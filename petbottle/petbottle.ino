@@ -1,46 +1,48 @@
 #include "BluetoothSerial.h"
 
-#define TRIG_PIN 5
-#define ECHO_PIN 18
+// --- Sensor Pins ---
+#define L_TRIG 5
+#define L_ECHO 18
+#define R_TRIG 17
+#define R_ECHO 16
 #define BUZZER_PIN 19
 
 BluetoothSerial SerialBT;
 
 void setup() {
   Serial.begin(115200);
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
+  pinMode(L_TRIG, OUTPUT); pinMode(L_ECHO, INPUT);
+  pinMode(R_TRIG, OUTPUT); pinMode(R_ECHO, INPUT);
   pinMode(BUZZER_PIN, OUTPUT);
   
   SerialBT.begin("ESP32_Chat");
 }
 
-long getDistance() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-  return pulseIn(ECHO_PIN, HIGH) * 0.034 / 2;
+long readDistance(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long d = pulseIn(echo, HIGH, 30000); // 30ms timeout
+  return (d == 0) ? 999 : d * 0.034 / 2;
 }
 
 void loop() {
-  long distance = getDistance();
-  
-  // Stream data to Pi constantly for real-time visualization
-  if (distance > 0 && distance < 100) {
-    SerialBT.print("D:");
-    SerialBT.println(distance);
-  }
+  long distL = readDistance(L_TRIG, L_ECHO);
+  long distR = readDistance(R_TRIG, R_ECHO);
 
-  // Dynamic Beeping Logic
-  if (distance > 0 && distance < 30) {
-    int beepDelay = map(distance, 2, 30, 30, 400);
+  // Send combined data: "L:15,R:22"
+  SerialBT.print("L:"); SerialBT.print(distL);
+  SerialBT.print(",R:"); SerialBT.println(distR);
+
+  // Beep logic: Beep if either sensor is close
+  long closest = min(distL, distR);
+  if (closest < 30) {
+    int beepDelay = map(closest, 2, 30, 40, 400);
     digitalWrite(BUZZER_PIN, HIGH);
-    delay(30); 
+    delay(30);
     digitalWrite(BUZZER_PIN, LOW);
-    delay(constrain(beepDelay, 30, 400));
+    delay(constrain(beepDelay, 40, 400));
   } else {
-    delay(50); // High-speed refresh rate
+    delay(60); 
   }
 }

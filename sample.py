@@ -11,114 +11,96 @@ import time
 ESP32_MAC_ADDRESS = "F4:2D:C9:71:C9:E2" 
 PORT = 1 
 
-class RealTimeRobotGUI:
+class DualSensorGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("LIVE: Bottle Collector Sensor")
-        self.root.geometry("450x350")
-        self.root.configure(bg="#1e1e1e") # Dark theme for better contrast
+        self.root.title("Dual Sensor Robot Monitor")
+        self.root.geometry("600x400")
+        self.root.configure(bg="#121212")
 
         self.data_queue = queue.Queue()
         
-        # --- UI DESIGN ---
-        self.label_title = tk.Label(root, text="REAL-TIME PROXIMITY", font=("Courier", 18, "bold"), bg="#1e1e1e", fg="#00ff00")
-        self.label_title.pack(pady=15)
+        # --- UI LAYOUT ---
+        tk.Label(root, text="BOTTLE DETECTOR: LEFT & RIGHT", font=("Arial", 16, "bold"), bg="#121212", fg="white").pack(pady=10)
 
-        # Big Digital Display
-        self.dist_var = tk.StringVar(value="-- cm")
-        self.dist_label = tk.Label(root, textvariable=self.dist_var, font=("Impact", 60), bg="#1e1e1e", fg="#00ff00")
-        self.dist_label.pack()
+        self.frame = tk.Frame(root, bg="#121212")
+        self.frame.pack(expand=True, fill="both", padx=20)
 
-        # Smooth Progress Bar
-        self.style = ttk.Style()
-        self.style.theme_use('default')
-        self.style.configure("TProgressbar", thickness=30, troughcolor='#333', background='#00ff00')
-        
-        self.progress = ttk.Progressbar(root, orient="horizontal", length=350, mode="determinate", maximum=40)
-        self.progress.pack(pady=20)
+        # Left Column
+        self.left_label = tk.Label(self.frame, text="LEFT", font=("Arial", 14), bg="#121212", fg="#00ccff")
+        self.left_label.grid(row=0, column=0, padx=40)
+        self.left_dist = tk.Label(self.frame, text="-- cm", font=("Impact", 40), bg="#121212", fg="#00ccff")
+        self.left_dist.grid(row=1, column=0)
+        self.left_bar = ttk.Progressbar(self.frame, orient="vertical", length=200, mode="determinate", maximum=40)
+        self.left_bar.grid(row=2, column=0, pady=10)
 
-        self.status_var = tk.StringVar(value="SEARCHING FOR ROBOT...")
-        self.status_label = tk.Label(root, textvariable=self.status_var, font=("Arial", 10), bg="#1e1e1e", fg="white")
-        self.status_label.pack(side="bottom", pady=10)
+        # Right Column
+        self.right_label = tk.Label(self.frame, text="RIGHT", font=("Arial", 14), bg="#121212", fg="#ff33cc")
+        self.right_label.grid(row=0, column=1, padx=40)
+        self.right_dist = tk.Label(self.frame, text="-- cm", font=("Impact", 40), bg="#121212", fg="#ff33cc")
+        self.right_dist.grid(row=1, column=1)
+        self.right_bar = ttk.Progressbar(self.frame, orient="vertical", length=200, mode="determinate", maximum=40)
+        self.right_bar.grid(row=2, column=1, pady=10)
 
-        # Start Background Process
+        # Status
+        self.status_var = tk.StringVar(value="OFFLINE")
+        tk.Label(root, textvariable=self.status_var, bg="#121212", fg="gray").pack(side="bottom", pady=5)
+
         self.running = True
-        self.bt_thread = threading.Thread(target=self.bluetooth_worker, daemon=True)
-        self.bt_thread.start()
-        
-        # Start UI Update Loop
+        threading.Thread(target=self.bt_worker, daemon=True).start()
         self.process_queue()
 
     def process_queue(self):
-        """ Checks the queue for new data and updates UI immediately """
         try:
             while True:
-                distance = self.data_queue.get_nowait()
-                self.update_display(distance)
-        except queue.Empty:
-            pass
+                l_dist, r_dist = self.data_queue.get_nowait()
+                self.update_ui(l_dist, r_dist)
+        except queue.Empty: pass
+        if self.running: self.root.after(20, self.process_queue)
+
+    def update_ui(self, l, r):
+        # Update Text
+        self.left_dist.config(text=f"{l}cm")
+        self.right_dist.config(text=f"{r}cm")
         
-        if self.running:
-            self.root.after(20, self.process_queue) # Refresh every 20ms (50 FPS)
+        # Update Bars (Closer = Higher Bar)
+        self.left_bar['value'] = max(0, 40 - l)
+        self.right_bar['value'] = max(0, 40 - r)
 
-    def update_display(self, dist):
-        self.dist_var.set(f"{dist} cm")
-        
-        # Animated Bar Logic (40cm scale)
-        val = 40 - dist
-        self.progress['value'] = max(0, val)
+        # Visual Danger Feedback
+        self.left_dist.config(fg="red" if l < 10 else "#00ccff")
+        self.right_dist.config(fg="red" if r < 10 else "#ff33cc")
 
-        # Dynamic Color Shift (Green -> Red)
-        if dist < 8:
-            self.dist_label.config(fg="#ff3333")
-            self.style.configure("TProgressbar", background='#ff3333')
-            self.root.configure(bg="#2b0000") # Subtle red background
-        elif dist < 20:
-            self.dist_label.config(fg="#ffcc00")
-            self.style.configure("TProgressbar", background='#ffcc00')
-            self.root.configure(bg="#1e1e1e")
-        else:
-            self.dist_label.config(fg="#00ff00")
-            self.style.configure("TProgressbar", background='#00ff00')
-            self.root.configure(bg="#1e1e1e")
-
-    def bluetooth_worker(self):
-        """ Background thread to handle Bluetooth without lagging the UI """
+    def bt_worker(self):
         while self.running:
             sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
             try:
-                self.root.after(0, lambda: self.status_var.set("ATTEMPTING CONNECTION..."))
+                self.status_var.set("CONNECTING...")
                 sock.connect((ESP32_MAC_ADDRESS, PORT))
-                self.root.after(0, lambda: self.status_var.set("CONNECTED - STREAMING LIVE"))
+                self.status_var.set("CONNECTED")
                 
                 buffer = ""
                 while self.running:
-                    data = sock.recv(1024).decode('utf-8')
-                    if not data: break
-                    
-                    buffer += data
+                    chunk = sock.recv(1024).decode('utf-8')
+                    if not chunk: break
+                    buffer += chunk
                     if "\n" in buffer:
                         lines = buffer.split("\n")
                         for line in lines[:-1]:
-                            if "D:" in line:
+                            if "L:" in line and "R:" in line:
                                 try:
-                                    val = int(line.replace("D:", "").strip())
-                                    self.data_queue.put(val)
+                                    parts = line.split(",")
+                                    l_val = int(parts[0].replace("L:", ""))
+                                    r_val = int(parts[1].replace("R:", ""))
+                                    self.data_queue.put((l_val, r_val))
                                 except: pass
                         buffer = lines[-1]
             except:
-                self.root.after(0, lambda: self.status_var.set("CONNECTION LOST - RETRYING..."))
+                self.status_var.set("LOST CONNECTION - RETRYING...")
                 time.sleep(2)
-            finally:
-                sock.close()
+            finally: sock.close()
 
 if __name__ == "__main__":
     root = tk.Tk()
-    gui = RealTimeRobotGUI(root)
-    
-    def on_exit():
-        gui.running = False
-        root.destroy()
-        
-    root.protocol("WM_DELETE_WINDOW", on_exit)
+    DualSensorGUI(root)
     root.mainloop()
