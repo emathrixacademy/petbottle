@@ -15,7 +15,7 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   
   SerialBT.begin("ESP32_Chat");
-  Serial.println("Robot Ready: Ultrasonic + Buzzer Active.");
+  Serial.println("Robot Ready: Dynamic Proximity Beeping Active.");
 }
 
 long getDistance() {
@@ -26,32 +26,36 @@ long getDistance() {
   digitalWrite(TRIG_PIN, LOW);
   
   long duration = pulseIn(ECHO_PIN, HIGH);
-  // Calculate distance in cm
-  return duration * 0.034 / 2;
+  long distance = duration * 0.034 / 2;
+  return (distance == 0) ? 999 : distance; // Return 999 if out of range
 }
 
 void loop() {
   long distance = getDistance();
   
-  // If an object (bottle) is detected within 10cm
-  if (distance > 0 && distance < 10) {
-    Serial.print("Object Detected: ");
-    Serial.print(distance);
-    Serial.println("cm");
-    
-    // Alert the Raspberry Pi via Bluetooth
-    SerialBT.print("BOTTLE_DETECTED:");
+  // Only beep if the object is closer than 30cm
+  if (distance < 30) {
+    // Alert the Pi
+    SerialBT.print("PROXIMITY:");
     SerialBT.println(distance);
-    
-    // Beep the buzzer
+
+    // Calculate beep speed
+    // 2cm = 50ms delay (fast), 30cm = 500ms delay (slow)
+    int beepDelay = map(distance, 2, 30, 50, 500);
+    beepDelay = constrain(beepDelay, 50, 500); 
+
+    // Beep
     digitalWrite(BUZZER_PIN, HIGH);
-    delay(100);
+    delay(40); // Constant short beep duration
     digitalWrite(BUZZER_PIN, LOW);
     
-    delay(1000); // Prevent spamming the Pi
+    // Wait based on distance
+    delay(beepDelay); 
+  } else {
+    delay(100); // Slow down loop if nothing is near
   }
 
-  // Check if Pi sent a manual buzzer command
+  // Manual command check
   if (SerialBT.available()) {
     String cmd = SerialBT.readStringUntil('\n');
     cmd.trim();
@@ -59,9 +63,6 @@ void loop() {
       digitalWrite(BUZZER_PIN, HIGH);
       delay(500);
       digitalWrite(BUZZER_PIN, LOW);
-      SerialBT.println("Buzzer Triggered Manually.");
     }
   }
-  
-  delay(100); 
 }
