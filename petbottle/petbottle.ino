@@ -1,40 +1,65 @@
 #include "BluetoothSerial.h"
+#include <Stepper.h>
 
-// Check if Bluetooth is properly enabled in the ESP32 config
-#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-#error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
-#endif
+// --- Hardware Pins ---
+#define IN1 19
+#define IN2 18
+#define IN3 5
+#define IN4 17
+
+// --- Stepper Config ---
+const int stepsPerRevolution = 200; 
+// Lowered speed to 30 RPM to provide more torque at 5V
+Stepper myStepper(stepsPerRevolution, IN1, IN3, IN2, IN4);
 
 BluetoothSerial SerialBT;
 
 void setup() {
-  // Serial monitor for debugging
   Serial.begin(115200);
   
-  // The name that will show up on your Raspberry Pi
-  SerialBT.begin("ESP32_Chat"); 
+  // 30 RPM is safer for 5V batteries
+  myStepper.setSpeed(30); 
   
-  Serial.println("The device started, now you can pair it with Bluetooth!");
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  
+  SerialBT.begin("ESP32_Chat"); 
+  Serial.println("Robot Ready (5V Low Power Mode)");
+}
+
+void releaseStepper() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
 }
 
 void loop() {
-  // 1. Read from Raspberry Pi and print to Serial Monitor
   if (SerialBT.available()) {
-    Serial.print("Received from Pi: ");
-    while (SerialBT.available()) {
-      char incomingChar = SerialBT.read();
-      Serial.print(incomingChar);
+    String data = SerialBT.readStringUntil('\n');
+    data.trim();
+
+    if (data.length() > 0) {
+      if (isDigit(data[0]) || (data[0] == '-' && isDigit(data[1]))) {
+        float degrees = data.toFloat();
+        int stepsToMove = (int)((degrees * stepsPerRevolution) / 360.0);
+        
+        SerialBT.print("Moving ");
+        SerialBT.print(degrees);
+        SerialBT.println(" deg @ 5V...");
+
+        myStepper.step(stepsToMove);
+        
+        SerialBT.println("Done.");
+        // CRITICAL: Always release at 5V to save battery
+        releaseStepper(); 
+      }
+      else if (data == "OFF") {
+        releaseStepper();
+        SerialBT.println("Motors released.");
+      }
     }
-    Serial.println(); // New line for readability
-
-    // 2. Send an automatic response back to the Pi
-    SerialBT.println("ESP32: Message received successfully!");
   }
-
-  // 3. Optional: Send typing from Serial Monitor to the Pi
-  if (Serial.available()) {
-    SerialBT.write(Serial.read());
-  }
-  
-  delay(20);
 }
