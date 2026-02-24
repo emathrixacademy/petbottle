@@ -1,53 +1,66 @@
 import socket
+import time
 import sys
 
 # ==========================================================
-# CONFIGURATION - UPDATE THE MAC ADDRESS BELOW
+# CONFIGURATION - UPDATED WITH YOUR DEVICE MAC
 # ==========================================================
-# Run 'hcitool scan' or 'bluetoothctl scan on' to find yours
-ESP32_MAC_ADDRESS = "XX:XX:XX:XX:XX:XX" 
-PORT = 1 # Standard RFCOMM port for ESP32 Bluetooth Serial
+ESP32_MAC_ADDRESS = "00:4B:12:30:06:FA" 
+PORT = 1 
 
-def run_bluetooth_client():
-    # Create the RFCOMM socket
-    # We use AF_BLUETOOTH for Bluetooth communication
-    try:
+def start_robot_comms():
+    print(f"--- Autonomous Pet Bottle Collector Interface ---")
+    
+    while True:
+        # Create a new Bluetooth RFCOMM socket
         sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
         
-        print(f"Attempting to connect to ESP32 ({ESP32_MAC_ADDRESS})...")
-        
-        # Connect to the ESP32
-        sock.connect((ESP32_MAC_ADDRESS, PORT))
-        print("Connected successfully!")
-        print("Type your message and press Enter. Type 'exit' to quit.")
-
-        while True:
-            # Get input from the user
-            message = input("You (Pi): ")
+        try:
+            print(f"Connecting to ESP32_Chat ({ESP32_MAC_ADDRESS})...")
+            # Set a 10-second timeout for the connection attempt
+            sock.settimeout(10) 
+            sock.connect((ESP32_MAC_ADDRESS, PORT))
             
-            if message.lower() == 'exit':
-                print("Closing connection...")
-                break
+            # Connection successful, disable timeout for continuous streaming
+            sock.settimeout(None) 
+            print("Status: CONNECTED")
+            print("Commands: Type your message or 'exit' to quit.")
 
-            # Send the data to the ESP32
-            # We add \n because the ESP32 code looks for a newline
-            sock.send(bytes(message + "\n", 'utf-8'))
+            while True:
+                # 1. Send data to Robot
+                message = input("Command to Robot >> ")
+                
+                if message.lower() == 'exit':
+                    print("Shutting down interface...")
+                    sock.close()
+                    return 
 
-            # Wait for a response from the ESP32
-            data = sock.recv(1024)
-            if data:
-                print(f"ESP32: {data.decode('utf-8').strip()}")
+                # Send message with newline for ESP32 parsing
+                sock.send(bytes(message + "\n", 'utf-8'))
 
-    except socket.error as e:
-        print(f"Couldn't connect to Bluetooth device: {e}")
-    except KeyboardInterrupt:
-        print("\nScript stopped by user.")
-    finally:
-        sock.close()
-        print("Socket closed.")
+                # 2. Receive data from Robot (e.g., sensor updates)
+                # Using a small timeout here so the script doesn't hang if ESP32 is silent
+                sock.settimeout(2.0)
+                try:
+                    data = sock.recv(1024)
+                    if data:
+                        print(f"Robot Response: {data.decode('utf-8').strip()}")
+                except socket.timeout:
+                    # It's okay if the robot doesn't reply immediately
+                    pass
+                finally:
+                    sock.settimeout(None)
+
+        except (socket.error, socket.timeout) as e:
+            print(f"Connection Error: {e}")
+            print("Retrying in 3 seconds... (Check if ESP32 is powered on)")
+            sock.close()
+            time.sleep(3) 
+            
+        except KeyboardInterrupt:
+            print("\nUser interrupted. Closing.")
+            sock.close()
+            sys.exit()
 
 if __name__ == "__main__":
-    if ESP32_MAC_ADDRESS == "XX:XX:XX:XX:XX:XX":
-        print("ERROR: Please edit the script and enter your ESP32's MAC address!")
-        sys.exit()
-    run_bluetooth_client()
+    start_robot_comms()
