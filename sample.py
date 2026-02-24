@@ -1,76 +1,76 @@
 import socket
 import time
 import sys
+import select
 
 # ==========================================================
-# CONFIGURATION - USE YOUR SCANNED MAC ADDRESS
+# CONFIGURATION - YOUR ESP32 MAC ADDRESS
 # ==========================================================
 ESP32_MAC_ADDRESS = "F4:2D:C9:71:C9:E2" 
 PORT = 1 
 
-def start_collector_interface():
+def start_robot_monitor():
     print("==============================================")
-    print("   PET BOTTLE COLLECTOR - 5V CONTROL PANEL    ")
+    print("   PET BOTTLE COLLECTOR - SENSOR MONITOR      ")
     print("==============================================")
     
     while True:
-        # Initialize Bluetooth Socket
+        # Create Bluetooth RFCOMM socket
         sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
         
         try:
-            print(f"\n[*] Connecting to Robot ({ESP32_MAC_ADDRESS})...")
+            print(f"[*] Connecting to {ESP32_MAC_ADDRESS}...")
             sock.settimeout(10)
             sock.connect((ESP32_MAC_ADDRESS, PORT))
             sock.settimeout(None)
             print("[+] Status: CONNECTED")
-            print("[!] Note: Running on 5V. Use small degree steps if motor stalls.")
+            print("[i] Monitoring for bottles... (Type 'BEEP' to test buzzer)")
             print("----------------------------------------------")
 
             while True:
-                # 1. User Input
-                cmd = input("Enter Degrees (e.g. 90, -45) or 'OFF': ").strip()
-                
-                if cmd.lower() == 'exit':
-                    sock.close()
-                    return
-                
-                if not cmd:
-                    continue
+                # Use select to check if there is data from the ESP32
+                # This prevents the script from freezing while waiting for input
+                rlist, _, _ = select.select([sock, sys.stdin], [], [], 0.1)
 
-                # 2. Send Command
-                print(f"[*] Sending: {cmd}")
-                sock.send(bytes(cmd + "\n", 'utf-8'))
+                for ready_source in rlist:
+                    # Case 1: Data coming from ESP32 (Sensor Alert)
+                    if ready_source == sock:
+                        data = sock.recv(1024)
+                        if data:
+                            msg = data.decode('utf-8').strip()
+                            if "BOTTLE_DETECTED" in msg:
+                                # Extract distance from "BOTTLE_DETECTED:8"
+                                try:
+                                    dist = msg.split(":")[1]
+                                    print(f"!!! [ALERT] Bottle Found at {dist} cm !!!")
+                                except IndexError:
+                                    print(f"[RAW]: {msg}")
+                            else:
+                                print(f"[ESP32]: {msg}")
+                        else:
+                            # If recv returns empty, connection is broken
+                            raise socket.error("Remote side closed connection")
 
-                # 3. Wait for Robot Response (Confirmation of movement)
-                # We give it a longer timeout (5s) because 5V motors move slower
-                sock.settimeout(5.0)
-                try:
-                    data = sock.recv(1024)
-                    if data:
-                        response = data.decode('utf-8').strip()
-                        print(f"[Robot]: {response}")
-                        
-                        # Wait until the 'Done' message arrives before sending more
-                        if "Moving" in response:
-                            # Listen again for the 'Done.' confirmation
-                            done_data = sock.recv(1024)
-                            print(f"[Robot]: {done_data.decode('utf-8').strip()}")
-                
-                except socket.timeout:
-                    print("[!] Warning: Robot is taking a long time to respond...")
-                finally:
-                    sock.settimeout(None)
+                    # Case 2: User typing in the terminal
+                    elif ready_source == sys.stdin:
+                        user_cmd = sys.stdin.readline().strip().upper()
+                        if user_cmd == "EXIT":
+                            sock.close()
+                            return
+                        if user_cmd:
+                            sock.send(bytes(user_cmd + "\n", 'utf-8'))
+                            print(f"[*] Command Sent: {user_cmd}")
 
         except (socket.error, socket.timeout) as e:
             print(f"[-] Connection Lost: {e}")
-            print("[*] Attempting to reconnect in 3 seconds...")
+            print("[*] Retrying in 3 seconds...")
             sock.close()
             time.sleep(3)
             
         except KeyboardInterrupt:
-            print("\n[!] Closing Application.")
+            print("\n[!] Application stopped by user.")
             sock.close()
             sys.exit()
 
 if __name__ == "__main__":
-    start_collector_interface()
+    start_robot_monitor()

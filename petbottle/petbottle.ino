@@ -1,65 +1,67 @@
 #include "BluetoothSerial.h"
-#include <Stepper.h>
 
 // --- Hardware Pins ---
-#define IN1 19
-#define IN2 18
-#define IN3 5
-#define IN4 17
-
-// --- Stepper Config ---
-const int stepsPerRevolution = 200; 
-// Lowered speed to 30 RPM to provide more torque at 5V
-Stepper myStepper(stepsPerRevolution, IN1, IN3, IN2, IN4);
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+#define BUZZER_PIN 19
 
 BluetoothSerial SerialBT;
 
 void setup() {
   Serial.begin(115200);
   
-  // 30 RPM is safer for 5V batteries
-  myStepper.setSpeed(30); 
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
   
-  pinMode(IN1, OUTPUT);
-  pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT);
-  pinMode(IN4, OUTPUT);
-  
-  SerialBT.begin("ESP32_Chat"); 
-  Serial.println("Robot Ready (5V Low Power Mode)");
+  SerialBT.begin("ESP32_Chat");
+  Serial.println("Robot Ready: Ultrasonic + Buzzer Active.");
 }
 
-void releaseStepper() {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
+long getDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  long duration = pulseIn(ECHO_PIN, HIGH);
+  // Calculate distance in cm
+  return duration * 0.034 / 2;
 }
 
 void loop() {
+  long distance = getDistance();
+  
+  // If an object (bottle) is detected within 10cm
+  if (distance > 0 && distance < 10) {
+    Serial.print("Object Detected: ");
+    Serial.print(distance);
+    Serial.println("cm");
+    
+    // Alert the Raspberry Pi via Bluetooth
+    SerialBT.print("BOTTLE_DETECTED:");
+    SerialBT.println(distance);
+    
+    // Beep the buzzer
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+    
+    delay(1000); // Prevent spamming the Pi
+  }
+
+  // Check if Pi sent a manual buzzer command
   if (SerialBT.available()) {
-    String data = SerialBT.readStringUntil('\n');
-    data.trim();
-
-    if (data.length() > 0) {
-      if (isDigit(data[0]) || (data[0] == '-' && isDigit(data[1]))) {
-        float degrees = data.toFloat();
-        int stepsToMove = (int)((degrees * stepsPerRevolution) / 360.0);
-        
-        SerialBT.print("Moving ");
-        SerialBT.print(degrees);
-        SerialBT.println(" deg @ 5V...");
-
-        myStepper.step(stepsToMove);
-        
-        SerialBT.println("Done.");
-        // CRITICAL: Always release at 5V to save battery
-        releaseStepper(); 
-      }
-      else if (data == "OFF") {
-        releaseStepper();
-        SerialBT.println("Motors released.");
-      }
+    String cmd = SerialBT.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "BEEP") {
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(500);
+      digitalWrite(BUZZER_PIN, LOW);
+      SerialBT.println("Buzzer Triggered Manually.");
     }
   }
+  
+  delay(100); 
 }
