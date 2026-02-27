@@ -9,40 +9,41 @@ app = Flask(__name__)
 picam2 = Picamera2()
 
 def setup_camera():
-    # Use 16:9 for the Wide sensor's full field of view
-    # 1280x720 is very stable for real-time robot navigation
-    config = picam2.create_preview_configuration(main={"size": (1280, 720)})
+    # 1. High FPS Mode: 640x360 is extremely fast and keeps the 16:9 Wide FOV.
+    # We set a high frame_rate in the configuration.
+    config = picam2.create_preview_configuration(
+        main={"size": (640, 360), "format": "BGR888"},
+        controls={"FrameRate": 60} 
+    )
     picam2.configure(config)
 
-    # Enable HDR for better visibility in shadows/sunlight
+    # 2. Performance Tuning
+    # Disable HDR for high FPS (HDR requires double exposure, which halves FPS)
     try:
-        picam2.set_controls({"HdrMode": 1})
-    except:
-        pass
-
-    # Enable Continuous Autofocus for a moving robot
-    picam2.set_controls({"AfMode": 2})
+        picam2.set_controls({"HdrMode": 0}) 
+        # Set Focus to manual/fixed or fast continuous
+        picam2.set_controls({"AfMode": 2}) 
+    except Exception as e:
+        print(f"Control error: {e}")
     
     picam2.start()
-    print("Camera Module 3 Wide: High-Potential Mode Active.")
+    print("Camera initialized in HIGH FPS mode (60 FPS targeted).")
 
 setup_camera()
 
 HTML_PAGE = """
 <html>
     <head>
-        <title>Wide-View Robot Eyes</title>
+        <title>Robot High-Speed Feed</title>
         <style>
-            body { margin: 0; background: #000; color: #0f0; font-family: monospace; text-align: center; }
-            img { width: 100vw; height: auto; max-height: 85vh; border-bottom: 2px solid #0f0; }
-            .telemetry { padding: 10px; font-size: 1.1em; background: #111; }
+            body { margin: 0; background: #000; color: #00ff00; font-family: monospace; overflow: hidden; }
+            .stats { position: absolute; top: 10; left: 10; background: rgba(0,0,0,0.8); padding: 5px; border: 1px solid #0f0; }
+            img { width: 100vw; height: 100vh; object-fit: contain; image-rendering: pixelated; }
         </style>
     </head>
     <body>
+        <div class="stats">MODE: HIGH_FPS | FOV: WIDE | LATENCY: ULTRA_LOW</div>
         <img src="{{ url_for('video_feed') }}">
-        <div class="telemetry">
-            [ FOV: WIDE ] [ HDR: ON ] [ AF: CONT ] [ IP: 192.168.18.49 ]
-        </div>
     </body>
 </html>
 """
@@ -50,36 +51,30 @@ HTML_PAGE = """
 def generate_frames():
     while True:
         try:
-            # Capture the frame as a NumPy array (RGB/BGR)
-            # This is the 'Raw' data after the Pi 5's ISP processing
+            # Capture using the fast array method
             frame = picam2.capture_array()
 
             if frame is None:
                 continue
 
-            # Add a small timestamp so you know the stream hasn't frozen
-            timestamp = time.strftime("%H:%M:%S")
-            cv2.putText(frame, timestamp, (10, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-            # Convert to JPEG using OpenCV to control quality and prevent glitching
-            # [70] quality is the sweet spot for a clear but fast robot stream
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+            # Lower JPEG quality (60) to ensure the network can keep up with the high FPS
+            # If the network chokes, the FPS will drop regardless of the camera speed.
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 60]
             
-            # Since capture_array typically returns RGB for Picamera2, 
-            # and OpenCV imencode expects BGR, we swap them.
+            # Note: picamera2 capture_array usually returns RGB. 
+            # We skip the color conversion if we want absolute max FPS, 
+            # but if you look blue, keep the next line:
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
             _, buffer = cv2.imencode('.jpg', frame_bgr, encode_param)
             
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
             
-            # Cap at ~20fps to keep the network pipeline clean
-            time.sleep(0.05)
-
+            # No sleep here—let the hardware clock drive the loop!
         except Exception as e:
-            print(f"Stream Error: {e}")
-            time.sleep(1) # Wait a bit before retrying
+            print(f"Stream error: {e}")
+            break
 
 @app.route('/')
 def index():
@@ -92,10 +87,11 @@ def video_feed():
 
 if __name__ == '__main__':
     try:
-        # Access on your laptop at http://192.168.18.49:5000
+        # Access at http://192.168.18.49:5000
+        # 'threaded=True' is vital to keep the web server from blocking the camera loop
         app.run(host='0.0.0.0', port=5000, threaded=True, debug=False)
     except KeyboardInterrupt:
-        print("\nShutting down Robot Camera...")
+        print("\nStopping...")
     finally:
         picam2.stop()
         picam2.close()
