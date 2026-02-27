@@ -1,36 +1,67 @@
+import io
 import time
+from flask import Flask, Response, render_template_string
 from picamera2 import Picamera2
 
-def test_camera_stream():
-    # Initialize Picamera2
-    # The Raspberry Pi 5 handles the hardware synchronization automatically
-    pc2 = Picamera2()
+# Initialize Flask and Camera
+app = Flask(__name__)
+picam2 = Picamera2()
+
+# HTML Template as a string for a single-file solution
+HTML_PAGE = """
+<html>
+    <head>
+        <title>Robot Eye - Bottle Collector</title>
+        <style>
+            body { font-family: sans-serif; text-align: center; background: #222; color: white; }
+            img { border: 5px solid #444; border-radius: 10px; max-width: 90%; }
+        </style>
+    </head>
+    <body>
+        <h1>Pet Bottle Collector - Live Feed</h1>
+        <img src="{{ url_for('video_feed') }}">
+        <p>Status: <span style="color: #0f0;">Streaming Online</span></p>
+    </body>
+</html>
+"""
+
+def generate_frames():
+    # Configure Camera Module 3
+    # Use 640x480 for lower latency on the robot's network
+    config = picam2.create_preview_configuration(main={"size": (640, 480)})
+    picam2.configure(config)
+    picam2.start()
 
     try:
-        print("Configuring Camera Module 3...")
-        # Configure the camera for a standard 720p preview stream
-        config = pc2.create_preview_configuration(main={"size": (1280, 720)})
-        pc2.configure(config)
-
-        print("Starting stream preview...")
-        # This opens a window on your Pi's desktop (X11 or Wayland)
-        pc2.start_preview()
-
-        print("Stream active. Press Ctrl+C to stop.")
-        
-        # Keep the script running so the preview stays open
         while True:
-            time.sleep(1)
-
-    except KeyboardInterrupt:
-        print("\nStopping stream...")
-    except Exception as e:
-        print(f"An error occurred: {e}")
+            # Capture frame into a byte buffer
+            buf = io.BytesIO()
+            picam2.capture_file(buf, format='jpeg')
+            frame = buf.getvalue()
+            
+            # Yield the frame in MJPEG format
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            
+            # Small sleep to prevent CPU Maxing
+            time.sleep(0.01)
     finally:
-        # Ensure the camera resources are released properly
-        pc2.stop_preview()
-        pc2.close()
-        print("Camera closed.")
+        picam2.stop()
+        picam2.close()
 
-if __name__ == "__main__":
-    test_camera_stream()
+@app.route('/')
+def index():
+    return render_template_string(HTML_PAGE)
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+if __name__ == '__main__':
+    # host='0.0.0.0' allows access from any device on your network
+    try:
+        print("Starting Robot Web Server...")
+        app.run(host='0.0.0.0', port=5000, threaded=True)
+    except KeyboardInterrupt:
+        print("\nStopping Server...")
