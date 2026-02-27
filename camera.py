@@ -10,7 +10,8 @@ app = Flask(__name__)
 
 # Initialize Camera
 picam2 = Picamera2()
-config = picam2.create_preview_configuration(main={"size": (640, 480)})
+# We explicitly request 'RGB' from the camera
+config = picam2.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
 picam2.configure(config)
 picam2.start()
 
@@ -18,37 +19,35 @@ picam2.start()
 HTML_PAGE = """
 <html>
     <head>
-        <title>Bottle Collector Robot Feed</title>
+        <title>Bottle Collector Robot - Fixed Color</title>
         <style>
             body { font-family: Arial; text-align: center; background: #1a1a1a; color: white; }
-            .container { margin-top: 20px; }
-            img { border: 4px solid #3498db; border-radius: 8px; width: 80%; max-width: 800px; }
-            .status { color: #2ecc71; font-weight: bold; }
+            img { border: 4px solid #2ecc71; border-radius: 8px; width: 80%; max-width: 800px; }
         </style>
     </head>
     <body>
         <h1>AUTONOMOUS BOTTLE COLLECTOR</h1>
-        <div class="status">● LIVE FEED ACTIVE</div>
-        <div class="container">
-            <img src="{{ url_for('video_feed') }}">
-        </div>
-        <p>Connected to: CAM/DISP 0 (IMX708)</p>
+        <p>Color Correction: <span style="color: #2ecc71;">NATURAL RGB</span></p>
+        <img src="{{ url_for('video_feed') }}">
     </body>
 </html>
 """
 
 def generate_frames():
     while True:
-        # Capture frame as a NumPy array (OpenCV format)
-        # This allows you to add detection logic later in this loop
+        # 1. Capture frame (Coming in as RGB from the camera config)
         frame = picam2.capture_array()
 
-        # Optional: Add a timestamp or text to the frame using OpenCV
-        cv2.putText(frame, time.strftime("%H:%M:%S"), (10, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        # 2. FIX: OpenCV expects BGR to encode JPEG correctly. 
+        # Since the camera is giving us RGB, we swap them here.
+        corrected_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-        # Encode the frame as JPEG
-        _, buffer = cv2.imencode('.jpg', frame)
+        # 3. Add text overlay (Optional)
+        cv2.putText(corrected_frame, "BOTTLE_CAM_01", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        # 4. Encode the corrected frame
+        _, buffer = cv2.imencode('.jpg', corrected_frame)
         frame_bytes = buffer.tobytes()
 
         yield (b'--frame\r\n'
@@ -65,8 +64,7 @@ def video_feed():
 
 if __name__ == '__main__':
     try:
-        print("Starting Robot Web Interface...")
-        # Host 0.0.0.0 makes it visible to your laptop
+        print("Starting Corrected Robot Web Interface...")
         app.run(host='0.0.0.0', port=5000, threaded=True)
     except KeyboardInterrupt:
         print("\nShutting down...")
