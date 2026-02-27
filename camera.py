@@ -4,46 +4,58 @@ import cv2
 import numpy as np
 from flask import Flask, Response, render_template_string
 from picamera2 import Picamera2
+from ultralytics import YOLO
 
+# Initialize Flask and Camera
 app = Flask(__name__)
 picam2 = Picamera2()
 
+# Load YOLOv8 Nano - This will download yolov8n.pt to your current folder
+# Class 39 in the COCO dataset is 'bottle'
+model = YOLO('yolov8n.pt')
+
 def setup_camera():
-    # 1. High FPS Mode: 1280x720 is a native binned mode for Module 3.
-    # This is often MORE stable for the Pi 5 than smaller custom resolutions.
+    # 640x360 is the most efficient size for YOLOv8 on Pi 5
+    # It maintains the 16:9 aspect ratio of the Wide Camera
     config = picam2.create_preview_configuration(
-        main={"size": (1280, 720), "format": "BGR888"},
-        controls={"FrameRate": 60} 
+        main={"size": (640, 360), "format": "BGR888"},
+        controls={"FrameRate": 30} 
     )
     picam2.configure(config)
 
-    # 2. Performance Tuning
     try:
-        # Disable HDR for high FPS stability
+        # High FPS usually works better with HDR off
         picam2.set_controls({"HdrMode": 0}) 
-        # Set Continuous Autofocus
+        # Continuous Autofocus is critical for a moving robot
         picam2.set_controls({"AfMode": 2}) 
     except Exception as e:
-        print(f"Control error: {e}")
+        print(f"Control setup warning: {e}")
     
     picam2.start()
-    print("Camera initialized in HIGH FPS mode (1280x720 @ 60 FPS).")
+    print("AI Robot Vision System: ACTIVE (No VENV)")
 
 setup_camera()
 
 HTML_PAGE = """
 <html>
     <head>
-        <title>Robot High-Speed Feed</title>
+        <title>Autonomous Bottle Collector - AI Feed</title>
         <style>
-            body { margin: 0; background: #000; color: #00ff00; font-family: monospace; overflow: hidden; }
-            .stats { position: absolute; top: 10; left: 10; background: rgba(0,0,0,0.8); padding: 5px; border: 1px solid #0f0; z-index: 10; }
-            img { width: 100vw; height: 100vh; object-fit: contain; }
+            body { margin: 0; background: #111; color: #0f0; font-family: 'Courier New', monospace; text-align: center; }
+            .container { position: relative; display: inline-block; width: 100%; }
+            img { width: 100vw; height: auto; max-height: 85vh; border-bottom: 2px solid #0f0; }
+            .telemetry { padding: 10px; background: #000; font-size: 1.2em; }
+            .warn { color: yellow; font-size: 0.8em; }
         </style>
     </head>
     <body>
-        <div class="stats">MODE: HIGH_FPS | RES: 720p | FOV: WIDE</div>
-        <img src="{{ url_for('video_feed') }}">
+        <div class="container">
+            <img src="{{ url_for('video_feed') }}">
+        </div>
+        <div class="telemetry">
+            DETECTION: BOTTLES ONLY | FOV: WIDE | AI: YOLOv8n
+        </div>
+        <div class="warn">Running in System Environment (No VENV)</div>
     </body>
 </html>
 """
@@ -51,27 +63,28 @@ HTML_PAGE = """
 def generate_frames():
     while True:
         try:
-            # Capture using the fast array method
+            # Capture the frame
             frame = picam2.capture_array()
-
             if frame is None:
                 continue
 
-            # JPEG Quality 60 reduces network congestion
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 60]
+            # Run YOLOv8 Inference
+            # conf=0.4 filters out weak detections
+            # classes=[39] ensures it only looks for bottles
+            results = model.predict(frame, conf=0.4, classes=[39], verbose=False)
             
-            # Note: Picamera2 capture_array returns RGB, but imencode wants BGR.
-            # Keeping the swap to ensure skin/bottles look natural.
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            
-            _, buffer = cv2.imencode('.jpg', frame_bgr, encode_param)
+            # Use results[0].plot() to draw boxes on the frame
+            annotated_frame = results[0].plot()
+
+            # Encode the resulting frame as JPEG
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+            _, buffer = cv2.imencode('.jpg', annotated_frame, encode_param)
             
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
             
         except Exception as e:
-            print(f"Stream error: {e}")
-            # If the camera frontend times out, we break the loop to allow a clean exit
+            print(f"Error during stream: {e}")
             break
 
 @app.route('/')
@@ -85,15 +98,13 @@ def video_feed():
 
 if __name__ == '__main__':
     try:
-        # Host on all interfaces for robot accessibility
-        app.run(host='0.0.0.0', port=5000, threaded=True, debug=False)
+        # Start server - accessible at http://192.168.18.49:5000
+        app.run(host='0.0.0.0', port=5000, threaded=True)
     except KeyboardInterrupt:
-        print("\nStopping Robot Camera...")
+        print("\nShutting down AI...")
     finally:
-        # Wrapped in a try/except to prevent hanging on a timed-out camera
         try:
             picam2.stop()
             picam2.close()
-            print("Camera resources released.")
         except:
-            print("Camera was already unresponsive.")
+            pass
