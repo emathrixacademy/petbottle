@@ -10,44 +10,59 @@ app = Flask(__name__)
 
 # Initialize Camera
 picam2 = Picamera2()
-# We explicitly request 'RGB' from the camera
-config = picam2.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
+
+# Step 1: Explicitly configure for a standard format
+# We use 'BGR888' because it's OpenCV's native language. 
+# This avoids needing to swap channels manually later.
+config = picam2.create_preview_configuration(main={"size": (640, 480), "format": "BGR888"})
 picam2.configure(config)
 picam2.start()
+
+print("Camera started. Waiting 2 seconds for Auto White Balance to calibrate...")
+time.sleep(2) # Give the sensor time to realize you aren't actually blue
 
 # Simple HTML Interface
 HTML_PAGE = """
 <html>
     <head>
-        <title>Bottle Collector Robot - Fixed Color</title>
+        <title>Robot Collector - Color Fixed</title>
         <style>
-            body { font-family: Arial; text-align: center; background: #1a1a1a; color: white; }
-            img { border: 4px solid #2ecc71; border-radius: 8px; width: 80%; max-width: 800px; }
+            body { font-family: Arial, sans-serif; text-align: center; background: #1a1a1a; color: white; }
+            .feed-container { margin-top: 20px; }
+            img { border: 5px solid #2ecc71; border-radius: 12px; width: 80%; max-width: 800px; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
+            .info { color: #bdc3c7; font-size: 0.9em; margin-top: 10px; }
         </style>
     </head>
     <body>
         <h1>AUTONOMOUS BOTTLE COLLECTOR</h1>
-        <p>Color Correction: <span style="color: #2ecc71;">NATURAL RGB</span></p>
-        <img src="{{ url_for('video_feed') }}">
+        <div class="feed-container">
+            <img src="{{ url_for('video_feed') }}">
+        </div>
+        <div class="info">Sensor: IMX708 | Mode: BGR-Native | AWB: Auto</div>
     </body>
 </html>
 """
 
 def generate_frames():
     while True:
-        # 1. Capture frame (Coming in as RGB from the camera config)
+        # Since we configured the camera to output BGR888, 
+        # picam2.capture_array() returns a format OpenCV loves.
         frame = picam2.capture_array()
 
-        # 2. FIX: OpenCV expects BGR to encode JPEG correctly. 
-        # Since the camera is giving us RGB, we swap them here.
-        corrected_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        # Check if frame is empty
+        if frame is None:
+            continue
 
-        # 3. Add text overlay (Optional)
-        cv2.putText(corrected_frame, "BOTTLE_CAM_01", (10, 30), 
+        # Add a "Natural Color" label to the stream
+        cv2.putText(frame, "COLOR_OK", (10, 30), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        # 4. Encode the corrected frame
-        _, buffer = cv2.imencode('.jpg', corrected_frame)
+        # Encode the frame as JPEG
+        # The JPEG encoder expects BGR by default in the OpenCV implementation
+        success, buffer = cv2.imencode('.jpg', frame)
+        if not success:
+            continue
+            
         frame_bytes = buffer.tobytes()
 
         yield (b'--frame\r\n'
@@ -64,10 +79,10 @@ def video_feed():
 
 if __name__ == '__main__':
     try:
-        print("Starting Corrected Robot Web Interface...")
+        print("Web server running on http://0.0.0.0:5000")
         app.run(host='0.0.0.0', port=5000, threaded=True)
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print("\nStopping...")
     finally:
         picam2.stop()
         picam2.close()
