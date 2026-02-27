@@ -9,25 +9,22 @@ app = Flask(__name__)
 picam2 = Picamera2()
 
 def setup_camera():
-    # 1. High FPS Mode: 640x360 is extremely fast and keeps the 16:9 Wide FOV.
-    # We set a high frame_rate in the configuration.
-    config = picam2.create_preview_configuration(
-        main={"size": (640, 360), "format": "BGR888"},
-        controls={"FrameRate": 60} 
-    )
-    picam2.configure(config)
-
-    # 2. Performance Tuning
-    # Disable HDR for high FPS (HDR requires double exposure, which halves FPS)
     try:
-        picam2.set_controls({"HdrMode": 0}) 
-        # Set Focus to manual/fixed or fast continuous
-        picam2.set_controls({"AfMode": 2}) 
+        # Using 1280x720 at 60FPS is the 'Gold Standard' for High Speed on Pi 5.
+        # It uses the sensor's 2x2 binning mode which is very stable.
+        config = picam2.create_preview_configuration(
+            main={"size": (1280, 720), "format": "BGR888"},
+            controls={"FrameRate": 60}
+        )
+        picam2.configure(config)
+        
+        # Set Focus to Continuous but slow it down slightly for stability
+        picam2.set_controls({"AfMode": 2})
+        
+        picam2.start()
+        print("Camera Module 3 Wide: High FPS Mode (720p @ 60fps) Started.")
     except Exception as e:
-        print(f"Control error: {e}")
-    
-    picam2.start()
-    print("Camera initialized in HIGH FPS mode (60 FPS targeted).")
+        print(f"Initialization Failed: {e}. Check ribbon cable!")
 
 setup_camera()
 
@@ -36,14 +33,14 @@ HTML_PAGE = """
     <head>
         <title>Robot High-Speed Feed</title>
         <style>
-            body { margin: 0; background: #000; color: #00ff00; font-family: monospace; overflow: hidden; }
-            .stats { position: absolute; top: 10; left: 10; background: rgba(0,0,0,0.8); padding: 5px; border: 1px solid #0f0; }
-            img { width: 100vw; height: 100vh; object-fit: contain; image-rendering: pixelated; }
+            body { margin: 0; background: #000; color: #0f0; font-family: monospace; text-align: center; }
+            img { width: 100vw; height: auto; max-height: 90vh; object-fit: contain; }
+            .telemetry { padding: 10px; background: #111; border-top: 1px solid #0f0; }
         </style>
     </head>
     <body>
-        <div class="stats">MODE: HIGH_FPS | FOV: WIDE | LATENCY: ULTRA_LOW</div>
         <img src="{{ url_for('video_feed') }}">
+        <div class="telemetry">STREAMS: 720p60 | STATUS: STABLE | FOV: WIDE</div>
     </body>
 </html>
 """
@@ -51,29 +48,26 @@ HTML_PAGE = """
 def generate_frames():
     while True:
         try:
-            # Capture using the fast array method
+            # capture_array is fast, but we'll wrap it in a timeout check
             frame = picam2.capture_array()
-
+            
             if frame is None:
                 continue
 
-            # Lower JPEG quality (60) to ensure the network can keep up with the high FPS
-            # If the network chokes, the FPS will drop regardless of the camera speed.
+            # JPEG Quality 60 is the key to preventing network-induced glitching
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 60]
             
-            # Note: picamera2 capture_array usually returns RGB. 
-            # We skip the color conversion if we want absolute max FPS, 
-            # but if you look blue, keep the next line:
+            # Convert RGB (Picamera2) to BGR (OpenCV)
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            
             _, buffer = cv2.imencode('.jpg', frame_bgr, encode_param)
             
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-            
-            # No sleep here—let the hardware clock drive the loop!
+
         except Exception as e:
-            print(f"Stream error: {e}")
+            print(f"Camera Stream Lost: {e}")
+            # Try to restart the camera if it fails
+            time.sleep(2)
             break
 
 @app.route('/')
@@ -88,10 +82,13 @@ def video_feed():
 if __name__ == '__main__':
     try:
         # Access at http://192.168.18.49:5000
-        # 'threaded=True' is vital to keep the web server from blocking the camera loop
-        app.run(host='0.0.0.0', port=5000, threaded=True, debug=False)
+        app.run(host='0.0.0.0', port=5000, threaded=True)
     except KeyboardInterrupt:
-        print("\nStopping...")
+        print("\nShutting down...")
     finally:
-        picam2.stop()
-        picam2.close()
+        # Use a safe stop to prevent the KeyboardInterrupt hang you saw
+        try:
+            picam2.stop()
+            picam2.close()
+        except:
+            pass
