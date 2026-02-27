@@ -1,106 +1,72 @@
-import io
-import time
 import cv2
 import numpy as np
-from flask import Flask, Response, render_template_string
+import time
 from picamera2 import Picamera2
 from ultralytics import YOLO
 
-app = Flask(__name__)
+# 1. Initialize Camera and YOLOv8
 picam2 = Picamera2()
-
-# 1. Load YOLOv8n (Nano)
-# Class 39 is 'bottle' in the COCO dataset
 model = YOLO('yolov8n.pt')
 
 def setup_camera():
-    # Maintain your preferred 720p 60FPS High-Speed configuration
+    # Use 1280x720 60FPS for high potential and stability
     config = picam2.create_preview_configuration(
         main={"size": (1280, 720), "format": "BGR888"},
         controls={"FrameRate": 60} 
     )
     picam2.configure(config)
-
     try:
-        # Optimization: HDR off for speed, Continuous AF for a moving robot
-        picam2.set_controls({"HdrMode": 0}) 
-        picam2.set_controls({"AfMode": 2}) 
-    except Exception as e:
-        print(f"Control error: {e}")
-    
+        picam2.set_controls({"HdrMode": 0, "AfMode": 2}) 
+    except:
+        pass
     picam2.start()
-    print("AI BOTTLE COLLECTOR: Camera & YOLOv8n Initialized.")
+    print("Camera & YOLOv8 Active. Sending OpenCV UDP Stream...")
+
+# 2. Setup GStreamer Writer
+# REPLACE THIS IP with your laptop's IP address (found via ipconfig/ifconfig)
+TARGET_IP = '192.168.18.7' 
+TARGET_PORT = 5000
+
+# Pipeline: Captures BGR -> Converts to YUV -> Encodes H264 (Hardware) -> Sends UDP
+gst_str = (
+    f'appsrc ! videoconvert ! x264enc tune=zerolatency bitrate=2500 speed-preset=ultrafast ! '
+    f'rtph264pay ! udpsink host={TARGET_IP} port={TARGET_PORT}'
+)
+
+out = cv2.VideoWriter(gst_str, cv2.CAP_GSTREAMER, 0, 30, (1280, 720), True)
 
 setup_camera()
 
-HTML_PAGE = """
-<html>
-    <head>
-        <title>Autonomous Robot AI Feed</title>
-        <style>
-            body { margin: 0; background: #000; color: #00ff00; font-family: monospace; overflow: hidden; }
-            .stats { position: absolute; top: 10; left: 10; background: rgba(0,0,0,0.8); padding: 8px; border: 1px solid #0f0; z-index: 10; }
-            img { width: 100vw; height: 100vh; object-fit: contain; }
-            .target-box { color: #f1c40f; }
-        </style>
-    </head>
-    <body>
-        <div class="stats">
-            AI: YOLOv8n | <span class="target-box">TARGET: PET BOTTLE</span><br>
-            STREAM: 720p High-Speed | FOV: Wide
-        </div>
-        <img src="{{ url_for('video_feed') }}">
-    </body>
-</html>
-"""
-
-def generate_frames():
+try:
     while True:
-        try:
-            # Capture using the fast array method
-            frame = picam2.capture_array()
+        # Capture the raw frame
+        frame = picam2.capture_array()
+        if frame is None:
+            continue
 
-            if frame is None:
-                continue
+        # Run YOLOv8 Inference (Class 39 = Bottle)
+        results = model.predict(frame, classes=[39], conf=0.4, verbose=False)
 
-            # 2. RUN AI INFERENCE
-            # We filter for classes=[39] (Bottle) only
-            # conf=0.3 is a good balance to avoid false positives
-            results = model.predict(frame, classes=[39], conf=0.3, verbose=False)
-            
-            # Use results[0].plot() to automatically draw boxes and labels
-            annotated_frame = results[0].plot()
+        # Draw Custom High-Visibility Borders
+        for r in results:
+            for box in r.boxes:
+                # Get coordinates
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                
+                # Neon Green Border (Thick 4px)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 4)
+                
+                # Header box for label
+                cv2.rectangle(frame, (x1, y1 - 35), (x1 + 160, y1), (0, 255, 0), -1)
+                cv2.putText(frame, "PET BOTTLE", (x1 + 5, y1 - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
 
-            # Encode the resulting frame as JPEG
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 65]
-            _, buffer = cv2.imencode('.jpg', annotated_frame, encode_param)
-            
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-            
-        except Exception as e:
-            print(f"Stream error: {e}")
-            break
+        # Stream the frame to your laptop
+        out.write(frame)
 
-@app.route('/')
-def index():
-    return render_template_string(HTML_PAGE)
-
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_frames(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-if __name__ == '__main__':
-    try:
-        # Host on 0.0.0.0 so you can access it from your laptop browser
-        app.run(host='0.0.0.0', port=5000, threaded=True, debug=False)
-    except KeyboardInterrupt:
-        print("\nStopping Robot Camera AI...")
-    finally:
-        try:
-            picam2.stop()
-            picam2.close()
-            print("Resources released.")
-        except:
-            pass
+except KeyboardInterrupt:
+    print("\nRobot Vision Stopping...")
+finally:
+    picam2.stop()
+    picam2.close()
+    out.release()
