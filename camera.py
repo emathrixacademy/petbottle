@@ -19,7 +19,7 @@ from hailo_platform import (
 )
 
 # ── Settings ───────────────────────────────────────────────
-HEF_PATH       = "best.hef"
+HEF_PATH       = "best_hailo.hef"
 CLASS_NAMES    = ["PET-Bottle"]
 CONF_THRESHOLD = 0.3
 INPUT_SIZE     = (416, 416)
