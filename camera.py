@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 PET Bottle Detection - Hailo AI Hat + Raspberry Pi Camera
-Replaces YOLO CPU inference with Hailo HEF acceleration
+Fixed postprocessing for actual output shapes:
+  best/activation1: (1, 1, 3549, 1)  - confidence scores
+  best/concat14:    (1, 1, 3549, 64) - box regression (DFL)
 """
 
 import cv2
@@ -17,11 +19,107 @@ from hailo_platform import (
 # ── Settings ───────────────────────────────────────────────
 HEF_PATH       = "best.hef"
 CLASS_NAMES    = ["PET-Bottle"]
-CONF_THRESHOLD = 0.4
-INPUT_SIZE     = (416, 416)   # must match HEF compile size
+CONF_THRESHOLD = 0.3
+INPUT_SIZE     = (416, 416)
 CAMERA_SIZE    = (1280, 720)
 CAMERA_FPS     = 60
+REG_MAX        = 16   # DFL reg_max for YOLOv8
 # ───────────────────────────────────────────────────────────
+
+# YOLOv8 anchor grid for 416x416:
+# stride 8  → 52x52 = 2704
+# stride 16 → 26x26 = 676
+# stride 32 → 13x13 = 169
+# Total = 3549
+def generate_anchors(input_size=416, strides=[8, 16, 32]):
+    anchors = []
+    for stride in strides:
+        grid_size = input_size // stride
+        for y in range(grid_size):
+            for x in range(grid_size):
+                anchors.append((x + 0.5, y + 0.5, stride))
+    return anchors
+
+ANCHORS = generate_anchors()
+
+
+def dfl_decode(reg, reg_max=16):
+    """Decode DFL box regression [N, 64] → ltrb distances [N, 4]"""
+    N = reg.shape[0]
+    reg = reg.reshape(N, 4, reg_max)
+    reg = reg - reg.max(axis=-1, keepdims=True)
+    exp = np.exp(reg)
+    reg = exp / exp.sum(axis=-1, keepdims=True)
+    weights = np.arange(reg_max, dtype=np.float32)
+    ltrb = (reg * weights).sum(axis=-1)  # [N, 4]
+    return ltrb
+
+
+def postprocess(outputs, orig_w, orig_h):
+    conf_raw = outputs.get("best/activation1")  # (1,1,3549,1)
+    reg_raw  = outputs.get("best/concat14")      # (1,1,3549,64)
+
+    if conf_raw is None or reg_raw is None:
+        return []
+
+    conf = conf_raw.reshape(-1)      # [3549]
+    reg  = reg_raw.reshape(-1, 64)   # [3549, 64]
+
+    ltrb = dfl_decode(reg, REG_MAX)  # [3549, 4]
+
+    detections = []
+    for i, (score, (l, t, r, b)) in enumerate(zip(conf, ltrb)):
+        if score < CONF_THRESHOLD:
+            continue
+
+        cx, cy, stride = ANCHORS[i]
+
+        # Pixel coords in input space
+        x1 = (cx - l) * stride
+        y1 = (cy - t) * stride
+        x2 = (cx + r) * stride
+        y2 = (cy + b) * stride
+
+        # Scale to original frame
+        sx = orig_w / INPUT_SIZE[0]
+        sy = orig_h / INPUT_SIZE[1]
+        x1 = int(x1 * sx)
+        y1 = int(y1 * sy)
+        x2 = int(x2 * sx)
+        y2 = int(y2 * sy)
+
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(orig_w, x2), min(orig_h, y2)
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        detections.append([x1, y1, x2, y2, float(score), 0])
+
+    if not detections:
+        return []
+
+    # NMS
+    boxes  = [[d[0], d[1], d[2]-d[0], d[3]-d[1]] for d in detections]  # xywh for NMS
+    scores = [d[4] for d in detections]
+    indices = cv2.dnn.NMSBoxes(boxes, scores, CONF_THRESHOLD, 0.45)
+
+    if len(indices) == 0:
+        return []
+    return [detections[i] for i in indices.flatten()]
+
+
+def draw_detections(frame, detections):
+    for (x1, y1, x2, y2, conf, cls_id) in detections:
+        label = CLASS_NAMES[int(cls_id)] if int(cls_id) < len(CLASS_NAMES) else f"cls{cls_id}"
+        color = (0, 255, 0)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 4)
+        text = f"{label.upper()} {conf:.2f}"
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(frame, (x1, y1 - 25), (x1 + tw + 10, y1), color, -1)
+        cv2.putText(frame, text, (x1 + 5, y1 - 7),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+    return frame
 
 
 def setup_camera():
@@ -40,87 +138,10 @@ def setup_camera():
     return picam2
 
 
-def preprocess(frame):
-    """Resize + normalize to float32 [0,1] for Hailo"""
-    img = cv2.resize(frame, INPUT_SIZE)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = img.astype(np.float32) / 255.0
-    return np.expand_dims(img, axis=0)  # [1, H, W, C]
-
-
-def postprocess(outputs, orig_w, orig_h):
-    """Convert raw Hailo output to bounding boxes"""
-    detections = []
-    for name, data in outputs.items():
-        data = np.squeeze(data)
-
-        if data.ndim == 2:
-            # Transpose if shape is [5, N] → [N, 5]
-            if data.shape[0] <= (4 + len(CLASS_NAMES)):
-                data = data.T
-            for det in data:
-                if len(det) < 5:
-                    continue
-                x_c, y_c, w, h = det[0], det[1], det[2], det[3]
-                scores = det[4:]
-                conf = float(np.max(scores))
-                cls_id = int(np.argmax(scores))
-                if conf < CONF_THRESHOLD:
-                    continue
-                x1 = int((x_c - w / 2) * orig_w)
-                y1 = int((y_c - h / 2) * orig_h)
-                x2 = int((x_c + w / 2) * orig_w)
-                y2 = int((y_c + h / 2) * orig_h)
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(orig_w, x2), min(orig_h, y2)
-                detections.append((x1, y1, x2, y2, conf, cls_id))
-
-        elif data.ndim == 3:
-            c, fh, fw = data.shape
-            data = data.reshape(c, -1).T
-            for det in data:
-                if len(det) < 5:
-                    continue
-                x_c, y_c, bw, bh = det[0], det[1], det[2], det[3]
-                scores = det[4:]
-                conf = float(np.max(scores))
-                cls_id = int(np.argmax(scores))
-                if conf < CONF_THRESHOLD:
-                    continue
-                x1 = int((x_c - bw / 2) * orig_w)
-                y1 = int((y_c - bh / 2) * orig_h)
-                x2 = int((x_c + bw / 2) * orig_w)
-                y2 = int((y_c + bh / 2) * orig_h)
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(orig_w, x2), min(orig_h, y2)
-                detections.append((x1, y1, x2, y2, conf, cls_id))
-
-    return detections
-
-
-def draw_detections(frame, detections):
-    for (x1, y1, x2, y2, conf, cls_id) in detections:
-        label = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else f"cls{cls_id}"
-        color = (0, 255, 0)
-
-        # Thick bounding box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 4)
-
-        # Label background + text
-        text = f"{label.upper()} {conf:.2f}"
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        cv2.rectangle(frame, (x1, y1 - 25), (x1 + tw + 10, y1), color, -1)
-        cv2.putText(frame, text, (x1 + 5, y1 - 7),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-    return frame
-
-
 def main():
-    # Load HEF
     print(f"Loading HEF: {HEF_PATH}")
     hef = HEF(HEF_PATH)
 
-    # Setup Hailo AI Hat
     with VDevice() as target:
         configure_params = ConfigureParams.create_from_hef(
             hef, interface=HailoStreamInterface.PCIe
@@ -136,7 +157,6 @@ def main():
             network_group, format_type=FormatType.FLOAT32
         )
 
-        # Setup camera
         picam2 = setup_camera()
         input_name = hef.get_input_vstream_infos()[0].name
 
@@ -145,28 +165,34 @@ def main():
 
         with InferVStreams(network_group, input_vstreams_params, output_vstreams_params) as infer_pipeline:
             with network_group.activate(network_group_params):
-                print("✅ Hailo AI Hat inference running! Press 'q' to quit.")
+                print("✅ Hailo AI Hat running! Press 'q' to quit.")
 
                 try:
                     while True:
                         start_time = time.time()
 
-                        # Capture
                         frame = picam2.capture_array()
                         if frame is None:
                             continue
 
                         orig_h, orig_w = frame.shape[:2]
 
-                        # Preprocess → infer → postprocess
-                        input_data = preprocess(frame)
+                        # Preprocess
+                        img = cv2.resize(frame, INPUT_SIZE)
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        img = img.astype(np.float32) / 255.0
+                        input_data = np.expand_dims(img, axis=0)
+
+                        # Infer
                         raw_outputs = infer_pipeline.infer({input_name: input_data})
+
+                        # Postprocess
                         detections = postprocess(raw_outputs, orig_w, orig_h)
 
-                        # Draw boxes
+                        # Draw
                         frame = draw_detections(frame, detections)
 
-                        # FPS + detection count overlay
+                        # Overlay
                         fps = 1.0 / (time.time() - start_time)
                         cv2.putText(frame, f"FPS: {fps:.1f}", (20, 40),
                                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
