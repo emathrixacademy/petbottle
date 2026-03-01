@@ -1,96 +1,84 @@
-import cv2
-import numpy as np
+import io
 import time
+from flask import Flask, Response, render_template_string
 from picamera2 import Picamera2
-from ultralytics import YOLO
 
-# 1. Initialize YOLOv8n (Nano) 
-# This model detects 80 different classes (bottles, people, cars, etc.)
-model = YOLO('yolov8n.pt')
-
-# 2. Initialize Camera
+app = Flask(__name__)
 picam2 = Picamera2()
 
 def setup_camera():
-    # 1280x720 @ 60FPS: Best for High-Speed AI performance on Pi 5
-    config = picam2.create_preview_configuration(
-        main={"size": (1280, 720), "format": "BGR888"},
-        controls={"FrameRate": 60} 
-    )
+    # 1. Access the full 16:9 wide sensor area
+    # Note: 4608x2592 is the max, but for a web stream, 2304x1296 
+    # provides a massive field of view without lagging the network.
+    config = picam2.create_preview_configuration(main={"size": (2304, 1296)})
     picam2.configure(config)
-    
-    try:
-        # Optimization: HDR off for max FPS, Continuous AF for robot movement
-        picam2.set_controls({"HdrMode": 0, "AfMode": 2})
-    except Exception as e:
-        print(f"Control setup warning: {e}")
-        
-    picam2.start()
-    print("AI Vision System Started: Detecting All Objects (Local Display)")
 
+    # 2. Enable HDR (High Dynamic Range)
+    # This helps the robot see details in shadows and bright spots
+    try:
+        picam2.set_controls({"HdrMode": 1})
+        print("HDR Mode Enabled")
+    except Exception as e:
+        print(f"HDR not supported or failed: {e}")
+
+    # 3. Set Continuous Autofocus
+    # Critical for a moving robot to keep objects sharp
+    picam2.set_controls({"AfMode": 2}) # 2 is 'Continuous' (AfModeContinuous)
+    
+    picam2.start()
+    print("Camera Module 3 Wide initialized at high potential.")
+
+# Initialize hardware
 setup_camera()
 
-# Create the display window
-window_name = "ROBOT VISION - HIGH FPS ALL-OBJECT DETECTION"
-cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+HTML_PAGE = """
+<html>
+    <head>
+        <title>Wide-View Robot Eyes</title>
+        <style>
+            body { margin: 0; background: #111; color: #0f0; font-family: 'Courier New', monospace; text-align: center; }
+            img { width: 100%; height: auto; border-bottom: 3px solid #0f0; }
+            .telemetry { padding: 15px; display: grid; grid-template-columns: 1fr 1fr; text-align: left; max-width: 600px; margin: auto; }
+            .label { color: #888; }
+        </style>
+    </head>
+    <body>
+        <img src="{{ url_for('video_feed') }}">
+        <div class="telemetry">
+            <div><span class="label">SENSOR:</span> IMX708 Wide</div>
+            <div><span class="label">RES:</span> 2304x1296 (16:9)</div>
+            <div><span class="label">HDR:</span> ACTIVE</div>
+            <div><span class="label">AF:</span> CONTINUOUS</div>
+        </div>
+    </body>
+</html>
+"""
 
-try:
+def generate_frames():
     while True:
-        start_time = time.time()
+        # Capture the high-res frame using the hardware encoder
+        buf = io.BytesIO()
+        picam2.capture_file(buf, format='jpeg')
+        frame = buf.getvalue()
         
-        # Capture frame
-        frame = picam2.capture_array()
-        if frame is None:
-            continue
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
-        # --- AI INFERENCE ---
-        # No 'classes' filter = Detects all 80 categories
-        # conf=0.3 is lower to show more potential objects
-        results = model.predict(frame, conf=0.3, verbose=False)
+@app.route('/')
+def index():
+    return render_template_string(HTML_PAGE)
 
-        # Draw Custom Thick Borders for all detected objects
-        for r in results:
-            for box in r.boxes:
-                # Coordinates
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                
-                # Get class name and confidence
-                cls_id = int(box.cls[0])
-                label = model.names[cls_id].upper()
-                conf = float(box.conf[0])
-                
-                # Assign a unique color based on the class ID for better variety
-                color = (int((cls_id * 50) % 255), 255, int((cls_id * 100) % 255))
-                
-                # Thick Border (4px)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 4)
-                
-                # Label Background and Text
-                text = f"{label} {conf:.2f}"
-                (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                cv2.rectangle(frame, (x1, y1 - 25), (x1 + w + 10, y1), color, -1)
-                cv2.putText(frame, text, (x1 + 5, y1 - 7), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
-        # Calculate and Display FPS
-        fps = 1.0 / (time.time() - start_time)
-        cv2.putText(frame, f"FPS: {fps:.1f}", (20, 40), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-        # Show local window
-        cv2.imshow(window_name, frame)
-
-        # Press 'q' to exit
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-except KeyboardInterrupt:
-    print("\nShutting down AI...")
-finally:
-    # Safe cleanup
+if __name__ == '__main__':
     try:
+        # Access via http://<pi-ip>:5000
+        app.run(host='0.0.0.0', port=5000, threaded=True)
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
         picam2.stop()
         picam2.close()
-    except:
-        pass
-    cv2.destroyAllWindows()
