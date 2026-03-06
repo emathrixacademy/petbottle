@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-PET Bottle detection with COCO yolov8s model (bottle class 39)
+PET Bottle detection with COCO yolov8s HEF (bottle class 39)
 Usage:
   python3 camera.py                          # live camera (default)
   python3 camera.py --camera 0               # choose camera index
   python3 camera.py --image sample.jpg       # run on single image
   python3 camera.py --images ./test_images/  # run on image folder
-  python3 camera.py --conf 0.25              # set confidence threshold
+  python3 camera.py --conf 0.20              # set confidence threshold
   python3 camera.py --no-show                # headless / save only
 """
 
@@ -22,119 +22,16 @@ from hailo_platform import (
 )
 
 # ── Settings ───────────────────────────────────────────────
-HEF_PATH        = "yolov8s-coco.hef"
-COCO_BOTTLE_ID  = 39
-CONF_THRESHOLD  = 0.20
-RESULTS_DIR     = "./results"
-SMOOTH_FRAMES   = 10
-CPU_CONF        = 0.25   # confidence for CPU YOLOv8n fallback
-# ───────────────────────────────────────────────────────────
-
-# ── CPU YOLOv8n + YOLOv8m ensemble for laydown detection ──
-_cpu_models = None   # list of loaded models, or False if unavailable
-
-def load_cpu_models():
-    """Load YOLOv8n and YOLOv8m on CPU (once). Auto-downloads weights."""
-    global _cpu_models
-    if _cpu_models is not None:
-        return _cpu_models
-    try:
-        from ultralytics import YOLO
-        _cpu_models = []
-        for name in ("yolov8n.pt", "yolov8m.pt"):
-            m = YOLO(name)
-            _cpu_models.append(m)
-            print(f"  CPU {name} loaded")
-    except Exception as e:
-        print(f"  ultralytics not available ({e}) — horizontal laydown may be missed")
-        _cpu_models = False
-    return _cpu_models
-
-def _rotate_boxes_back(boxes_list, rot_code, orig_w, orig_h):
-    """Transform bounding boxes from rotated frame back to original frame coords."""
-    result = []
-    for (rx1, ry1, rx2, ry2, score) in boxes_list:
-        if rot_code == cv2.ROTATE_90_CLOCKWISE:
-            # rotated size: (orig_h, orig_w) → rot frame w=orig_h, h=orig_w
-            ox1 = ry1;         oy1 = orig_w - rx2
-            ox2 = ry2;         oy2 = orig_w - rx1
-        elif rot_code == cv2.ROTATE_180:
-            ox1 = orig_w - rx2; oy1 = orig_h - ry2
-            ox2 = orig_w - rx1; oy2 = orig_h - ry1
-        elif rot_code == cv2.ROTATE_90_COUNTERCLOCKWISE:
-            ox1 = orig_h - ry2; oy1 = rx1
-            ox2 = orig_h - ry1; oy2 = rx2
-        else:
-            ox1, oy1, ox2, oy2 = rx1, ry1, rx2, ry2
-        ox1, ox2 = sorted([max(0, ox1), min(orig_w, ox2)])
-        oy1, oy2 = sorted([max(0, oy1), min(orig_h, oy2)])
-        if ox2 > ox1 and oy2 > oy1:
-            result.append([ox1, oy1, ox2, oy2, score])
-    return result
-
-
-def cpu_detect(frame, conf_thresh):
-    """
-    Run YOLOv8n + YOLOv8m ensemble at 4 rotations (0°, 90°, 180°, 270°).
-    Catches bottles in any orientation — horizontal laydown becomes
-    upright from the model's perspective after 90° rotation.
-    """
-    models = load_cpu_models()
-    if not models:
-        return []
-
-    orig_h, orig_w = frame.shape[:2]
-    dets = []
-
-    rotations = [
-        (None,                          orig_w, orig_h),
-        (cv2.ROTATE_90_CLOCKWISE,       orig_w, orig_h),
-        (cv2.ROTATE_180,                orig_w, orig_h),
-        (cv2.ROTATE_90_COUNTERCLOCKWISE,orig_w, orig_h),
-    ]
-
-    for rot_code, ow, oh in rotations:
-        img = cv2.rotate(frame, rot_code) if rot_code is not None else frame
-        raw = []
-        for model in models:
-            for box in model(img, classes=[COCO_BOTTLE_ID], conf=conf_thresh, verbose=False)[0].boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                raw.append([x1, y1, x2, y2, float(box.conf[0])])
-        if rot_code is not None:
-            raw = _rotate_boxes_back(raw, rot_code, ow, oh)
-        dets.extend(raw)
-
-    # NMS across all rotations to remove duplicates
-    if not dets:
-        return []
-    boxes  = [[d[0], d[1], d[2]-d[0], d[3]-d[1]] for d in dets]
-    scores = [d[4] for d in dets]
-    idx    = cv2.dnn.NMSBoxes(boxes, scores, conf_thresh, 0.4)
-    return [dets[i] for i in (idx.flatten() if len(idx) else [])]
-
-def merge_detections(hailo_dets, cpu_dets, iou_thresh=0.4):
-    """Add CPU detections that don't overlap with Hailo detections."""
-    merged = list(hailo_dets)
-    for d in cpu_dets:
-        x1, y1, x2, y2 = d[0], d[1], d[2], d[3]
-        duplicate = False
-        for m in merged:
-            ix1 = max(x1, m[0]); iy1 = max(y1, m[1])
-            ix2 = min(x2, m[2]); iy2 = min(y2, m[3])
-            iw = max(0, ix2 - ix1); ih = max(0, iy2 - iy1)
-            inter = iw * ih
-            union = (x2-x1)*(y2-y1) + (m[2]-m[0])*(m[3]-m[1]) - inter
-            if union > 0 and inter / union > iou_thresh:
-                duplicate = True
-                break
-        if not duplicate:
-            merged.append(d)
-    return merged
+HEF_PATH       = "yolov8s-coco.hef"
+COCO_BOTTLE_ID = 39
+CONF_THRESHOLD = 0.20
+RESULTS_DIR    = "./results"
+SMOOTH_FRAMES  = 10
 # ───────────────────────────────────────────────────────────
 
 
 def postprocess_coco(outputs, orig_w, orig_h, conf_thresh):
-    """NMS-format postprocessor for yolov8s-coco.hef — keeps bottle class only."""
+    """NMS-format postprocessor — keeps bottle class only."""
     nms_key = next((k for k in outputs if 'nms' in k.lower() or 'output' in k.lower()), None)
     if nms_key is None:
         return []
@@ -159,45 +56,31 @@ def get_orientation(x1, y1, x2, y2, frame_h):
     """
     Orientation detection for 1.5L and 500ml PET bottles.
     Aspect ratio is the primary and authoritative signal.
-      - ratio > 1.15  → definitely laydown (wider than tall)
-      - ratio < 0.85  → definitely upright (taller than wide)
+      - ratio > 1.15  → laydown (wider than tall)
+      - ratio < 0.85  → upright (taller than wide)
       - 0.85–1.15     → ambiguous, use vertical fill as tiebreaker
     """
     w, h = x2 - x1, y2 - y1
     if w == 0 or h == 0:
         return "upright"
-
-    ratio = w / h  # >1 = wider than tall
-
+    ratio = w / h
     if ratio > 1.15:
         return "laydown"
     if ratio < 0.85:
         return "upright"
-
-    # Ambiguous zone: box is nearly square (common for 500ml upright)
-    # Use vertical fill — upright bottles extend tall in frame
     remaining = frame_h - y1
     vertical_fill = h / remaining if remaining > 0 else 1.0
     return "upright" if vertical_fill > 0.4 else "laydown"
 
 
 def draw_orientation_arrow(frame, x1, y1, x2, y2, orientation, color):
-    """Draw an arrow inside the box showing bottle orientation."""
     cx = (x1 + x2) // 2
     cy = (y1 + y2) // 2
-    w, h = x2 - x1, y2 - y1
-    arm = min(w, h) // 3
-
+    arm = min(x2 - x1, y2 - y1) // 3
     if orientation == "upright":
-        # Vertical arrow pointing up
-        pt_tail = (cx, cy + arm)
-        pt_head = (cx, cy - arm)
+        cv2.arrowedLine(frame, (cx, cy + arm), (cx, cy - arm), color, 2, tipLength=0.4)
     else:
-        # Horizontal arrow pointing right
-        pt_tail = (cx - arm, cy)
-        pt_head = (cx + arm, cy)
-
-    cv2.arrowedLine(frame, pt_tail, pt_head, color, 2, tipLength=0.4)
+        cv2.arrowedLine(frame, (cx - arm, cy), (cx + arm, cy), color, 2, tipLength=0.4)
 
 
 def draw_detections(frame, detections):
@@ -220,32 +103,23 @@ def draw_detections(frame, detections):
 
 
 class DetectionTracker:
-    """
-    Temporal smoother: keeps a detection alive for SMOOTH_FRAMES frames
-    after it was last seen, preventing flicker when the model misses a frame.
-    Uses IoU matching to track boxes across frames.
-    """
+    """Keeps detections alive for SMOOTH_FRAMES after last seen — prevents flicker."""
     def __init__(self, max_age=SMOOTH_FRAMES, iou_thresh=0.35):
-        self.max_age   = max_age
+        self.max_age    = max_age
         self.iou_thresh = iou_thresh
-        self.tracked   = []  # list of [x1,y1,x2,y2,conf, age]
+        self.tracked    = []  # [x1,y1,x2,y2,conf,age]
 
     def _iou(self, a, b):
         ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
         ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
-        iw  = max(0, ix2 - ix1); ih = max(0, iy2 - iy1)
+        iw = max(0, ix2 - ix1); ih = max(0, iy2 - iy1)
         inter = iw * ih
-        ua = (a[2]-a[0])*(a[3]-a[1]); ub = (b[2]-b[0])*(b[3]-b[1])
-        union = ua + ub - inter
+        union = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
         return inter / union if union > 0 else 0.0
 
     def update(self, detections):
-        # Age all tracked boxes
         for t in self.tracked:
             t[5] += 1
-
-        # Match new detections to existing tracks
-        matched = set()
         for det in detections:
             best_iou, best_idx = 0, -1
             for i, t in enumerate(self.tracked):
@@ -253,18 +127,11 @@ class DetectionTracker:
                 if iou > best_iou:
                     best_iou, best_idx = iou, i
             if best_iou >= self.iou_thresh:
-                # Update existing track with new position + reset age
                 self.tracked[best_idx][:5] = list(det)
                 self.tracked[best_idx][5]  = 0
-                matched.add(best_idx)
             else:
-                # New detection
                 self.tracked.append(list(det) + [0])
-
-        # Remove stale tracks
         self.tracked = [t for t in self.tracked if t[5] <= self.max_age]
-
-        # Return all live tracks (age <= max_age)
         return [[t[0], t[1], t[2], t[3], t[4]] for t in self.tracked]
 
 
@@ -317,17 +184,15 @@ def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, o
     print(f"  Live Camera | conf={conf_thresh} | Q to quit")
     print(f"{'='*55}\n")
 
-    frame_idx  = 0
-    ms         = 0.0
-    tracker    = DetectionTracker()
-    last_cpu   = []   # cached CPU detections
-    CPU_EVERY  = 3    # run CPU inference every N frames
+    frame_idx = 0
+    ms        = 0.0
+    tracker   = DetectionTracker()
 
     try:
         while True:
             if use_picamera2:
-                frame_rgb = picam2.capture_array()
-                frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                frame_rgb  = picam2.capture_array()
+                frame      = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
                 input_data = preprocess(frame_rgb, is_rgb=True, input_size=input_size)
             else:
                 ret, frame = cap.read()
@@ -342,10 +207,7 @@ def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, o
             raw_outputs = infer_pipeline.infer({input_name: input_data})
             ms = (time.time() - t0) * 1000
 
-            hailo_dets = postprocess_coco(raw_outputs, orig_w, orig_h, conf_thresh)
-            if frame_idx % CPU_EVERY == 0:
-                last_cpu = cpu_detect(frame, CPU_CONF)
-            raw_dets   = merge_detections(hailo_dets, last_cpu)
+            raw_dets   = postprocess_coco(raw_outputs, orig_w, orig_h, conf_thresh)
             detections = tracker.update(raw_dets)
 
             result = draw_detections(frame.copy(), detections)
@@ -413,9 +275,7 @@ def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out
         raw_outputs = infer_pipeline.infer({input_name: input_data})
         ms = (time.time() - t0) * 1000
 
-        hailo_dets = postprocess_coco(raw_outputs, orig_w, orig_h, conf_thresh)
-        cpu_dets   = cpu_detect(frame, CPU_CONF)
-        detections = merge_detections(hailo_dets, cpu_dets)
+        detections = postprocess_coco(raw_outputs, orig_w, orig_h, conf_thresh)
         total_det += len(detections)
         total_ms  += ms
 
@@ -450,14 +310,14 @@ def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PET Bottle detection (COCO yolov8s)")
+    parser = argparse.ArgumentParser(description="PET Bottle detection (COCO yolov8s HEF)")
     parser.add_argument("--image",   default=None,  help="Path to a single image file")
     parser.add_argument("--images",  default=None,  help="Path to image folder")
     parser.add_argument("--camera",  type=int, default=0, help="Camera index (default: 0)")
     parser.add_argument("--output",  default=RESULTS_DIR, help="Directory to save results")
     parser.add_argument("--conf",    type=float, default=CONF_THRESHOLD,
                         help=f"Confidence threshold (default: {CONF_THRESHOLD})")
-    parser.add_argument("--no-show", action="store_true", help="Headless mode — no display window")
+    parser.add_argument("--no-show", action="store_true", help="Headless mode")
     args = parser.parse_args()
 
     out_dir = Path(args.output)
@@ -475,8 +335,8 @@ def main():
     configure_params = ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)
 
     with VDevice() as target:
-        network_groups = target.configure(hef, configure_params)
-        network_group  = network_groups[0]
+        network_groups       = target.configure(hef, configure_params)
+        network_group        = network_groups[0]
         network_group_params = network_group.create_params()
 
         input_vstreams_params  = InputVStreamParams.make(network_group, format_type=FormatType.UINT8)
@@ -484,7 +344,7 @@ def main():
 
         input_info = hef.get_input_vstream_infos()[0]
         input_name = input_info.name
-        h, w = input_info.shape[0], input_info.shape[1]
+        h, w       = input_info.shape[0], input_info.shape[1]
         input_size = (w, h)
         print(f"Model input size: {input_size}")
 
