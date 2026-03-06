@@ -53,30 +53,38 @@ def postprocess_coco(outputs, orig_w, orig_h, conf_thresh):
 
 def get_orientation(x1, y1, x2, y2, frame_h):
     """
-    Determine bottle orientation using three independent signals:
-      1. Aspect ratio  — width/height (strongest signal)
-      2. Vertical fill — how much of the remaining frame height the box occupies
-      3. Box diagonal angle — angle of the bounding box diagonal from horizontal
-    Each signal casts a vote; majority (2/3) wins.
+    Orientation detection tuned for 1.5L and 500ml PET bottles.
+
+    1.5L bottles: tall/slim — upright aspect ~0.35 w/h, laydown ~2.8 w/h
+    500ml bottles: shorter/wider — upright aspect ~0.55 w/h, laydown ~1.8 w/h
+
+    Three signals, majority vote (2/3):
+      1. Aspect ratio  — primary signal
+      2. Vertical fill — how much frame height the box fills from its top
+      3. Box compactness — 500ml upright boxes are squarish but taller than wide
     """
     w, h = x2 - x1, y2 - y1
     if w == 0 or h == 0:
         return "upright"
 
+    ratio = w / h  # >1 = wider than tall, <1 = taller than wide
+
     # --- Signal 1: aspect ratio ---
-    ratio = w / h
-    sig1 = "laydown" if ratio > 1.2 else "upright"
+    # Laydown threshold lowered to 1.0 to catch 500ml bottles on their side
+    # (500ml laydown w/h ~1.8, upright w/h ~0.55)
+    sig1 = "laydown" if ratio > 1.0 else "upright"
 
     # --- Signal 2: vertical fill ---
-    # Upright bottles fill a large fraction of the space below their top edge
+    # Upright bottles occupy a tall portion of the frame from their top edge
+    # 500ml upright is shorter so threshold lowered to 0.35
     remaining = frame_h - y1
     vertical_fill = h / remaining if remaining > 0 else 1.0
-    sig2 = "upright" if vertical_fill > 0.45 else "laydown"
+    sig2 = "upright" if vertical_fill > 0.35 else "laydown"
 
-    # --- Signal 3: diagonal angle ---
-    # angle of box diagonal from horizontal; upright boxes have steep diagonals (>45°)
-    angle_deg = abs(np.degrees(np.arctan2(h, w)))  # 0°=flat, 90°=tall
-    sig3 = "upright" if angle_deg > 50 else "laydown"
+    # --- Signal 3: height dominance ---
+    # For both bottle sizes, upright means height > width
+    # Use a small margin so near-square 500ml upright still votes upright
+    sig3 = "upright" if h > w * 0.85 else "laydown"
 
     votes = [sig1, sig2, sig3]
     return "laydown" if votes.count("laydown") >= 2 else "upright"
