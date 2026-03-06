@@ -158,22 +158,25 @@ def overlay_info(frame, detections, ms, extra=""):
 
 
 def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, out_dir):
-    # Pi Camera via libcamera (gstreamer) or fallback to V4L2
-    gst_pipeline = (
-        "libcamerasrc ! video/x-raw,width=640,height=480,framerate=30/1 ! "
-        "videoconvert ! appsink"
-    )
-    cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
-    if not cap.isOpened():
-        print("  GStreamer/libcamera not available, falling back to V4L2...")
+    # Use picamera2 for Pi Camera ribbon (CSI)
+    try:
+        from picamera2 import Picamera2
+        picam2 = Picamera2()
+        picam2.configure(picam2.create_preview_configuration(
+            main={"format": "BGR888", "size": (640, 480)}
+        ))
+        picam2.start()
+        use_picamera2 = True
+        print("  Using picamera2 (CSI ribbon)")
+    except Exception as e:
+        print(f"  picamera2 not available ({e}), falling back to V4L2...")
+        use_picamera2 = False
         cap = cv2.VideoCapture(camera_index)
-
-    if not cap.isOpened():
-        print(f"❌ Cannot open camera (index={camera_index})")
-        return
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        if not cap.isOpened():
+            print(f"❌ Cannot open camera (index={camera_index})")
+            return
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     if not no_show:
         cv2.namedWindow("PET Bottle Detection", cv2.WINDOW_NORMAL)
@@ -185,43 +188,50 @@ def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, o
     frame_idx = 0
     ms = 0.0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("  ⚠️  Frame capture failed, retrying...")
-            continue
+    try:
+        while True:
+            if use_picamera2:
+                frame = picam2.capture_array()
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    print("  ⚠️  Frame capture failed")
+                    break
 
-        orig_h, orig_w = frame.shape[:2]
-        input_data = preprocess(frame)
+            orig_h, orig_w = frame.shape[:2]
+            input_data = preprocess(frame)
 
-        t0 = time.time()
-        raw_outputs = infer_pipeline.infer({input_name: input_data})
-        ms = (time.time() - t0) * 1000
+            t0 = time.time()
+            raw_outputs = infer_pipeline.infer({input_name: input_data})
+            ms = (time.time() - t0) * 1000
 
-        detections = postprocess(raw_outputs, orig_w, orig_h, conf_thresh)
+            detections = postprocess(raw_outputs, orig_w, orig_h, conf_thresh)
 
-        result = draw_detections(frame.copy(), detections)
-        overlay_info(result, detections, ms, f"Frame {frame_idx}")
+            result = draw_detections(frame.copy(), detections)
+            overlay_info(result, detections, ms, f"Frame {frame_idx}")
 
-        icon = "✅" if detections else "⬜"
-        print(f"\r  {icon} frame={frame_idx:5d} | {len(detections):2d} det | {ms:.1f}ms", end="", flush=True)
+            icon = "✅" if detections else "⬜"
+            print(f"\r  {icon} frame={frame_idx:5d} | {len(detections):2d} det | {ms:.1f}ms", end="", flush=True)
 
+            if not no_show:
+                cv2.imshow("PET Bottle Detection", result)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord('q'), ord('Q'), 27):
+                    break
+                if key == ord('s'):
+                    snap = out_dir / f"snap_{frame_idx:05d}.jpg"
+                    cv2.imwrite(str(snap), result)
+                    print(f"\n  Saved: {snap}")
+
+            frame_idx += 1
+    finally:
+        if use_picamera2:
+            picam2.stop()
+        else:
+            cap.release()
         if not no_show:
-            cv2.imshow("PET Bottle Detection", result)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord('q'), ord('Q'), 27):
-                break
-            if key == ord('s'):
-                snap = out_dir / f"snap_{frame_idx:05d}.jpg"
-                cv2.imwrite(str(snap), result)
-                print(f"\n  Saved: {snap}")
-
-        frame_idx += 1
-
-    cap.release()
-    if not no_show:
-        cv2.destroyAllWindows()
-    print()
+            cv2.destroyAllWindows()
+        print()
 
 
 def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out_dir):
