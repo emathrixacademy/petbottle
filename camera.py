@@ -53,18 +53,33 @@ def postprocess_coco(outputs, orig_w, orig_h, conf_thresh):
 
 def get_orientation(x1, y1, x2, y2, frame_h):
     """
-    Determine bottle orientation using aspect ratio + vertical position.
-    A laid-down bottle is wider than tall (w > h * 1.4).
+    Determine bottle orientation using three independent signals:
+      1. Aspect ratio  — width/height (strongest signal)
+      2. Vertical fill — how much of the remaining frame height the box occupies
+      3. Box diagonal angle — angle of the bounding box diagonal from horizontal
+    Each signal casts a vote; majority (2/3) wins.
     """
     w, h = x2 - x1, y2 - y1
-    ratio = w / h if h > 0 else 1
+    if w == 0 or h == 0:
+        return "upright"
 
-    if ratio > 1.4:
-        return "laydown"
-    if ratio > 0.8:
-        vertical_fill = h / (frame_h - y1) if (frame_h - y1) > 0 else 1
-        return "upright" if vertical_fill > 0.5 else "laydown"
-    return "upright"
+    # --- Signal 1: aspect ratio ---
+    ratio = w / h
+    sig1 = "laydown" if ratio > 1.2 else "upright"
+
+    # --- Signal 2: vertical fill ---
+    # Upright bottles fill a large fraction of the space below their top edge
+    remaining = frame_h - y1
+    vertical_fill = h / remaining if remaining > 0 else 1.0
+    sig2 = "upright" if vertical_fill > 0.45 else "laydown"
+
+    # --- Signal 3: diagonal angle ---
+    # angle of box diagonal from horizontal; upright boxes have steep diagonals (>45°)
+    angle_deg = abs(np.degrees(np.arctan2(h, w)))  # 0°=flat, 90°=tall
+    sig3 = "upright" if angle_deg > 50 else "laydown"
+
+    votes = [sig1, sig2, sig3]
+    return "laydown" if votes.count("laydown") >= 2 else "upright"
 
 
 def draw_orientation_arrow(frame, x1, y1, x2, y2, orientation, color):
