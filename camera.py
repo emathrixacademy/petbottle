@@ -214,6 +214,151 @@ def overlay_info(frame, detections, ms, extra=""):
     return frame
 
 
+def load_model(hef_path, use_coco=False):
+    """Load a HEF and return (network_group, network_group_params, input_info, output_names, infer_pipeline context)."""
+    hef  = HEF(hef_path)
+    fmt  = FormatType.UINT8 if use_coco else FormatType.FLOAT32
+    return hef, fmt
+
+
+def merge_detections(dets_a, dets_b, iou_thresh=0.5):
+    """Merge two detection lists, removing duplicates by IoU."""
+    merged = list(dets_a)
+    for d in dets_b:
+        x1, y1, x2, y2 = d[0], d[1], d[2], d[3]
+        duplicate = False
+        for m in merged:
+            ix1 = max(x1, m[0]); iy1 = max(y1, m[1])
+            ix2 = min(x2, m[2]); iy2 = min(y2, m[3])
+            iw  = max(0, ix2 - ix1); ih = max(0, iy2 - iy1)
+            inter = iw * ih
+            union = (x2-x1)*(y2-y1) + (m[2]-m[0])*(m[3]-m[1]) - inter
+            if union > 0 and inter / union > iou_thresh:
+                duplicate = True
+                break
+        if not duplicate:
+            merged.append(d)
+    return merged
+
+
+def run_dual_camera(target, conf_thresh, camera_index, no_show, out_dir):
+    """Run COCO model + petbottle model simultaneously and merge detections."""
+    coco_hef  = HEF(HEF_MODELS[4])
+    pet_hef   = HEF(HEF_MODELS[1])
+
+    coco_cfg  = ConfigureParams.create_from_hef(coco_hef,  interface=HailoStreamInterface.PCIe)
+    pet_cfg   = ConfigureParams.create_from_hef(pet_hef,   interface=HailoStreamInterface.PCIe)
+
+    coco_ng   = target.configure(coco_hef,  coco_cfg)[0]
+    pet_ng    = target.configure(pet_hef,   pet_cfg)[0]
+
+    coco_in_params  = InputVStreamParams.make(coco_ng, format_type=FormatType.UINT8)
+    coco_out_params = OutputVStreamParams.make(coco_ng, format_type=FormatType.FLOAT32)
+    pet_in_params   = InputVStreamParams.make(pet_ng,  format_type=FormatType.FLOAT32)
+    pet_out_params  = OutputVStreamParams.make(pet_ng,  format_type=FormatType.FLOAT32)
+
+    coco_input_name = coco_hef.get_input_vstream_infos()[0].name
+    pet_input_name  = pet_hef.get_input_vstream_infos()[0].name
+    coco_input_info = coco_hef.get_input_vstream_infos()[0]
+    pet_input_info  = pet_hef.get_input_vstream_infos()[0]
+    coco_size = (coco_input_info.shape[1], coco_input_info.shape[0])
+    pet_size  = (pet_input_info.shape[1],  pet_input_info.shape[0])
+    pet_output_names = [o.name for o in pet_hef.get_output_vstream_infos()]
+
+    print(f"  COCO model input: {coco_size}  |  PetBottle model input: {pet_size}")
+
+    # Use picamera2 for Pi Camera ribbon (CSI)
+    try:
+        from picamera2 import Picamera2
+        picam2 = Picamera2()
+        picam2.configure(picam2.create_preview_configuration(
+            main={"format": "BGR888", "size": (640, 480)}
+        ))
+        picam2.start()
+        use_picamera2 = True
+        print("  Using picamera2 (CSI ribbon)")
+    except Exception as e:
+        print(f"  picamera2 not available ({e}), falling back to V4L2...")
+        use_picamera2 = False
+        cap = cv2.VideoCapture(camera_index)
+        if not cap.isOpened():
+            print(f"❌ Cannot open camera (index={camera_index})")
+            return
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    if not no_show:
+        cv2.namedWindow("PET Bottle Detection", cv2.WINDOW_NORMAL)
+
+    print(f"\n{'='*55}")
+    print(f"  Dual Model | conf={conf_thresh} | Q to quit")
+    print(f"{'='*55}\n")
+
+    frame_idx = 0
+    ms = 0.0
+
+    try:
+        while True:
+            if use_picamera2:
+                frame_rgb = picam2.capture_array()
+                frame     = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                coco_data = preprocess(frame_rgb, is_rgb=True, use_coco=True,  input_size=coco_size)
+                pet_data  = preprocess(frame_rgb, is_rgb=True, use_coco=False, input_size=pet_size)
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    print("  ⚠️  Frame capture failed")
+                    break
+                coco_data = preprocess(frame, use_coco=True,  input_size=coco_size)
+                pet_data  = preprocess(frame, use_coco=False, input_size=pet_size)
+
+            orig_h, orig_w = frame.shape[:2]
+            t0 = time.time()
+
+            # Run COCO model
+            with coco_ng.activate():
+                with InferVStreams(coco_ng, coco_in_params, coco_out_params) as pipe:
+                    coco_out  = pipe.infer({coco_input_name: coco_data})
+            coco_dets = postprocess_coco(coco_out, orig_w, orig_h, conf_thresh)
+
+            # Run petbottle model
+            with pet_ng.activate():
+                with InferVStreams(pet_ng, pet_in_params, pet_out_params) as pipe:
+                    pet_out   = pipe.infer({pet_input_name: pet_data})
+            pet_dets  = postprocess(pet_out, orig_w, orig_h, conf_thresh, pet_output_names)
+
+            ms = (time.time() - t0) * 1000
+
+            # Merge, removing overlapping boxes
+            detections = merge_detections(coco_dets, pet_dets)
+
+            result = draw_detections(frame.copy(), detections)
+            overlay_info(result, detections, ms, f"Frame {frame_idx} [DUAL]")
+
+            icon = "✅" if detections else "⬜"
+            print(f"\r  {icon} frame={frame_idx:5d} | {len(detections):2d} det | {ms:.1f}ms", end="", flush=True)
+
+            if not no_show:
+                cv2.imshow("PET Bottle Detection", result)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord('q'), ord('Q'), 27):
+                    break
+                if key == ord('s'):
+                    snap = out_dir / f"snap_{frame_idx:05d}.jpg"
+                    cv2.imwrite(str(snap), result)
+                    print(f"\n  Saved: {snap}")
+
+            frame_idx += 1
+    finally:
+        if use_picamera2:
+            picam2.stop()
+        else:
+            cap.release()
+        if not no_show:
+            cv2.destroyAllWindows()
+        print()
+
+
 def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, out_dir, output_names=None, use_coco=False, input_size=None):
     # Use picamera2 for Pi Camera ribbon (CSI)
     try:
@@ -369,6 +514,8 @@ def main():
     parser = argparse.ArgumentParser(description="PET Bottle detection — camera or images")
     parser.add_argument("--model",   type=int, default=4, choices=[1, 2, 3, 4],
                         help="Model: 1=yolov8m, 2=yolov8n, 3=yolov8s, 4=COCO-yolov8s (default)")
+    parser.add_argument("--dual",    action="store_true",
+                        help="Run dual model: COCO (upright) + petbottle-yolov8m (laydown)")
     parser.add_argument("--image",   default=None,
                         help="Path to a single image file")
     parser.add_argument("--images",  default=None,
@@ -386,19 +533,22 @@ def main():
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    hef_path = HEF_MODELS[args.model]
-    print(f"Loading HEF: {hef_path}  (model {args.model})")
-    hef = HEF(hef_path)
-
-    # Print detected stream names for debugging
-    print("Input streams:")
-    for i in hef.get_input_vstream_infos():
-        print(f"  {i.name}  shape={i.shape}")
-    print("Output streams:")
-    for o in hef.get_output_vstream_infos():
-        print(f"  {o.name}  shape={o.shape}")
-
     with VDevice() as target:
+        # Dual model mode — runs both COCO and petbottle model
+        if args.dual and not args.image and not args.images:
+            run_dual_camera(target, args.conf, args.camera, args.no_show, out_dir)
+            return
+
+        hef_path = HEF_MODELS[args.model]
+        print(f"Loading HEF: {hef_path}  (model {args.model})")
+        hef = HEF(hef_path)
+        print("Input streams:")
+        for i in hef.get_input_vstream_infos():
+            print(f"  {i.name}  shape={i.shape}")
+        print("Output streams:")
+        for o in hef.get_output_vstream_infos():
+            print(f"  {o.name}  shape={o.shape}")
+
         configure_params = ConfigureParams.create_from_hef(
             hef, interface=HailoStreamInterface.PCIe
         )
