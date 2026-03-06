@@ -161,8 +161,9 @@ def draw_detections(frame, detections):
     return frame
 
 
-def preprocess(frame, is_rgb=False, use_coco=False):
-    img = cv2.resize(frame, INPUT_SIZE)
+def preprocess(frame, is_rgb=False, use_coco=False, input_size=None):
+    size = input_size if input_size else INPUT_SIZE
+    img = cv2.resize(frame, size)
     if not is_rgb:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     if use_coco:
@@ -183,7 +184,7 @@ def overlay_info(frame, detections, ms, extra=""):
     return frame
 
 
-def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, out_dir, output_names=None, use_coco=False):
+def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, out_dir, output_names=None, use_coco=False, input_size=None):
     # Use picamera2 for Pi Camera ribbon (CSI)
     try:
         from picamera2 import Picamera2
@@ -219,13 +220,13 @@ def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, o
             if use_picamera2:
                 frame_rgb = picam2.capture_array()
                 frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-                input_data = preprocess(frame_rgb, is_rgb=True, use_coco=use_coco)
+                input_data = preprocess(frame_rgb, is_rgb=True, use_coco=use_coco, input_size=input_size)
             else:
                 ret, frame = cap.read()
                 if not ret:
                     print("  ⚠️  Frame capture failed")
                     break
-                input_data = preprocess(frame, use_coco=use_coco)
+                input_data = preprocess(frame, use_coco=use_coco, input_size=input_size)
 
             orig_h, orig_w = frame.shape[:2]
 
@@ -262,7 +263,7 @@ def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, o
         print()
 
 
-def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out_dir, single=None, output_names=None, use_coco=False):
+def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out_dir, single=None, output_names=None, use_coco=False, input_size=None):
     if single:
         image_files = [single]
     else:
@@ -294,7 +295,7 @@ def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out
             continue
 
         orig_h, orig_w = frame.shape[:2]
-        input_data = preprocess(frame, use_coco=use_coco)
+        input_data = preprocess(frame, use_coco=use_coco, input_size=input_size)
 
         t0 = time.time()
         raw_outputs = infer_pipeline.infer({input_name: input_data})
@@ -379,7 +380,11 @@ def main():
         fmt = FormatType.UINT8 if use_coco else FormatType.FLOAT32
         input_vstreams_params  = InputVStreamParams.make(network_group, format_type=fmt)
         output_vstreams_params = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
-        input_name = hef.get_input_vstream_infos()[0].name
+        input_info = hef.get_input_vstream_infos()[0]
+        input_name = input_info.name
+        h, w = input_info.shape[0], input_info.shape[1]
+        model_input_size = (w, h)
+        print(f"Model input size: {model_input_size}")
         output_names = [o.name for o in hef.get_output_vstream_infos()]
 
         with InferVStreams(network_group, input_vstreams_params, output_vstreams_params) as infer_pipeline:
@@ -388,15 +393,17 @@ def main():
                     run_images(infer_pipeline, input_name, args.conf,
                                None, args.no_show, out_dir,
                                single=Path(args.image), output_names=output_names,
-                               use_coco=use_coco)
+                               use_coco=use_coco, input_size=model_input_size)
                 elif args.images:
                     run_images(infer_pipeline, input_name, args.conf,
                                args.images, args.no_show, out_dir,
-                               output_names=output_names, use_coco=use_coco)
+                               output_names=output_names, use_coco=use_coco,
+                               input_size=model_input_size)
                 else:
                     run_camera(infer_pipeline, input_name, args.conf,
                                args.camera, args.no_show, out_dir,
-                               output_names=output_names, use_coco=use_coco)
+                               output_names=output_names, use_coco=use_coco,
+                               input_size=model_input_size)
 
 
 if __name__ == "__main__":
