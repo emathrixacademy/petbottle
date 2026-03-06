@@ -27,7 +27,7 @@ HEF_MODELS = {
     3: "petbottle-yolov8s.hef",
 }
 CLASS_NAMES    = ["PET-Bottle"]
-CONF_THRESHOLD = 0.05
+CONF_THRESHOLD = 0.25
 INPUT_SIZE     = (416, 416)
 REG_MAX        = 16
 RESULTS_DIR    = "./results"
@@ -100,6 +100,10 @@ def postprocess(outputs, orig_w, orig_h, conf_thresh, output_names=None):
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(orig_w, x2), min(orig_h, y2)
         if x2 <= x1 or y2 <= y1:
+            continue
+        w, h = x2 - x1, y2 - y1
+        aspect = h / w if w > 0 else 0
+        if aspect < 0.8 or aspect > 6.0:  # filter non-bottle shapes
             continue
         detections.append([x1, y1, x2, y2, float(score), 0])
 
