@@ -68,15 +68,15 @@ def find_outputs(outputs):
 
 
 def postprocess(outputs, orig_w, orig_h, conf_thresh):
-    conf_raw, reg_raw = find_outputs(outputs)
+    conf_raw = outputs.get("petbottle/activation1")
+    reg_raw  = outputs.get("petbottle/concat14")
     if conf_raw is None or reg_raw is None:
-        # Fallback: try known key names
-        conf_raw = outputs.get("petbottle/activation1")
-        reg_raw  = outputs.get("petbottle/concat14")
+        conf_raw, reg_raw = find_outputs(outputs)
     if conf_raw is None or reg_raw is None:
         return []
 
     conf = conf_raw.reshape(-1)
+    print(f"  [debug] max_conf={conf.max():.4f}  thresh={conf_thresh}", flush=True)
     reg  = reg_raw.reshape(-1, 64)
     ltrb = dfl_decode(reg, REG_MAX)
 
