@@ -27,7 +27,7 @@ HEF_MODELS = {
     3: "petbottle-yolov8s.hef",
 }
 CLASS_NAMES    = ["PET-Bottle"]
-CONF_THRESHOLD = 0.015
+CONF_THRESHOLD = 0.05
 INPUT_SIZE     = (416, 416)
 REG_MAX        = 16
 RESULTS_DIR    = "./results"
@@ -108,7 +108,7 @@ def postprocess(outputs, orig_w, orig_h, conf_thresh, output_names=None):
 
     boxes  = [[d[0], d[1], d[2]-d[0], d[3]-d[1]] for d in detections]
     scores = [d[4] for d in detections]
-    indices = cv2.dnn.NMSBoxes(boxes, scores, conf_thresh, 0.45)
+    indices = cv2.dnn.NMSBoxes(boxes, scores, conf_thresh, 0.3)
     if len(indices) == 0:
         return []
     return [detections[i] for i in indices.flatten()]
