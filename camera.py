@@ -27,7 +27,7 @@ HEF_MODELS = {
     3: "petbottle-yolov8s.hef",
 }
 CLASS_NAMES    = ["PET-Bottle"]
-CONF_THRESHOLD = 0.01
+CONF_THRESHOLD = 0.015
 INPUT_SIZE     = (416, 416)
 REG_MAX        = 16
 RESULTS_DIR    = "./results"
@@ -131,9 +131,10 @@ def draw_detections(frame, detections):
     return frame
 
 
-def preprocess(frame):
+def preprocess(frame, is_rgb=False):
     img = cv2.resize(frame, INPUT_SIZE)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    if not is_rgb:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img = img.astype(np.float32) / 255.0
     return np.expand_dims(img, axis=0)
 
@@ -185,15 +186,17 @@ def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, o
     try:
         while True:
             if use_picamera2:
-                frame = picam2.capture_array()
+                frame_rgb = picam2.capture_array()
+                frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                input_data = preprocess(frame_rgb, is_rgb=True)
             else:
                 ret, frame = cap.read()
                 if not ret:
                     print("  ⚠️  Frame capture failed")
                     break
+                input_data = preprocess(frame)
 
             orig_h, orig_w = frame.shape[:2]
-            input_data = preprocess(frame)
 
             t0 = time.time()
             raw_outputs = infer_pipeline.infer({input_name: input_data})
