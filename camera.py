@@ -109,31 +109,17 @@ def postprocess(outputs, orig_w, orig_h, conf_thresh):
 def draw_detections(frame, detections):
     for (x1, y1, x2, y2, conf, cls_id) in detections:
         label = CLASS_NAMES[int(cls_id)] if int(cls_id) < len(CLASS_NAMES) else f"cls{cls_id}"
+        text  = f"{label.upper()}  {conf:.2f}"
 
-        # Outer border (red)
-        cv2.rectangle(frame, (x1-2, y1-2), (x2+2, y2+2), (0, 0, 255), 6)
-        # Inner border (green)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        # Bounding box
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
 
-        # Corner accents
-        clen = 20
-        ct   = 4
-        c    = (0, 255, 0)
-        cv2.line(frame, (x1, y1), (x1+clen, y1), c, ct)
-        cv2.line(frame, (x1, y1), (x1, y1+clen), c, ct)
-        cv2.line(frame, (x2, y1), (x2-clen, y1), c, ct)
-        cv2.line(frame, (x2, y1), (x2, y1+clen), c, ct)
-        cv2.line(frame, (x1, y2), (x1+clen, y2), c, ct)
-        cv2.line(frame, (x1, y2), (x1, y2-clen), c, ct)
-        cv2.line(frame, (x2, y2), (x2-clen, y2), c, ct)
-        cv2.line(frame, (x2, y2), (x2, y2-clen), c, ct)
-
-        # Label
-        text = f"{label.upper()} {conf:.2f}"
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-        cv2.rectangle(frame, (x1, y1-30), (x1+tw+10, y1), (0, 0, 255), -1)
-        cv2.putText(frame, text, (x1+5, y1-8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        # Label badge
+        (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        badge_y = max(y1 - th - baseline - 8, 0)
+        cv2.rectangle(frame, (x1, badge_y), (x1 + tw + 10, y1), (0, 255, 0), -1)
+        cv2.putText(frame, text, (x1 + 5, y1 - baseline - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
     return frame
 
 
