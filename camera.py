@@ -149,20 +149,29 @@ def postprocess(outputs, orig_w, orig_h, conf_thresh, output_names=None, use_coc
     return [detections[i] for i in indices.flatten()]
 
 
+def get_orientation(x1, y1, x2, y2):
+    """Return 'upright' or 'laydown' based on bounding box shape."""
+    w, h = x2 - x1, y2 - y1
+    return "laydown" if w > h else "upright"
+
+
 def draw_detections(frame, detections):
     for (x1, y1, x2, y2, conf, cls_id) in detections:
-        label = CLASS_NAMES[int(cls_id)] if int(cls_id) < len(CLASS_NAMES) else f"cls{cls_id}"
-        text  = f"{label.upper()}  {conf:.2f}"
+        label       = CLASS_NAMES[int(cls_id)] if int(cls_id) < len(CLASS_NAMES) else f"cls{cls_id}"
+        orientation = get_orientation(x1, y1, x2, y2)
+        tag         = "LAYDOWN" if orientation == "laydown" else "UPRIGHT"
+        color       = (0, 165, 255) if orientation == "laydown" else (0, 255, 0)  # orange / green
+        text        = f"{label.upper()} {tag}  {conf:.2f}"
 
         # Bounding box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
 
         # Label badge
-        (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
         badge_y = max(y1 - th - baseline - 8, 0)
-        cv2.rectangle(frame, (x1, badge_y), (x1 + tw + 10, y1), (0, 255, 0), -1)
+        cv2.rectangle(frame, (x1, badge_y), (x1 + tw + 10, y1), color, -1)
         cv2.putText(frame, text, (x1 + 5, y1 - baseline - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2)
     return frame
 
 
@@ -342,8 +351,8 @@ def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out
 
 def main():
     parser = argparse.ArgumentParser(description="PET Bottle detection — camera or images")
-    parser.add_argument("--model",   type=int, default=1, choices=[1, 2, 3, 4],
-                        help="Model: 1=yolov8m, 2=yolov8n, 3=yolov8s, 4=COCO-yolov8s (most accurate)")
+    parser.add_argument("--model",   type=int, default=4, choices=[1, 2, 3, 4],
+                        help="Model: 1=yolov8m, 2=yolov8n, 3=yolov8s, 4=COCO-yolov8s (default)")
     parser.add_argument("--image",   default=None,
                         help="Path to a single image file")
     parser.add_argument("--images",  default=None,
