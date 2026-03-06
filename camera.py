@@ -31,22 +31,41 @@ SMOOTH_FRAMES  = 10
 
 
 def postprocess_coco(outputs, orig_w, orig_h, conf_thresh):
-    """NMS-format postprocessor — keeps bottle class only."""
+    """NMS-format postprocessor — keeps bottle class only.
+    Uses a lower threshold for large (close-range) detections because
+    COCO models score close/large objects lower than mid-range ones.
+    """
     nms_key = next((k for k in outputs if 'nms' in k.lower() or 'output' in k.lower()), None)
     if nms_key is None:
         return []
     batch = outputs[nms_key][0]  # shape: [num_classes, max_det, 5]
     if COCO_BOTTLE_ID >= len(batch):
         return []
+
+    frame_area = orig_w * orig_h
     detections = []
     for det in batch[COCO_BOTTLE_ID]:
         score = float(det[4])
-        if score < conf_thresh:
+        if score <= 0:
             continue
         # det: [y1, x1, y2, x2, score] normalised 0-1
         y1 = int(det[0] * orig_h); x1 = int(det[1] * orig_w)
         y2 = int(det[2] * orig_h); x2 = int(det[3] * orig_w)
         if x2 <= x1 or y2 <= y1:
+            continue
+
+        box_area = (x2 - x1) * (y2 - y1)
+        fill     = box_area / frame_area  # 0.0–1.0
+
+        # Close-range: bottle fills large portion — lower threshold aggressively
+        if fill > 0.40:
+            effective_thresh = conf_thresh * 0.25
+        elif fill > 0.20:
+            effective_thresh = conf_thresh * 0.50
+        else:
+            effective_thresh = conf_thresh
+
+        if score < effective_thresh:
             continue
         detections.append([x1, y1, x2, y2, score])
     return detections
@@ -68,6 +87,14 @@ def get_orientation(x1, y1, x2, y2, frame_h):
         return "laydown"
     if ratio < 0.85:
         return "upright"
+
+    # Ambiguous zone — close bottles fill most of frame so vertical_fill is
+    # unreliable. Fall back to pure aspect ratio with a small margin.
+    box_fill = (w * h) / (frame_h * frame_h)  # approx fill ratio
+    if box_fill > 0.25:
+        # Close-range: trust aspect ratio only
+        return "laydown" if ratio > 1.0 else "upright"
+
     remaining = frame_h - y1
     vertical_fill = h / remaining if remaining > 0 else 1.0
     return "upright" if vertical_fill > 0.4 else "laydown"
@@ -143,6 +170,63 @@ def preprocess(frame, is_rgb=False, input_size=None):
     return np.expand_dims(img.astype(np.uint8), axis=0)
 
 
+def infer_multiscale(infer_pipeline, input_name, frame, orig_w, orig_h, conf_thresh, input_size):
+    """
+    Run inference at 3 scales by padding/zooming the frame.
+    Close-range bottles (filling most of frame) appear as normal-sized
+    bottles in the zoomed-out passes, giving the model a familiar view.
+
+    Scales:
+      1.0 — normal (original frame)
+      0.6 — zoom out: bottle appears smaller, more of scene visible
+      0.4 — zoom out more: works for very close bottles
+    """
+    all_dets = []
+
+    for scale in [1.0, 0.6, 0.4]:
+        if scale == 1.0:
+            img = frame
+        else:
+            # Shrink frame and pad with black to fill input_size
+            new_w = int(orig_w * scale)
+            new_h = int(orig_h * scale)
+            small = cv2.resize(frame, (new_w, new_h))
+            img   = np.zeros((orig_h, orig_w, 3), dtype=np.uint8)
+            pad_x = (orig_w - new_w) // 2
+            pad_y = (orig_h - new_h) // 2
+            img[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = small
+
+        input_data = preprocess(img, input_size=input_size)
+        outputs    = infer_pipeline.infer({input_name: input_data})
+        dets       = postprocess_coco(outputs, orig_w, orig_h, conf_thresh)
+
+        if scale < 1.0:
+            # Transform boxes back from padded coords to original frame coords
+            pad_x = (orig_w - int(orig_w * scale)) // 2
+            pad_y = (orig_h - int(orig_h * scale)) // 2
+            mapped = []
+            for (x1, y1, x2, y2, score) in dets:
+                rx1 = int((x1 - pad_x) / scale)
+                ry1 = int((y1 - pad_y) / scale)
+                rx2 = int((x2 - pad_x) / scale)
+                ry2 = int((y2 - pad_y) / scale)
+                rx1 = max(0, rx1); ry1 = max(0, ry1)
+                rx2 = min(orig_w, rx2); ry2 = min(orig_h, ry2)
+                if rx2 > rx1 and ry2 > ry1:
+                    mapped.append([rx1, ry1, rx2, ry2, score])
+            dets = mapped
+
+        all_dets.extend(dets)
+
+    # NMS across all scales
+    if not all_dets:
+        return []
+    boxes  = [[d[0], d[1], d[2]-d[0], d[3]-d[1]] for d in all_dets]
+    scores = [d[4] for d in all_dets]
+    idx    = cv2.dnn.NMSBoxes(boxes, scores, conf_thresh * 0.25, 0.4)
+    return [all_dets[i] for i in (idx.flatten() if len(idx) else [])]
+
+
 def overlay_info(frame, detections, ms, extra=""):
     h = frame.shape[0]
     status = f"DETECTED ({len(detections)})" if detections else "NONE"
@@ -191,23 +275,21 @@ def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, o
     try:
         while True:
             if use_picamera2:
-                frame_rgb  = picam2.capture_array()
-                frame      = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-                input_data = preprocess(frame_rgb, is_rgb=True, input_size=input_size)
+                frame_rgb = picam2.capture_array()
+                frame     = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             else:
                 ret, frame = cap.read()
                 if not ret:
                     print("  Frame capture failed")
                     break
-                input_data = preprocess(frame, input_size=input_size)
 
             orig_h, orig_w = frame.shape[:2]
 
             t0 = time.time()
-            raw_outputs = infer_pipeline.infer({input_name: input_data})
+            raw_dets = infer_multiscale(infer_pipeline, input_name, frame,
+                                        orig_w, orig_h, conf_thresh, input_size)
             ms = (time.time() - t0) * 1000
 
-            raw_dets   = postprocess_coco(raw_outputs, orig_w, orig_h, conf_thresh)
             detections = tracker.update(raw_dets)
 
             result = draw_detections(frame.copy(), detections)
