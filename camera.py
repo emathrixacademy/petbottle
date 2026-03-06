@@ -220,12 +220,15 @@ def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, o
         print()
 
 
-def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out_dir):
-    img_dir = Path(images_dir)
-    image_files = []
-    for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.JPG', '.PNG']:
-        image_files.extend(img_dir.glob(f'*{ext}'))
-    image_files = sorted(image_files)
+def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out_dir, single=None):
+    if single:
+        image_files = [single]
+    else:
+        img_dir = Path(images_dir)
+        image_files = []
+        for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.JPG', '.PNG']:
+            image_files.extend(img_dir.glob(f'*{ext}'))
+        image_files = sorted(image_files)
 
     if not image_files:
         print(f"❌ No images found in: {images_dir}")
@@ -291,6 +294,8 @@ def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out
 
 def main():
     parser = argparse.ArgumentParser(description="PET Bottle detection — camera or images")
+    parser.add_argument("--image",   default=None,
+                        help="Path to a single image file")
     parser.add_argument("--images",  default=None,
                         help="Path to image folder (omit for live camera)")
     parser.add_argument("--camera",  type=int, default=0,
@@ -335,7 +340,11 @@ def main():
 
         with InferVStreams(network_group, input_vstreams_params, output_vstreams_params) as infer_pipeline:
             with network_group.activate(network_group_params):
-                if args.images:
+                if args.image:
+                    run_images(infer_pipeline, input_name, args.conf,
+                               str(Path(args.image).parent), args.no_show, out_dir,
+                               single=Path(args.image))
+                elif args.images:
                     run_images(infer_pipeline, input_name, args.conf,
                                args.images, args.no_show, out_dir)
                 else:
