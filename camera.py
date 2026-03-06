@@ -67,6 +67,25 @@ def get_orientation(x1, y1, x2, y2, frame_h):
     return "upright"
 
 
+def draw_orientation_arrow(frame, x1, y1, x2, y2, orientation, color):
+    """Draw an arrow inside the box showing bottle orientation."""
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+    w, h = x2 - x1, y2 - y1
+    arm = min(w, h) // 3
+
+    if orientation == "upright":
+        # Vertical arrow pointing up
+        pt_tail = (cx, cy + arm)
+        pt_head = (cx, cy - arm)
+    else:
+        # Horizontal arrow pointing right
+        pt_tail = (cx - arm, cy)
+        pt_head = (cx + arm, cy)
+
+    cv2.arrowedLine(frame, pt_tail, pt_head, color, 2, tipLength=0.4)
+
+
 def draw_detections(frame, detections):
     frame_h = frame.shape[0]
     for (x1, y1, x2, y2, conf) in detections:
@@ -76,6 +95,7 @@ def draw_detections(frame, detections):
         text  = f"BOTTLE {tag}  {conf:.2f}"
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+        draw_orientation_arrow(frame, x1, y1, x2, y2, orientation, color)
 
         (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
         badge_y = max(y1 - th - baseline - 8, 0)
