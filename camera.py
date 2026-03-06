@@ -128,8 +128,13 @@ def postprocess(outputs, orig_w, orig_h, conf_thresh, output_names=None, use_coc
         if x2 <= x1 or y2 <= y1:
             continue
         w, h = x2 - x1, y2 - y1
-        aspect = h / w if w > 0 else 0
-        if aspect < 0.8 or aspect > 6.0:  # filter non-bottle shapes
+        area = w * h
+        # Filter by size: ignore tiny noise and full-frame detections
+        if area < (orig_w * orig_h * 0.002) or area > (orig_w * orig_h * 0.8):
+            continue
+        # Filter extreme aspect ratios (very flat wide shapes like floors/walls)
+        aspect = max(w, h) / min(w, h) if min(w, h) > 0 else 99
+        if aspect > 8.0:
             continue
         detections.append([x1, y1, x2, y2, float(score), 0])
 
