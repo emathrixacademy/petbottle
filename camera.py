@@ -21,7 +21,11 @@ from hailo_platform import (
 )
 
 # ── Settings ───────────────────────────────────────────────
-HEF_PATH       = "petbottle.hef"
+HEF_MODELS = {
+    1: "petbottle-yolov8m.hef",
+    2: "petbottle-yolov8n.hef",
+    3: "petbottle-yolov8s.hef",
+}
 CLASS_NAMES    = ["PET-Bottle"]
 CONF_THRESHOLD = 0.01
 INPUT_SIZE     = (416, 416)
@@ -67,9 +71,14 @@ def find_outputs(outputs):
     return conf_raw, reg_raw
 
 
-def postprocess(outputs, orig_w, orig_h, conf_thresh):
-    conf_raw = outputs.get("petbottle/activation1")
-    reg_raw  = outputs.get("petbottle/concat14")
+def postprocess(outputs, orig_w, orig_h, conf_thresh, output_names=None):
+    conf_raw = reg_raw = None
+    if output_names:
+        for name in output_names:
+            if "activation" in name:
+                conf_raw = outputs.get(name)
+            elif "concat" in name:
+                reg_raw  = outputs.get(name)
     if conf_raw is None or reg_raw is None:
         conf_raw, reg_raw = find_outputs(outputs)
     if conf_raw is None or reg_raw is None:
@@ -142,7 +151,7 @@ def overlay_info(frame, detections, ms, extra=""):
     return frame
 
 
-def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, out_dir):
+def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, out_dir, output_names=None):
     # Use picamera2 for Pi Camera ribbon (CSI)
     try:
         from picamera2 import Picamera2
@@ -190,7 +199,7 @@ def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, o
             raw_outputs = infer_pipeline.infer({input_name: input_data})
             ms = (time.time() - t0) * 1000
 
-            detections = postprocess(raw_outputs, orig_w, orig_h, conf_thresh)
+            detections = postprocess(raw_outputs, orig_w, orig_h, conf_thresh, output_names)
 
             result = draw_detections(frame.copy(), detections)
             overlay_info(result, detections, ms, f"Frame {frame_idx}")
@@ -219,7 +228,7 @@ def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, o
         print()
 
 
-def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out_dir, single=None):
+def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out_dir, single=None, output_names=None):
     if single:
         image_files = [single]
     else:
@@ -293,6 +302,8 @@ def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out
 
 def main():
     parser = argparse.ArgumentParser(description="PET Bottle detection — camera or images")
+    parser.add_argument("--model",   type=int, default=1, choices=[1, 2, 3],
+                        help="Model: 1=yolov8m (default), 2=yolov8n, 3=yolov8s")
     parser.add_argument("--image",   default=None,
                         help="Path to a single image file")
     parser.add_argument("--images",  default=None,
@@ -310,8 +321,9 @@ def main():
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading HEF: {HEF_PATH}")
-    hef = HEF(HEF_PATH)
+    hef_path = HEF_MODELS[args.model]
+    print(f"Loading HEF: {hef_path}  (model {args.model})")
+    hef = HEF(hef_path)
 
     # Print detected stream names for debugging
     print("Input streams:")
@@ -336,19 +348,22 @@ def main():
             network_group, format_type=FormatType.FLOAT32
         )
         input_name = hef.get_input_vstream_infos()[0].name
+        output_names = [o.name for o in hef.get_output_vstream_infos()]
 
         with InferVStreams(network_group, input_vstreams_params, output_vstreams_params) as infer_pipeline:
             with network_group.activate(network_group_params):
                 if args.image:
                     run_images(infer_pipeline, input_name, args.conf,
                                None, args.no_show, out_dir,
-                               single=Path(args.image))
+                               single=Path(args.image), output_names=output_names)
                 elif args.images:
                     run_images(infer_pipeline, input_name, args.conf,
-                               args.images, args.no_show, out_dir)
+                               args.images, args.no_show, out_dir,
+                               output_names=output_names)
                 else:
                     run_camera(infer_pipeline, input_name, args.conf,
-                               args.camera, args.no_show, out_dir)
+                               args.camera, args.no_show, out_dir,
+                               output_names=output_names)
 
 
 if __name__ == "__main__":
