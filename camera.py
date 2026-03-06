@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Test best.hef detection on images
+PET Bottle detection with petbottle.hef — images or live camera
 Usage:
-  python3 test_hef.py --images ./test_images/
-  python3 test_hef.py --images ./test_images/ --no-show   (headless)
-  python3 test_hef.py --images ./test_images/ --conf 0.5
+  python3 camera.py                          # live camera (default)
+  python3 camera.py --camera 0               # choose camera index
+  python3 camera.py --images ./test_images/  # run on image folder
+  python3 camera.py --conf 0.4               # set confidence threshold
+  python3 camera.py --no-show                # headless / save only
 """
 
 import cv2
@@ -19,7 +21,7 @@ from hailo_platform import (
 )
 
 # ── Settings ───────────────────────────────────────────────
-HEF_PATH       = "best_hailo8.hef"
+HEF_PATH       = "petbottle.hef"
 CLASS_NAMES    = ["PET-Bottle"]
 CONF_THRESHOLD = 0.3
 INPUT_SIZE     = (416, 416)
@@ -50,9 +52,27 @@ def dfl_decode(reg, reg_max=16):
     return (reg * weights).sum(axis=-1)
 
 
+def find_outputs(outputs):
+    """Auto-detect confidence and regression tensors by shape."""
+    conf_raw = reg_raw = None
+    total_anchors = sum(
+        (INPUT_SIZE[0] // s) * (INPUT_SIZE[1] // s) for s in [8, 16, 32]
+    )  # 3549 for 416x416
+    for _, tensor in outputs.items():
+        flat = tensor.reshape(-1)
+        if flat.shape[0] == total_anchors:
+            conf_raw = flat
+        elif tensor.reshape(-1, 64).shape[0] == total_anchors:
+            reg_raw = tensor
+    return conf_raw, reg_raw
+
+
 def postprocess(outputs, orig_w, orig_h, conf_thresh):
-    conf_raw = outputs.get("best/activation1")
-    reg_raw  = outputs.get("best/concat14")
+    conf_raw, reg_raw = find_outputs(outputs)
+    if conf_raw is None or reg_raw is None:
+        # Fallback: try known key names
+        conf_raw = outputs.get("petbottle/activation1") or outputs.get("best/activation1")
+        reg_raw  = outputs.get("petbottle/concat14")    or outputs.get("best/concat14")
     if conf_raw is None or reg_raw is None:
         return []
 
@@ -117,51 +137,199 @@ def draw_detections(frame, detections):
     return frame
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Test best.hef on images")
-    parser.add_argument("--images",  default="./test_images",
-                        help="Path to test images folder")
-    parser.add_argument("--output",  default=RESULTS_DIR,
-                        help="Path to save result images")
-    parser.add_argument("--conf",    type=float, default=CONF_THRESHOLD,
-                        help="Confidence threshold (default: 0.3)")
-    parser.add_argument("--no-show", action="store_true",
-                        help="Save results only, do not display")
-    args = parser.parse_args()
+def preprocess(frame):
+    img = cv2.resize(frame, INPUT_SIZE)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = img.astype(np.float32) / 255.0
+    return np.expand_dims(img, axis=0)
 
-    # Collect images
-    img_dir = Path(args.images)
+
+def overlay_info(frame, detections, ms, extra=""):
+    h = frame.shape[0]
+    status = f"DETECTED ({len(detections)})" if detections else "NONE"
+    color  = (0, 255, 0) if detections else (0, 200, 255)
+    cv2.putText(frame, status, (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+    cv2.putText(frame, f"Infer: {ms:.1f}ms  {1000/ms:.1f}FPS" if ms > 0 else "",
+                (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 2)
+    if extra:
+        cv2.putText(frame, extra, (10, h - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
+    return frame
+
+
+def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, out_dir):
+    # Pi Camera via libcamera (gstreamer) or fallback to V4L2
+    gst_pipeline = (
+        "libcamerasrc ! video/x-raw,width=640,height=480,framerate=30/1 ! "
+        "videoconvert ! appsink"
+    )
+    cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+    if not cap.isOpened():
+        print("  GStreamer/libcamera not available, falling back to V4L2...")
+        cap = cv2.VideoCapture(camera_index)
+
+    if not cap.isOpened():
+        print(f"❌ Cannot open camera (index={camera_index})")
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    if not no_show:
+        cv2.namedWindow("PET Bottle Detection", cv2.WINDOW_NORMAL)
+
+    print(f"\n{'='*55}")
+    print(f"  Live Camera | conf={conf_thresh} | Q to quit")
+    print(f"{'='*55}\n")
+
+    frame_idx = 0
+    ms = 0.0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("  ⚠️  Frame capture failed, retrying...")
+            continue
+
+        orig_h, orig_w = frame.shape[:2]
+        input_data = preprocess(frame)
+
+        t0 = time.time()
+        raw_outputs = infer_pipeline.infer({input_name: input_data})
+        ms = (time.time() - t0) * 1000
+
+        detections = postprocess(raw_outputs, orig_w, orig_h, conf_thresh)
+
+        result = draw_detections(frame.copy(), detections)
+        overlay_info(result, detections, ms, f"Frame {frame_idx}")
+
+        icon = "✅" if detections else "⬜"
+        print(f"\r  {icon} frame={frame_idx:5d} | {len(detections):2d} det | {ms:.1f}ms", end="", flush=True)
+
+        if not no_show:
+            cv2.imshow("PET Bottle Detection", result)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord('q'), ord('Q'), 27):
+                break
+            if key == ord('s'):
+                snap = out_dir / f"snap_{frame_idx:05d}.jpg"
+                cv2.imwrite(str(snap), result)
+                print(f"\n  Saved: {snap}")
+
+        frame_idx += 1
+
+    cap.release()
+    if not no_show:
+        cv2.destroyAllWindows()
+    print()
+
+
+def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out_dir):
+    img_dir = Path(images_dir)
     image_files = []
     for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.JPG', '.PNG']:
         image_files.extend(img_dir.glob(f'*{ext}'))
     image_files = sorted(image_files)
 
     if not image_files:
-        print(f"❌ No images found in: {args.images}")
+        print(f"❌ No images found in: {images_dir}")
         return
 
-    print(f"Found {len(image_files)} images")
+    print(f"\n{'='*55}")
+    print(f"  Testing {len(image_files)} images | conf={conf_thresh}")
+    print(f"{'='*55}")
 
-    # Create output dir
-    out_dir = Path(args.output)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Load HEF
-    print(f"Loading HEF: {HEF_PATH}")
-    hef = HEF(HEF_PATH)
+    if not no_show:
+        cv2.namedWindow("PET Bottle Detection", cv2.WINDOW_NORMAL)
+        print("  Press ANY KEY for next image | Q to quit\n")
 
     total_det = 0
     total_ms  = 0
+
+    for idx, img_path in enumerate(image_files):
+        frame = cv2.imread(str(img_path))
+        if frame is None:
+            print(f"  ⚠️  Cannot load: {img_path.name}")
+            continue
+
+        orig_h, orig_w = frame.shape[:2]
+        input_data = preprocess(frame)
+
+        t0 = time.time()
+        raw_outputs = infer_pipeline.infer({input_name: input_data})
+        ms = (time.time() - t0) * 1000
+
+        detections = postprocess(raw_outputs, orig_w, orig_h, conf_thresh)
+        total_det += len(detections)
+        total_ms  += ms
+
+        result = draw_detections(frame.copy(), detections)
+        overlay_info(result, detections, ms, f"[{idx+1}/{len(image_files)}] {img_path.name}")
+
+        out_path = out_dir / f"result_{img_path.name}"
+        cv2.imwrite(str(out_path), result)
+
+        icon = "✅" if detections else "⬜"
+        print(f"  {icon} [{idx+1:3d}/{len(image_files)}] {img_path.name:<35} "
+              f"| {len(detections):2d} det | {ms:.1f}ms")
+
+        if not no_show:
+            cv2.imshow("PET Bottle Detection", result)
+            key = cv2.waitKey(0) & 0xFF
+            if key in (ord('q'), ord('Q')):
+                break
+
+    if not no_show:
+        cv2.destroyAllWindows()
+
+    avg_ms = total_ms / len(image_files) if image_files else 0
+    print(f"\n{'='*55}")
+    print(f"  RESULTS SUMMARY")
+    print(f"{'='*55}")
+    print(f"  Images tested     : {len(image_files)}")
+    print(f"  Total detections  : {total_det}")
+    print(f"  Avg infer time    : {avg_ms:.1f}ms  ({1000/avg_ms:.1f} FPS)")
+    print(f"  Results saved to  : {out_dir}/")
+    print(f"{'='*55}\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="PET Bottle detection — camera or images")
+    parser.add_argument("--images",  default=None,
+                        help="Path to image folder (omit for live camera)")
+    parser.add_argument("--camera",  type=int, default=0,
+                        help="Camera index for V4L2 fallback (default: 0)")
+    parser.add_argument("--output",  default=RESULTS_DIR,
+                        help="Directory to save results / snapshots")
+    parser.add_argument("--conf",    type=float, default=CONF_THRESHOLD,
+                        help="Confidence threshold (default: 0.3)")
+    parser.add_argument("--no-show", action="store_true",
+                        help="Headless mode — no display window")
+    args = parser.parse_args()
+
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Loading HEF: {HEF_PATH}")
+    hef = HEF(HEF_PATH)
+
+    # Print detected stream names for debugging
+    print("Input streams:")
+    for i in hef.get_input_vstream_infos():
+        print(f"  {i.name}  shape={i.shape}")
+    print("Output streams:")
+    for o in hef.get_output_vstream_infos():
+        print(f"  {o.name}  shape={o.shape}")
 
     with VDevice() as target:
         configure_params = ConfigureParams.create_from_hef(
             hef, interface=HailoStreamInterface.PCIe
         )
         network_groups = target.configure(hef, configure_params)
-        network_group = network_groups[0]
+        network_group  = network_groups[0]
         network_group_params = network_group.create_params()
 
-        input_vstreams_params = InputVStreamParams.make(
+        input_vstreams_params  = InputVStreamParams.make(
             network_group, format_type=FormatType.FLOAT32
         )
         output_vstreams_params = OutputVStreamParams.make(
@@ -171,82 +339,12 @@ def main():
 
         with InferVStreams(network_group, input_vstreams_params, output_vstreams_params) as infer_pipeline:
             with network_group.activate(network_group_params):
-                print(f"\n{'='*55}")
-                print(f"  Testing {len(image_files)} images | conf={args.conf}")
-                print(f"{'='*55}")
-
-                if not args.no_show:
-                    cv2.namedWindow("HEF Test", cv2.WINDOW_NORMAL)
-                    print("  Press ANY KEY for next image | Q to quit\n")
-
-                for idx, img_path in enumerate(image_files):
-                    frame = cv2.imread(str(img_path))
-                    if frame is None:
-                        print(f"  ⚠️  Cannot load: {img_path.name}")
-                        continue
-
-                    orig_h, orig_w = frame.shape[:2]
-
-                    # Preprocess
-                    img = cv2.resize(frame, INPUT_SIZE)
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    img = img.astype(np.float32) / 255.0
-                    input_data = np.expand_dims(img, axis=0)
-
-                    # Infer
-                    t0 = time.time()
-                    raw_outputs = infer_pipeline.infer({input_name: input_data})
-                    ms = (time.time() - t0) * 1000
-
-                    # Postprocess
-                    detections = postprocess(raw_outputs, orig_w, orig_h, args.conf)
-                    total_det += len(detections)
-                    total_ms  += ms
-
-                    # Draw
-                    result = draw_detections(frame.copy(), detections)
-
-                    # Info overlay
-                    status = "✅ DETECTED" if detections else "⬜ NONE"
-                    cv2.putText(result, f"{status} ({len(detections)})", (10, 35),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.9,
-                                (0, 255, 0) if detections else (0, 200, 255), 2)
-                    cv2.putText(result, f"Infer: {ms:.1f}ms", (10, 70),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
-                    cv2.putText(result, f"[{idx+1}/{len(image_files)}] {img_path.name}",
-                                (10, orig_h - 15),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
-
-                    # Save
-                    out_path = out_dir / f"result_{img_path.name}"
-                    cv2.imwrite(str(out_path), result)
-
-                    # Log
-                    icon = "✅" if detections else "⬜"
-                    print(f"  {icon} [{idx+1:3d}/{len(image_files)}] {img_path.name:<35} "
-                          f"| {len(detections):2d} det | {ms:.1f}ms")
-
-                    # Display
-                    if not args.no_show:
-                        cv2.imshow("HEF Test", result)
-                        key = cv2.waitKey(0) & 0xFF
-                        if key == ord('q') or key == ord('Q'):
-                            break
-
-    if not args.no_show:
-        cv2.destroyAllWindows()
-
-    avg_ms = total_ms / len(image_files) if image_files else 0
-    detected = sum(1 for _ in range(len(image_files)))
-
-    print(f"\n{'='*55}")
-    print(f"  RESULTS SUMMARY")
-    print(f"{'='*55}")
-    print(f"  Images tested     : {len(image_files)}")
-    print(f"  Total detections  : {total_det}")
-    print(f"  Avg infer time    : {avg_ms:.1f}ms  ({1000/avg_ms:.1f} FPS)")
-    print(f"  Results saved to  : {out_dir}/")
-    print(f"{'='*55}\n")
+                if args.images:
+                    run_images(infer_pipeline, input_name, args.conf,
+                               args.images, args.no_show, out_dir)
+                else:
+                    run_camera(infer_pipeline, input_name, args.conf,
+                               args.camera, args.no_show, out_dir)
 
 
 if __name__ == "__main__":
