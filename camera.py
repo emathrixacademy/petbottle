@@ -25,8 +25,10 @@ HEF_MODELS = {
     1: "petbottle-yolov8m.hef",
     2: "petbottle-yolov8n.hef",
     3: "petbottle-yolov8s.hef",
+    4: "yolov8s-coco.hef",       # COCO pretrained — bottle class 39
 }
 CLASS_NAMES    = ["PET-Bottle"]
+COCO_BOTTLE_ID = 39
 CONF_THRESHOLD = 0.25
 INPUT_SIZE     = (416, 416)
 REG_MAX        = 16
@@ -71,7 +73,31 @@ def find_outputs(outputs):
     return conf_raw, reg_raw
 
 
-def postprocess(outputs, orig_w, orig_h, conf_thresh, output_names=None):
+def postprocess_coco(outputs, orig_w, orig_h, conf_thresh):
+    """NMS-format postprocessor for yolov8s-coco.hef — keeps bottle class only."""
+    nms_key = next((k for k in outputs if 'nms' in k.lower() or 'output' in k.lower()), None)
+    if nms_key is None:
+        return []
+    batch = outputs[nms_key][0]  # shape: [num_classes, max_det, 5]
+    if COCO_BOTTLE_ID >= len(batch):
+        return []
+    detections = []
+    for det in batch[COCO_BOTTLE_ID]:
+        score = float(det[4])
+        if score < conf_thresh:
+            continue
+        # det: [y1, x1, y2, x2, score] normalised 0-1
+        y1 = int(det[0] * orig_h); x1 = int(det[1] * orig_w)
+        y2 = int(det[2] * orig_h); x2 = int(det[3] * orig_w)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        detections.append([x1, y1, x2, y2, score, 0])
+    return detections
+
+
+def postprocess(outputs, orig_w, orig_h, conf_thresh, output_names=None, use_coco=False):
+    if use_coco:
+        return postprocess_coco(outputs, orig_w, orig_h, conf_thresh)
     conf_raw = reg_raw = None
     if output_names:
         for name in output_names:
@@ -135,12 +161,13 @@ def draw_detections(frame, detections):
     return frame
 
 
-def preprocess(frame, is_rgb=False):
+def preprocess(frame, is_rgb=False, use_coco=False):
     img = cv2.resize(frame, INPUT_SIZE)
     if not is_rgb:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = img.astype(np.float32) / 255.0
-    return np.expand_dims(img, axis=0)
+    if use_coco:
+        return np.expand_dims(img.astype(np.uint8), axis=0)
+    return np.expand_dims(img.astype(np.float32) / 255.0, axis=0)
 
 
 def overlay_info(frame, detections, ms, extra=""):
@@ -156,7 +183,7 @@ def overlay_info(frame, detections, ms, extra=""):
     return frame
 
 
-def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, out_dir, output_names=None):
+def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, out_dir, output_names=None, use_coco=False):
     # Use picamera2 for Pi Camera ribbon (CSI)
     try:
         from picamera2 import Picamera2
@@ -192,13 +219,13 @@ def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, o
             if use_picamera2:
                 frame_rgb = picam2.capture_array()
                 frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-                input_data = preprocess(frame_rgb, is_rgb=True)
+                input_data = preprocess(frame_rgb, is_rgb=True, use_coco=use_coco)
             else:
                 ret, frame = cap.read()
                 if not ret:
                     print("  ⚠️  Frame capture failed")
                     break
-                input_data = preprocess(frame)
+                input_data = preprocess(frame, use_coco=use_coco)
 
             orig_h, orig_w = frame.shape[:2]
 
@@ -206,7 +233,7 @@ def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, o
             raw_outputs = infer_pipeline.infer({input_name: input_data})
             ms = (time.time() - t0) * 1000
 
-            detections = postprocess(raw_outputs, orig_w, orig_h, conf_thresh, output_names)
+            detections = postprocess(raw_outputs, orig_w, orig_h, conf_thresh, output_names, use_coco)
 
             result = draw_detections(frame.copy(), detections)
             overlay_info(result, detections, ms, f"Frame {frame_idx}")
@@ -235,7 +262,7 @@ def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, o
         print()
 
 
-def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out_dir, single=None, output_names=None):
+def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out_dir, single=None, output_names=None, use_coco=False):
     if single:
         image_files = [single]
     else:
@@ -267,13 +294,13 @@ def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out
             continue
 
         orig_h, orig_w = frame.shape[:2]
-        input_data = preprocess(frame)
+        input_data = preprocess(frame, use_coco=use_coco)
 
         t0 = time.time()
         raw_outputs = infer_pipeline.infer({input_name: input_data})
         ms = (time.time() - t0) * 1000
 
-        detections = postprocess(raw_outputs, orig_w, orig_h, conf_thresh)
+        detections = postprocess(raw_outputs, orig_w, orig_h, conf_thresh, output_names, use_coco)
         total_det += len(detections)
         total_ms  += ms
 
@@ -309,8 +336,8 @@ def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out
 
 def main():
     parser = argparse.ArgumentParser(description="PET Bottle detection — camera or images")
-    parser.add_argument("--model",   type=int, default=1, choices=[1, 2, 3],
-                        help="Model: 1=yolov8m (default), 2=yolov8n, 3=yolov8s")
+    parser.add_argument("--model",   type=int, default=1, choices=[1, 2, 3, 4],
+                        help="Model: 1=yolov8m, 2=yolov8n, 3=yolov8s, 4=COCO-yolov8s (most accurate)")
     parser.add_argument("--image",   default=None,
                         help="Path to a single image file")
     parser.add_argument("--images",  default=None,
@@ -348,12 +375,10 @@ def main():
         network_group  = network_groups[0]
         network_group_params = network_group.create_params()
 
-        input_vstreams_params  = InputVStreamParams.make(
-            network_group, format_type=FormatType.FLOAT32
-        )
-        output_vstreams_params = OutputVStreamParams.make(
-            network_group, format_type=FormatType.FLOAT32
-        )
+        use_coco = (args.model == 4)
+        fmt = FormatType.UINT8 if use_coco else FormatType.FLOAT32
+        input_vstreams_params  = InputVStreamParams.make(network_group, format_type=fmt)
+        output_vstreams_params = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
         input_name = hef.get_input_vstream_infos()[0].name
         output_names = [o.name for o in hef.get_output_vstream_infos()]
 
@@ -362,15 +387,16 @@ def main():
                 if args.image:
                     run_images(infer_pipeline, input_name, args.conf,
                                None, args.no_show, out_dir,
-                               single=Path(args.image), output_names=output_names)
+                               single=Path(args.image), output_names=output_names,
+                               use_coco=use_coco)
                 elif args.images:
                     run_images(infer_pipeline, input_name, args.conf,
                                args.images, args.no_show, out_dir,
-                               output_names=output_names)
+                               output_names=output_names, use_coco=use_coco)
                 else:
                     run_camera(infer_pipeline, input_name, args.conf,
                                args.camera, args.no_show, out_dir,
-                               output_names=output_names)
+                               output_names=output_names, use_coco=use_coco)
 
 
 if __name__ == "__main__":
