@@ -71,8 +71,8 @@ def postprocess(outputs, orig_w, orig_h, conf_thresh):
     conf_raw, reg_raw = find_outputs(outputs)
     if conf_raw is None or reg_raw is None:
         # Fallback: try known key names
-        conf_raw = outputs.get("petbottle/activation1") or outputs.get("best/activation1")
-        reg_raw  = outputs.get("petbottle/concat14")    or outputs.get("best/concat14")
+        conf_raw = outputs.get("petbottle/activation1")
+        reg_raw  = outputs.get("petbottle/concat14")
     if conf_raw is None or reg_raw is None:
         return []
 
@@ -231,7 +231,7 @@ def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out
         image_files = sorted(image_files)
 
     if not image_files:
-        print(f"❌ No images found in: {images_dir}")
+        print(f"❌ No images found in: {images_dir or single}")
         return
 
     print(f"\n{'='*55}")
@@ -342,7 +342,7 @@ def main():
             with network_group.activate(network_group_params):
                 if args.image:
                     run_images(infer_pipeline, input_name, args.conf,
-                               str(Path(args.image).parent), args.no_show, out_dir,
+                               None, args.no_show, out_dir,
                                single=Path(args.image))
                 elif args.images:
                     run_images(infer_pipeline, input_name, args.conf,
