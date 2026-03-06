@@ -23,7 +23,7 @@ from hailo_platform import (
 # ── Settings ───────────────────────────────────────────────
 HEF_PATH       = "petbottle.hef"
 CLASS_NAMES    = ["PET-Bottle"]
-CONF_THRESHOLD = 0.3
+CONF_THRESHOLD = 0.01
 INPUT_SIZE     = (416, 416)
 REG_MAX        = 16
 RESULTS_DIR    = "./results"
@@ -76,7 +76,6 @@ def postprocess(outputs, orig_w, orig_h, conf_thresh):
         return []
 
     conf = conf_raw.reshape(-1)
-    print(f"  [debug] max_conf={conf.max():.4f}  thresh={conf_thresh}", flush=True)
     reg  = reg_raw.reshape(-1, 64)
     ltrb = dfl_decode(reg, REG_MAX)
 
