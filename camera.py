@@ -149,16 +149,32 @@ def postprocess(outputs, orig_w, orig_h, conf_thresh, output_names=None, use_coc
     return [detections[i] for i in indices.flatten()]
 
 
-def get_orientation(x1, y1, x2, y2):
-    """Return 'upright' or 'laydown' based on bounding box shape."""
+def get_orientation(x1, y1, x2, y2, frame_h):
+    """
+    Determine bottle orientation using aspect ratio + vertical position.
+    A laid-down bottle is wider than tall (w > h * 1.2).
+    An upright bottle near the bottom edge is still upright even if slightly wide.
+    """
     w, h = x2 - x1, y2 - y1
-    return "laydown" if w > h else "upright"
+    ratio = w / h if h > 0 else 1
+
+    # Strong indicator: significantly wider than tall
+    if ratio > 1.4:
+        return "laydown"
+    # Ambiguous zone (0.8–1.4): use vertical position as tiebreaker
+    # Upright bottles tend to occupy more vertical space relative to their position
+    if ratio > 0.8:
+        # If box is tall relative to its distance from bottom → likely upright
+        vertical_fill = h / (frame_h - y1) if (frame_h - y1) > 0 else 1
+        return "upright" if vertical_fill > 0.5 else "laydown"
+    return "upright"
 
 
 def draw_detections(frame, detections):
+    frame_h = frame.shape[0]
     for (x1, y1, x2, y2, conf, cls_id) in detections:
         label       = CLASS_NAMES[int(cls_id)] if int(cls_id) < len(CLASS_NAMES) else f"cls{cls_id}"
-        orientation = get_orientation(x1, y1, x2, y2)
+        orientation = get_orientation(x1, y1, x2, y2, frame_h)
         tag         = "LAYDOWN" if orientation == "laydown" else "UPRIGHT"
         color       = (0, 165, 255) if orientation == "laydown" else (0, 255, 0)  # orange / green
         text        = f"{label.upper()} {tag}  {conf:.2f}"
