@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
-PET Bottle detection with COCO yolov8s HEF (bottle class 39)
+PET Bottle detection with YOLOv5 / YOLOv7 / YOLOv8 model stitching on Hailo-8
 Usage:
-  python3 camera.py                          # live camera (default)
+  python3 camera.py                          # live camera (default, YOLOv8)
+  python3 camera.py --model yolov5           # use YOLOv5
+  python3 camera.py --model yolov7           # use YOLOv7
+  python3 camera.py --model yolov8           # use YOLOv8 (default)
+  python3 camera.py --model all              # ensemble: run all 3, merge results
   python3 camera.py --camera 0               # choose camera index
   python3 camera.py --image sample.jpg       # run on single image
   python3 camera.py --images ./test_images/  # run on image folder
   python3 camera.py --conf 0.20              # set confidence threshold
   python3 camera.py --no-show                # headless / save only
+
+Toggle models live with keyboard:
+  5 = YOLOv5   |   7 = YOLOv7   |   8 = YOLOv8   |   A = All (ensemble)
 """
 
 import cv2
@@ -21,64 +28,219 @@ from hailo_platform import (
     InputVStreamParams, OutputVStreamParams, FormatType
 )
 
-# ── Settings ───────────────────────────────────────────────
-HEF_PATH       = "yolov8s-coco.hef"
+# ── Model Definitions ────────────────────────────────────────
+MODEL_CONFIGS = {
+    "yolov5": {
+        "name": "YOLOv5s",
+        "hef_path": "yolov5s.hef",
+        "type": "raw",
+        "color": (0, 255, 255),     # yellow
+        "anchors": [
+            [[10, 13], [16, 30], [33, 23]],       # P3 stride 8
+            [[30, 61], [62, 45], [59, 119]],       # P4 stride 16
+            [[116, 90], [156, 198], [373, 326]],   # P5 stride 32
+        ],
+        "strides": [8, 16, 32],
+    },
+    "yolov7": {
+        "name": "YOLOv7",
+        "hef_path": "yolov7.hef",
+        "type": "raw",
+        "color": (255, 0, 255),     # magenta
+        "anchors": [
+            [[12, 16], [19, 36], [40, 28]],        # P3 stride 8
+            [[36, 75], [76, 55], [72, 146]],        # P4 stride 16
+            [[142, 110], [192, 243], [459, 401]],   # P5 stride 32
+        ],
+        "strides": [8, 16, 32],
+    },
+    "yolov8": {
+        "name": "YOLOv8s",
+        "hef_path": "yolov8s-coco.hef",
+        "type": "nms",
+        "color": (255, 200, 0),     # cyan-ish
+        "anchors": None,
+        "strides": None,
+    },
+}
+
 COCO_BOTTLE_ID = 39
+COCO_PERSON_ID = 0
 CONF_THRESHOLD = 0.20
 RESULTS_DIR    = "./results"
 SMOOTH_FRAMES  = 10
-# ───────────────────────────────────────────────────────────
+
+# ── Model Specialisation by Range ────────────────────────────
+# All 3 models detect bottles in ANY orientation (standing, lying,
+# tilted) on the ground.  The robot picks them up, so every bottle
+# matters.  Each model covers a different detection range:
+#   YOLOv5  → FAR    (small bottles, <10% of frame)
+#   YOLOv7  → MID    (medium bottles, 10-35% of frame)
+#   YOLOv8  → CLOSE  (large/nearby bottles, >35% of frame)
+# In single-model mode the range filter is applied.
+# In ensemble mode all ranges are combined for full coverage.
+MODEL_RANGE = {
+    "yolov5": "far",
+    "yolov7": "mid",
+    "yolov8": "close",
+}
+# fill-ratio thresholds (box area / frame area)
+RANGE_LIMITS = {
+    "far":   (0.00, 0.10),
+    "mid":   (0.05, 0.40),   # slight overlap for smooth handoff
+    "close": (0.25, 1.00),   # slight overlap for smooth handoff
+}
+
+# IoU threshold to consider a bottle "held" by a person
+HELD_IOU_THRESH = 0.30
+# ──────────────────────────────────────────────────────────────
 
 
-def postprocess_coco(outputs, orig_w, orig_h, conf_thresh):
-    """NMS-format postprocessor — keeps bottle class only.
-    Uses a lower threshold for large (close-range) detections because
-    COCO models score close/large objects lower than mid-range ones.
+# ══════════════════════════════════════════════════════════════
+# Postprocessors
+# ══════════════════════════════════════════════════════════════
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))
+
+
+def postprocess_nms(outputs, orig_w, orig_h, conf_thresh):
+    """Postprocessor for YOLOv8 with built-in NMS.
+    Returns (bottle_detections, person_detections).
     """
     nms_key = next((k for k in outputs if 'nms' in k.lower() or 'output' in k.lower()), None)
     if nms_key is None:
-        return []
+        return [], []
     batch = outputs[nms_key][0]  # shape: [num_classes, max_det, 5]
-    if COCO_BOTTLE_ID >= len(batch):
-        return []
 
     frame_area = orig_w * orig_h
+
+    def _extract_class(class_id):
+        if class_id >= len(batch):
+            return []
+        dets = []
+        for det in batch[class_id]:
+            score = float(det[4])
+            if score <= 0:
+                continue
+            y1 = int(det[0] * orig_h); x1 = int(det[1] * orig_w)
+            y2 = int(det[2] * orig_h); x2 = int(det[3] * orig_w)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            box_area = (x2 - x1) * (y2 - y1)
+            fill = box_area / frame_area
+            if fill > 0.40:
+                effective_thresh = conf_thresh * 0.25
+            elif fill > 0.20:
+                effective_thresh = conf_thresh * 0.50
+            else:
+                effective_thresh = conf_thresh
+            if score < effective_thresh:
+                continue
+            dets.append([x1, y1, x2, y2, score])
+        return dets
+
+    bottles = _extract_class(COCO_BOTTLE_ID)
+    persons = _extract_class(COCO_PERSON_ID)
+    return bottles, persons
+
+
+def _decode_raw_class(data, class_id, anchors, strides, sorted_layers,
+                      orig_w, orig_h, conf_thresh, input_w, input_h):
+    """Decode raw YOLOv5/v7 outputs for a single COCO class.
+    Returns list of [x1, y1, x2, y2, score].
+    """
     detections = []
-    for det in batch[COCO_BOTTLE_ID]:
-        score = float(det[4])
-        if score <= 0:
-            continue
-        # det: [y1, x1, y2, x2, score] normalised 0-1
-        y1 = int(det[0] * orig_h); x1 = int(det[1] * orig_w)
-        y2 = int(det[2] * orig_h); x2 = int(det[3] * orig_w)
-        if x2 <= x1 or y2 <= y1:
+    for layer_idx, (name, tensor) in enumerate(sorted_layers):
+        if layer_idx >= len(anchors):
+            break
+        dat = tensor[0]
+        if dat.ndim < 3:
             continue
 
-        box_area = (x2 - x1) * (y2 - y1)
-        fill     = box_area / frame_area  # 0.0–1.0
-
-        # Close-range: bottle fills large portion — lower threshold aggressively
-        if fill > 0.40:
-            effective_thresh = conf_thresh * 0.25
-        elif fill > 0.20:
-            effective_thresh = conf_thresh * 0.50
-        else:
-            effective_thresh = conf_thresh
-
-        if score < effective_thresh:
+        grid_h, grid_w = dat.shape[0], dat.shape[1]
+        num_anchors = len(anchors[layer_idx])
+        stride = strides[layer_idx]
+        channels_per_anchor = dat.shape[2] // num_anchors
+        num_classes = channels_per_anchor - 5
+        if num_classes <= class_id:
             continue
-        detections.append([x1, y1, x2, y2, score])
-    return detections
 
+        dat = dat.reshape(grid_h, grid_w, num_anchors, channels_per_anchor)
+
+        grid_x, grid_y = np.meshgrid(np.arange(grid_w), np.arange(grid_h))
+        grid_x = grid_x[:, :, np.newaxis].astype(np.float32)
+        grid_y = grid_y[:, :, np.newaxis].astype(np.float32)
+
+        tx = dat[..., 0].astype(np.float32)
+        ty = dat[..., 1].astype(np.float32)
+        tw = dat[..., 2].astype(np.float32)
+        th = dat[..., 3].astype(np.float32)
+        obj = dat[..., 4].astype(np.float32)
+        cls = dat[..., 5 + class_id].astype(np.float32)
+
+        needs_sigmoid = (np.max(obj) > 1.0) or (np.min(obj) < 0.0)
+        if needs_sigmoid:
+            tx = _sigmoid(tx); ty = _sigmoid(ty)
+            tw = _sigmoid(tw); th = _sigmoid(th)
+            obj = _sigmoid(obj); cls = _sigmoid(cls)
+
+        cx = (tx * 2.0 - 0.5 + grid_x) * stride
+        cy = (ty * 2.0 - 0.5 + grid_y) * stride
+        anchor_arr = np.array(anchors[layer_idx], dtype=np.float32)
+        bw = (tw * 2.0) ** 2 * anchor_arr[:, 0]
+        bh = (th * 2.0) ** 2 * anchor_arr[:, 1]
+
+        conf = obj * cls
+        mask = conf > (conf_thresh * 0.25)
+        if not np.any(mask):
+            continue
+
+        cx_f = cx[mask]; cy_f = cy[mask]
+        bw_f = bw[mask]; bh_f = bh[mask]
+        conf_f = conf[mask]
+
+        x1 = np.clip((cx_f - bw_f / 2) / input_w * orig_w, 0, orig_w).astype(int)
+        y1 = np.clip((cy_f - bh_f / 2) / input_h * orig_h, 0, orig_h).astype(int)
+        x2 = np.clip((cx_f + bw_f / 2) / input_w * orig_w, 0, orig_w).astype(int)
+        y2 = np.clip((cy_f + bh_f / 2) / input_h * orig_h, 0, orig_h).astype(int)
+
+        for i in range(len(conf_f)):
+            if x2[i] > x1[i] and y2[i] > y1[i]:
+                detections.append([int(x1[i]), int(y1[i]), int(x2[i]), int(y2[i]), float(conf_f[i])])
+
+    if not detections:
+        return []
+    boxes = [[d[0], d[1], d[2] - d[0], d[3] - d[1]] for d in detections]
+    scores = [d[4] for d in detections]
+    idx = cv2.dnn.NMSBoxes(boxes, scores, conf_thresh * 0.25, 0.4)
+    return [detections[i] for i in (idx.flatten() if len(idx) else [])]
+
+
+def postprocess_raw(outputs, orig_w, orig_h, conf_thresh, anchors, strides, input_w, input_h):
+    """Postprocessor for raw YOLOv5 / YOLOv7 outputs (no built-in NMS).
+    Returns (bottle_detections, person_detections).
+    """
+    sorted_layers = sorted(
+        outputs.items(), key=lambda kv: kv[1][0].size, reverse=True,
+    )
+    bottles = _decode_raw_class(
+        outputs, COCO_BOTTLE_ID, anchors, strides, sorted_layers,
+        orig_w, orig_h, conf_thresh, input_w, input_h,
+    )
+    persons = _decode_raw_class(
+        outputs, COCO_PERSON_ID, anchors, strides, sorted_layers,
+        orig_w, orig_h, conf_thresh, input_w, input_h,
+    )
+    return bottles, persons
+
+
+# ══════════════════════════════════════════════════════════════
+# Orientation, view filtering, and held-by-human filtering
+# ══════════════════════════════════════════════════════════════
 
 def get_orientation(x1, y1, x2, y2, frame_h):
-    """
-    Orientation detection for 1.5L and 500ml PET bottles.
-    Aspect ratio is the primary and authoritative signal.
-      - ratio > 1.15  → laydown (wider than tall)
-      - ratio < 0.85  → upright (taller than wide)
-      - 0.85–1.15     → ambiguous, use vertical fill as tiebreaker
-    """
+    """Classify a bottle detection as upright / laydown / tilted."""
     w, h = x2 - x1, y2 - y1
     if w == 0 or h == 0:
         return "upright"
@@ -87,18 +249,75 @@ def get_orientation(x1, y1, x2, y2, frame_h):
         return "laydown"
     if ratio < 0.85:
         return "upright"
-
-    # Ambiguous zone — close bottles fill most of frame so vertical_fill is
-    # unreliable. Fall back to pure aspect ratio with a small margin.
-    box_fill = (w * h) / (frame_h * frame_h)  # approx fill ratio
+    # Ambiguous zone → tilted
+    box_fill = (w * h) / (frame_h * frame_h)
     if box_fill > 0.25:
-        # Close-range: trust aspect ratio only
-        return "laydown" if ratio > 1.0 else "upright"
-
+        return "tilted"
     remaining = frame_h - y1
     vertical_fill = h / remaining if remaining > 0 else 1.0
-    return "upright" if vertical_fill > 0.4 else "laydown"
+    if vertical_fill > 0.4:
+        return "upright"
+    return "tilted"
 
+
+def _iou(a, b):
+    """IoU between two [x1,y1,x2,y2,...] boxes."""
+    ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+    iw = max(0, ix2 - ix1); ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    aa = (a[2] - a[0]) * (a[3] - a[1])
+    ab = (b[2] - b[0]) * (b[3] - b[1])
+    union = aa + ab - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _bottle_inside_person(bottle, person):
+    """Check if bottle centre is inside the person box (likely being held)."""
+    bcx = (bottle[0] + bottle[2]) / 2
+    bcy = (bottle[1] + bottle[3]) / 2
+    return (person[0] <= bcx <= person[2]) and (person[1] <= bcy <= person[3])
+
+
+def filter_held_bottles(bottles, persons):
+    """Remove bottles that overlap significantly with a person (being held).
+    A bottle is considered held if:
+      - Its IoU with any person > HELD_IOU_THRESH, OR
+      - Its centre is inside a person bounding box
+    """
+    if not persons:
+        return bottles
+    free = []
+    for b in bottles:
+        held = False
+        for p in persons:
+            if _iou(b, p) > HELD_IOU_THRESH or _bottle_inside_person(b, p):
+                held = True
+                break
+        if not held:
+            free.append(b)
+    return free
+
+
+def filter_by_range(bottles, range_key, frame_area):
+    """Keep only bottles in this model's assigned range.
+    range_key = "far" | "mid" | "close" | None (keep all).
+    """
+    if range_key is None:
+        return bottles
+    lo, hi = RANGE_LIMITS[range_key]
+    result = []
+    for b in bottles:
+        box_area = (b[2] - b[0]) * (b[3] - b[1])
+        fill = box_area / frame_area if frame_area > 0 else 0
+        if lo <= fill <= hi:
+            result.append(b)
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+# Drawing helpers
+# ══════════════════════════════════════════════════════════════
 
 def draw_orientation_arrow(frame, x1, y1, x2, y2, orientation, color):
     cx = (x1 + x2) // 2
@@ -106,16 +325,34 @@ def draw_orientation_arrow(frame, x1, y1, x2, y2, orientation, color):
     arm = min(x2 - x1, y2 - y1) // 3
     if orientation == "upright":
         cv2.arrowedLine(frame, (cx, cy + arm), (cx, cy - arm), color, 2, tipLength=0.4)
-    else:
+    elif orientation == "laydown":
         cv2.arrowedLine(frame, (cx - arm, cy), (cx + arm, cy), color, 2, tipLength=0.4)
+    else:  # tilted
+        cv2.arrowedLine(frame, (cx - arm, cy + arm), (cx + arm, cy - arm), color, 2, tipLength=0.4)
 
 
-def draw_detections(frame, detections):
+def draw_detections(frame, detections, persons=None):
+    """Draw bottle detections and (optionally) person boxes."""
     frame_h = frame.shape[0]
+
+    # Draw person boxes (semi-transparent, so user sees why bottles are filtered)
+    if persons:
+        for (px1, py1, px2, py2, _) in persons:
+            cv2.rectangle(frame, (px1, py1), (px2, py2), (100, 100, 100), 2)
+            cv2.putText(frame, "PERSON", (px1 + 4, py1 + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+
+    # Draw bottle detections
     for (x1, y1, x2, y2, conf) in detections:
         orientation = get_orientation(x1, y1, x2, y2, frame_h)
-        tag   = "LAYDOWN" if orientation == "laydown" else "UPRIGHT"
-        color = (0, 165, 255) if orientation == "laydown" else (0, 255, 0)
+        tag_map = {"upright": "UPRIGHT", "laydown": "LAYDOWN", "tilted": "TILTED"}
+        color_map = {
+            "upright": (0, 255, 0),      # green
+            "laydown": (0, 165, 255),     # orange
+            "tilted":  (255, 200, 0),     # cyan
+        }
+        tag   = tag_map.get(orientation, "UPRIGHT")
+        color = color_map.get(orientation, (0, 255, 0))
         text  = f"BOTTLE {tag}  {conf:.2f}"
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
@@ -134,7 +371,7 @@ class DetectionTracker:
     def __init__(self, max_age=SMOOTH_FRAMES, iou_thresh=0.35):
         self.max_age    = max_age
         self.iou_thresh = iou_thresh
-        self.tracked    = []  # [x1,y1,x2,y2,conf,age]
+        self.tracked    = []
 
     def _iou(self, a, b):
         ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
@@ -170,78 +407,213 @@ def preprocess(frame, is_rgb=False, input_size=None):
     return np.expand_dims(img.astype(np.uint8), axis=0)
 
 
-def infer_multiscale(infer_pipeline, input_name, frame, orig_w, orig_h, conf_thresh, input_size):
-    """
-    Run inference at 3 scales by padding/zooming the frame.
-    Close-range bottles (filling most of frame) appear as normal-sized
-    bottles in the zoomed-out passes, giving the model a familiar view.
+# ══════════════════════════════════════════════════════════════
+# Model Manager — loads, switches, and runs YOLO models
+# ══════════════════════════════════════════════════════════════
 
-    Scales:
-      1.0 — normal (original frame)
-      0.6 — zoom out: bottle appears smaller, more of scene visible
-      0.4 — zoom out more: works for very close bottles
-    """
-    all_dets = []
+class ModelManager:
+    """Manages YOLOv5/v7/v8 on a Hailo VDevice with live toggling."""
 
-    for scale in [1.0, 0.6, 0.4]:
-        if scale == 1.0:
-            img = frame
+    MODEL_ORDER = ["yolov5", "yolov7", "yolov8"]
+
+    def __init__(self, target, model_keys=None):
+        """
+        target     : an open VDevice
+        model_keys : list of keys into MODEL_CONFIGS to load
+                     (default: all three)
+        """
+        self.target = target
+        self.models = {}          # key -> runtime info dict
+        self.active_key = None
+        self._pipeline = None
+        self._ng_activated = None
+
+        keys = model_keys or self.MODEL_ORDER
+        for key in keys:
+            cfg = MODEL_CONFIGS[key]
+            hef_path = Path(cfg["hef_path"])
+            if not hef_path.exists():
+                print(f"  WARNING: {hef_path} not found — skipping {cfg['name']}")
+                continue
+            hef = HEF(str(hef_path))
+            input_info  = hef.get_input_vstream_infos()[0]
+            output_info = hef.get_output_vstream_infos()
+            h, w = input_info.shape[0], input_info.shape[1]
+            self.models[key] = {
+                "cfg": cfg,
+                "hef": hef,
+                "input_name": input_info.name,
+                "input_size": (w, h),
+                "output_names": [o.name for o in output_info],
+            }
+            print(f"  Loaded {cfg['name']:8s}  input={w}x{h}  outputs={len(output_info)}")
+
+        if not self.models:
+            raise RuntimeError("No models could be loaded!")
+
+    # ── activation helpers ────────────────────────────────────
+    def _deactivate_current(self):
+        """Release the current pipeline and network group."""
+        self._pipeline = None
+        self._ng_activated = None
+
+    def activate(self, key):
+        """Configure and activate the model identified by *key*."""
+        if key == self.active_key and self._pipeline is not None:
+            return  # already active
+        if key not in self.models:
+            print(f"  Model '{key}' not available")
+            return
+
+        self._deactivate_current()
+
+        mi = self.models[key]
+        hef = mi["hef"]
+        params = ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)
+        ngs = self.target.configure(hef, params)
+        ng  = ngs[0]
+        ng_params = ng.create_params()
+
+        inp_params = InputVStreamParams.make(ng, format_type=FormatType.UINT8)
+        out_params = OutputVStreamParams.make(ng, format_type=FormatType.FLOAT32)
+
+        pipeline = InferVStreams(ng, inp_params, out_params)
+        pipeline.__enter__()
+        ng.activate(ng_params).__enter__()
+
+        self._pipeline     = pipeline
+        self._ng_activated = ng
+        self.active_key    = key
+        print(f"\n  >>> Switched to {mi['cfg']['name']}")
+
+    def cleanup(self):
+        self._deactivate_current()
+
+    # ── inference ─────────────────────────────────────────────
+    def infer(self, frame, conf_thresh, apply_range_filter=True):
+        """Run inference on *frame* with the currently active model.
+        Returns (bottle_detections, person_detections).
+        Detects ALL bottle orientations (standing, lying, tilted).
+        Bottles held by a person are filtered out.
+        Range filter keeps only bottles in this model's assigned range.
+        """
+        mi  = self.models[self.active_key]
+        cfg = mi["cfg"]
+        input_name = mi["input_name"]
+        input_size = mi["input_size"]
+        orig_h, orig_w = frame.shape[:2]
+
+        input_data = preprocess(frame, input_size=input_size)
+        outputs = self._pipeline.infer({input_name: input_data})
+
+        if cfg["type"] == "nms":
+            bottles, persons = postprocess_nms(outputs, orig_w, orig_h, conf_thresh)
         else:
-            # Shrink frame and pad with black to fill input_size
-            new_w = int(orig_w * scale)
-            new_h = int(orig_h * scale)
-            small = cv2.resize(frame, (new_w, new_h))
-            img   = np.zeros((orig_h, orig_w, 3), dtype=np.uint8)
-            pad_x = (orig_w - new_w) // 2
-            pad_y = (orig_h - new_h) // 2
-            img[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = small
+            bottles, persons = postprocess_raw(
+                outputs, orig_w, orig_h, conf_thresh,
+                cfg["anchors"], cfg["strides"],
+                input_size[0], input_size[1],
+            )
 
-        input_data = preprocess(img, input_size=input_size)
-        outputs    = infer_pipeline.infer({input_name: input_data})
-        dets       = postprocess_coco(outputs, orig_w, orig_h, conf_thresh)
+        # Filter out bottles held by a person
+        bottles = filter_held_bottles(bottles, persons)
 
-        if scale < 1.0:
-            # Transform boxes back from padded coords to original frame coords
-            pad_x = (orig_w - int(orig_w * scale)) // 2
-            pad_y = (orig_h - int(orig_h * scale)) // 2
-            mapped = []
-            for (x1, y1, x2, y2, score) in dets:
-                rx1 = int((x1 - pad_x) / scale)
-                ry1 = int((y1 - pad_y) / scale)
-                rx2 = int((x2 - pad_x) / scale)
-                ry2 = int((y2 - pad_y) / scale)
-                rx1 = max(0, rx1); ry1 = max(0, ry1)
-                rx2 = min(orig_w, rx2); ry2 = min(orig_h, ry2)
-                if rx2 > rx1 and ry2 > ry1:
-                    mapped.append([rx1, ry1, rx2, ry2, score])
-            dets = mapped
+        # Filter by range specialisation (far / mid / close)
+        if apply_range_filter:
+            range_key = MODEL_RANGE.get(self.active_key)
+            bottles = filter_by_range(bottles, range_key, orig_w * orig_h)
 
-        all_dets.extend(dets)
+        return bottles, persons
 
-    # NMS across all scales
-    if not all_dets:
-        return []
-    boxes  = [[d[0], d[1], d[2]-d[0], d[3]-d[1]] for d in all_dets]
-    scores = [d[4] for d in all_dets]
-    idx    = cv2.dnn.NMSBoxes(boxes, scores, conf_thresh * 0.25, 0.4)
-    return [all_dets[i] for i in (idx.flatten() if len(idx) else [])]
+    def infer_ensemble(self, frame, conf_thresh):
+        """Run all 3 models on *frame*, each covering its own range,
+        then merge results with NMS. Bottles held by a person are excluded.
+        All bottle orientations (standing, lying, tilted) are detected.
+        Returns (merged_bottles, persons).
+        """
+        orig_key = self.active_key
+        all_bottles = []
+        all_persons = []
+
+        for key in self.models:
+            self.activate(key)
+            bottles, persons = self.infer(frame, conf_thresh, apply_range_filter=True)
+            all_bottles.extend(bottles)
+            all_persons.extend(persons)
+
+        # Restore original model
+        if orig_key and orig_key in self.models:
+            self.activate(orig_key)
+
+        # NMS on merged person list
+        if all_persons:
+            pboxes = [[p[0], p[1], p[2]-p[0], p[3]-p[1]] for p in all_persons]
+            pscores = [p[4] for p in all_persons]
+            pidx = cv2.dnn.NMSBoxes(pboxes, pscores, conf_thresh * 0.25, 0.45)
+            all_persons = [all_persons[i] for i in (pidx.flatten() if len(pidx) else [])]
+
+        if not all_bottles:
+            return [], all_persons
+
+        # Cross-model NMS on bottles
+        boxes  = [[d[0], d[1], d[2] - d[0], d[3] - d[1]] for d in all_bottles]
+        scores = [d[4] for d in all_bottles]
+        idx = cv2.dnn.NMSBoxes(boxes, scores, conf_thresh * 0.25, 0.45)
+        merged = [all_bottles[i] for i in (idx.flatten() if len(idx) else [])]
+        return merged, all_persons
+
+    @property
+    def active_name(self):
+        if self.active_key and self.active_key in self.models:
+            return self.models[self.active_key]["cfg"]["name"]
+        return "none"
+
+    @property
+    def active_color(self):
+        if self.active_key and self.active_key in self.models:
+            return self.models[self.active_key]["cfg"]["color"]
+        return (255, 255, 255)
 
 
-def overlay_info(frame, detections, ms, extra=""):
-    h = frame.shape[0]
+# ══════════════════════════════════════════════════════════════
+# Overlay
+# ══════════════════════════════════════════════════════════════
+
+def overlay_info(frame, detections, ms, model_name, model_color, mode, extra=""):
+    h, w = frame.shape[:2]
+
+    # Model badge (top-right)
+    badge = f"[{mode}] {model_name}"
+    (tw, th), bl = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+    cv2.rectangle(frame, (w - tw - 20, 0), (w, th + 16), model_color, -1)
+    cv2.putText(frame, badge, (w - tw - 10, th + 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+
+    # Detection status (top-left)
     status = f"DETECTED ({len(detections)})" if detections else "NONE"
     color  = (0, 255, 0) if detections else (0, 200, 255)
     cv2.putText(frame, status, (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+
     if ms > 0:
         cv2.putText(frame, f"Infer: {ms:.1f}ms  {1000/ms:.1f}FPS",
                     (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 2)
+
+    # Toggle hint (bottom)
+    hint = "5=v5(FAR) 7=v7(MID) 8=v8(CLOSE) A=All Q=Quit | Held=filtered"
+    cv2.putText(frame, hint, (10, h - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 120, 120), 1)
+
     if extra:
-        cv2.putText(frame, extra, (10, h - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
+        cv2.putText(frame, extra, (10, h - 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1)
     return frame
 
 
-def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, out_dir, input_size):
+# ══════════════════════════════════════════════════════════════
+# Camera loop
+# ══════════════════════════════════════════════════════════════
+
+def run_camera(manager, conf_thresh, camera_index, no_show, out_dir, mode):
     try:
         from picamera2 import Picamera2
         picam2 = Picamera2()
@@ -258,52 +630,86 @@ def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, o
         if not cap.isOpened():
             print(f"Cannot open camera (index={camera_index})")
             return
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     if not no_show:
         cv2.namedWindow("PET Bottle Detection", cv2.WINDOW_NORMAL)
 
-    print(f"\n{'='*55}")
-    print(f"  Live Camera | conf={conf_thresh} | Q to quit")
-    print(f"{'='*55}\n")
+    print(f"\n{'='*60}")
+    print(f"  PET Bottle Pickup Robot — Live Detection")
+    print(f"  model={manager.active_name} | mode={mode}")
+    print(f"  conf={conf_thresh} | Held-by-human filter: ON")
+    print(f"  Detects ALL orientations: standing, lying, tilted")
+    print(f"  Range assignments:")
+    print(f"    5 = YOLOv5  → FAR   (small/distant bottles)")
+    print(f"    7 = YOLOv7  → MID   (medium range)")
+    print(f"    8 = YOLOv8  → CLOSE (nearby bottles)")
+    print(f"    A = All ranges combined | Q = Quit")
+    print(f"{'='*60}\n")
 
+    ensemble = (mode == "all")
     frame_idx = 0
-    ms        = 0.0
-    tracker   = DetectionTracker()
+    ms = 0.0
+    tracker = DetectionTracker()
 
     try:
         while True:
             if use_picamera2:
                 frame_rgb = picam2.capture_array()
-                frame     = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             else:
                 ret, frame = cap.read()
                 if not ret:
                     print("  Frame capture failed")
                     break
 
-            orig_h, orig_w = frame.shape[:2]
-
             t0 = time.time()
-            raw_dets = infer_multiscale(infer_pipeline, input_name, frame,
-                                        orig_w, orig_h, conf_thresh, input_size)
+            if ensemble:
+                raw_dets, persons = manager.infer_ensemble(frame, conf_thresh)
+            else:
+                raw_dets, persons = manager.infer(frame, conf_thresh)
             ms = (time.time() - t0) * 1000
 
             detections = tracker.update(raw_dets)
 
-            result = draw_detections(frame.copy(), detections)
-            overlay_info(result, detections, ms, f"Frame {frame_idx}")
+            result = draw_detections(frame.copy(), detections, persons)
+            disp_mode = "ENSEMBLE" if ensemble else "SINGLE"
+            range_tag = MODEL_RANGE.get(manager.active_key, "all") if not ensemble else "all"
+            disp_label = f"{disp_mode}:{range_tag.upper()}"
+            overlay_info(result, detections, ms,
+                         manager.active_name if not ensemble else "ALL",
+                         manager.active_color if not ensemble else (255, 255, 255),
+                         disp_label, f"Frame {frame_idx}")
 
             icon = "OK" if detections else "--"
-            print(f"\r  [{icon}] frame={frame_idx:5d} | {len(detections):2d} det | {ms:.1f}ms", end="", flush=True)
+            model_tag = "ALL" if ensemble else manager.active_name
+            print(f"\r  [{icon}] {model_tag:8s} frame={frame_idx:5d} | "
+                  f"{len(detections):2d} det | {ms:.1f}ms   ", end="", flush=True)
 
             if not no_show:
                 cv2.imshow("PET Bottle Detection", result)
                 key = cv2.waitKey(1) & 0xFF
+
+                # ── Live model toggle ────────────────────────
                 if key in (ord('q'), ord('Q'), 27):
                     break
-                if key == ord('s'):
+                elif key == ord('5'):
+                    ensemble = False
+                    manager.activate("yolov5")
+                    tracker = DetectionTracker()  # reset tracker on switch
+                elif key == ord('7'):
+                    ensemble = False
+                    manager.activate("yolov7")
+                    tracker = DetectionTracker()
+                elif key == ord('8'):
+                    ensemble = False
+                    manager.activate("yolov8")
+                    tracker = DetectionTracker()
+                elif key in (ord('a'), ord('A')):
+                    ensemble = True
+                    print("\n  >>> Ensemble mode (all models)")
+                elif key == ord('s'):
                     snap = out_dir / f"snap_{frame_idx:05d}.jpg"
                     cv2.imwrite(str(snap), result)
                     print(f"\n  Saved: {snap}")
@@ -319,7 +725,11 @@ def run_camera(infer_pipeline, input_name, conf_thresh, camera_index, no_show, o
         print()
 
 
-def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out_dir, single=None, input_size=None):
+# ══════════════════════════════════════════════════════════════
+# Image batch mode
+# ══════════════════════════════════════════════════════════════
+
+def run_images(manager, conf_thresh, images_dir, no_show, out_dir, mode, single=None):
     if single:
         image_files = [single]
     else:
@@ -333,66 +743,87 @@ def run_images(infer_pipeline, input_name, conf_thresh, images_dir, no_show, out
         print(f"No images found in: {images_dir or single}")
         return
 
-    print(f"\n{'='*55}")
-    print(f"  Testing {len(image_files)} images | conf={conf_thresh}")
-    print(f"{'='*55}")
+    ensemble = (mode == "all")
+
+    # In image mode with a single model, run all 3 models for comparison
+    model_keys = list(manager.models.keys()) if ensemble else [manager.active_key]
+
+    print(f"\n{'='*60}")
+    print(f"  Testing {len(image_files)} images x {len(model_keys)} model(s)")
+    print(f"  conf={conf_thresh}")
+    print(f"{'='*60}")
 
     if not no_show:
         cv2.namedWindow("PET Bottle Detection", cv2.WINDOW_NORMAL)
-        print("  Press ANY KEY for next image | Q to quit\n")
+        print("  Press ANY KEY for next | Q to quit\n")
 
-    total_det = 0
-    total_ms  = 0
+    for model_key in model_keys:
+        manager.activate(model_key)
+        model_name = manager.active_name
+        total_det = 0
+        total_ms = 0
 
-    for idx, img_path in enumerate(image_files):
-        frame = cv2.imread(str(img_path))
-        if frame is None:
-            print(f"  Cannot load: {img_path.name}")
-            continue
+        for idx, img_path in enumerate(image_files):
+            frame = cv2.imread(str(img_path))
+            if frame is None:
+                print(f"  Cannot load: {img_path.name}")
+                continue
 
-        orig_h, orig_w = frame.shape[:2]
-        input_data = preprocess(frame, input_size=input_size)
+            t0 = time.time()
+            if ensemble:
+                detections, persons = manager.infer_ensemble(frame, conf_thresh)
+            else:
+                detections, persons = manager.infer(frame, conf_thresh)
+            ms = (time.time() - t0) * 1000
+            total_det += len(detections)
+            total_ms += ms
 
-        t0 = time.time()
-        raw_outputs = infer_pipeline.infer({input_name: input_data})
-        ms = (time.time() - t0) * 1000
+            result = draw_detections(frame.copy(), detections, persons)
+            disp_mode = "ENSEMBLE" if ensemble else "SINGLE"
+            range_tag = MODEL_RANGE.get(manager.active_key, "all") if not ensemble else "all"
+            overlay_info(result, detections, ms, model_name,
+                         manager.active_color, f"{disp_mode}:{range_tag.upper()}",
+                         f"[{idx+1}/{len(image_files)}] {img_path.name}")
 
-        detections = postprocess_coco(raw_outputs, orig_w, orig_h, conf_thresh)
-        total_det += len(detections)
-        total_ms  += ms
+            suffix = "ensemble" if ensemble else model_key
+            out_path = out_dir / f"result_{suffix}_{img_path.name}"
+            cv2.imwrite(str(out_path), result)
 
-        result = draw_detections(frame.copy(), detections)
-        overlay_info(result, detections, ms, f"[{idx+1}/{len(image_files)}] {img_path.name}")
+            icon = "OK" if detections else "--"
+            print(f"  [{icon}] {model_name:8s} [{idx+1:3d}/{len(image_files)}] "
+                  f"{img_path.name:<30} | {len(detections):2d} det | {ms:.1f}ms")
 
-        out_path = out_dir / f"result_{img_path.name}"
-        cv2.imwrite(str(out_path), result)
+            if not no_show:
+                cv2.imshow("PET Bottle Detection", result)
+                key = cv2.waitKey(0) & 0xFF
+                if key in (ord('q'), ord('Q')):
+                    break
 
-        icon = "OK" if detections else "--"
-        print(f"  [{icon}] [{idx+1:3d}/{len(image_files)}] {img_path.name:<35} "
-              f"| {len(detections):2d} det | {ms:.1f}ms")
+        avg_ms = total_ms / len(image_files) if image_files else 0
+        print(f"\n  --- {model_name} SUMMARY ---")
+        print(f"  Total detections : {total_det}")
+        print(f"  Avg infer time   : {avg_ms:.1f}ms  ({1000/avg_ms:.1f} FPS)" if avg_ms > 0 else "")
 
-        if not no_show:
-            cv2.imshow("PET Bottle Detection", result)
-            key = cv2.waitKey(0) & 0xFF
-            if key in (ord('q'), ord('Q')):
-                break
+        if ensemble:
+            break  # ensemble already runs all models per frame
 
     if not no_show:
         cv2.destroyAllWindows()
 
-    avg_ms = total_ms / len(image_files) if image_files else 0
-    print(f"\n{'='*55}")
-    print(f"  RESULTS SUMMARY")
-    print(f"{'='*55}")
-    print(f"  Images tested     : {len(image_files)}")
-    print(f"  Total detections  : {total_det}")
-    print(f"  Avg infer time    : {avg_ms:.1f}ms  ({1000/avg_ms:.1f} FPS)")
-    print(f"  Results saved to  : {out_dir}/")
-    print(f"{'='*55}\n")
+    print(f"\n  Results saved to: {out_dir}/\n")
 
+
+# ══════════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="PET Bottle detection (COCO yolov8s HEF)")
+    parser = argparse.ArgumentParser(
+        description="PET Bottle detection — YOLOv5/v7/v8 model stitching on Hailo-8"
+    )
+    parser.add_argument("--model", default="yolov8",
+                        choices=["yolov5", "yolov7", "yolov8", "all"],
+                        help="Model to use (default: yolov8). 'all' = ensemble mode")
     parser.add_argument("--image",   default=None,  help="Path to a single image file")
     parser.add_argument("--images",  default=None,  help="Path to image folder")
     parser.add_argument("--camera",  type=int, default=0, help="Camera index (default: 0)")
@@ -405,45 +836,36 @@ def main():
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading HEF: {HEF_PATH}")
-    hef = HEF(HEF_PATH)
-    print("Input streams:")
-    for i in hef.get_input_vstream_infos():
-        print(f"  {i.name}  shape={i.shape}")
-    print("Output streams:")
-    for o in hef.get_output_vstream_infos():
-        print(f"  {o.name}  shape={o.shape}")
-
-    configure_params = ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)
+    print(f"\n{'='*60}")
+    print(f"  PET Bottle Detector — YOLO Model Stitching")
+    print(f"{'='*60}")
+    print(f"  Loading models...")
 
     with VDevice() as target:
-        network_groups       = target.configure(hef, configure_params)
-        network_group        = network_groups[0]
-        network_group_params = network_group.create_params()
+        manager = ModelManager(target)
 
-        input_vstreams_params  = InputVStreamParams.make(network_group, format_type=FormatType.UINT8)
-        output_vstreams_params = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
+        # Set initial model
+        if args.model == "all":
+            first_key = list(manager.models.keys())[0]
+            manager.activate(first_key)
+        else:
+            manager.activate(args.model)
 
-        input_info = hef.get_input_vstream_infos()[0]
-        input_name = input_info.name
-        h, w       = input_info.shape[0], input_info.shape[1]
-        input_size = (w, h)
-        print(f"Model input size: {input_size}")
+        print(f"\n  Active model: {manager.active_name}")
+        print(f"  Mode: {'ENSEMBLE' if args.model == 'all' else 'SINGLE'}")
 
-        with InferVStreams(network_group, input_vstreams_params, output_vstreams_params) as infer_pipeline:
-            with network_group.activate(network_group_params):
-                if args.image:
-                    run_images(infer_pipeline, input_name, args.conf,
-                               None, args.no_show, out_dir,
-                               single=Path(args.image), input_size=input_size)
-                elif args.images:
-                    run_images(infer_pipeline, input_name, args.conf,
-                               args.images, args.no_show, out_dir,
-                               input_size=input_size)
-                else:
-                    run_camera(infer_pipeline, input_name, args.conf,
-                               args.camera, args.no_show, out_dir,
-                               input_size=input_size)
+        try:
+            if args.image:
+                run_images(manager, args.conf, None, args.no_show, out_dir,
+                           args.model, single=Path(args.image))
+            elif args.images:
+                run_images(manager, args.conf, args.images, args.no_show, out_dir,
+                           args.model)
+            else:
+                run_camera(manager, args.conf, args.camera, args.no_show, out_dir,
+                           args.model)
+        finally:
+            manager.cleanup()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32",
+  "hardwareFolders": "C:\\Users\\FlorenceSangrenes\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.7,C:\\Users\\FlorenceSangrenes\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.7",
+  "otherLibrariesFolders": "C:\\Users\\FlorenceSangrenes\\OneDrive\\Documents\\Arduino\\libraries",
+  "sketchLocation": "C:\\Users\\FlorenceSangrenes\\Downloads\\florence\\emathrix\\pet bottle\\petbottle\\robotic_arm"
+}
