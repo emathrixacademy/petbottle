@@ -90,15 +90,15 @@ WebServer server(80);
 #define LEFT_LPWM    5     // was GPIO23 (not producing PWM)
 #define LEFT_EN      26
 
-// BTS7960B #2 - Right Drive Wheel
-#define RIGHT_RPWM   2     // was GPIO14 (boot pull-up caused motor runaway)
-#define RIGHT_LPWM   25
-#define RIGHT_EN     19
+// BTS7960B #2 - Right Drive Wheel  (swapped with Arm Lift pins)
+#define RIGHT_RPWM   16
+#define RIGHT_LPWM   17
+#define RIGHT_EN     27
 
-// BTS7960B #3 - Arm Lift (58SW31ZY)
-#define LIFT_RPWM    16
-#define LIFT_LPWM    17
-#define LIFT_EN      27
+// BTS7960B #3 - Arm Lift (58SW31ZY)  (swapped with Right Wheel pins)
+#define LIFT_RPWM    2
+#define LIFT_LPWM    25
+#define LIFT_EN      19
 
 // L298N - NEMA 17 Stepper (Base Turning Platform)
 #define STEP_IN1     32
@@ -117,7 +117,7 @@ WebServer server(80);
 #define LCD_SCL      15
 
 // Buzzer
-#define BUZZER_PIN   23    // was GPIO5 (swapped with Left LPWM)
+#define BUZZER_PIN   23
 
 // Ultrasonic Sensors (obstacle avoidance — read by Pi via /sensor)
 #define US_TRIG      12    // shared trigger (pulse one at a time)
@@ -130,6 +130,15 @@ WebServer server(80);
 #define PWM_RES        8
 #define DRIVE_DEFAULT  80
 #define LIFT_DEFAULT   80
+
+// LEDC channel assignments (paired by hardware timer: 0/1, 2/3, 4/5, 6/7)
+// Each pair shares one timer — both channels must use same freq/res.
+#define LEFT_RPWM_CH    0
+#define LEFT_LPWM_CH    1   // pair with ch0 (timer 0) - same 1kHz/8-bit
+#define RIGHT_RPWM_CH   2
+#define RIGHT_LPWM_CH   3   // pair with ch2 (timer 1) - same 1kHz/8-bit
+#define LIFT_RPWM_CH    4
+#define LIFT_LPWM_CH    5   // pair with ch4 (timer 2) - same 1kHz/8-bit
 
 // Stepper
 #define STEPS_PER_REV      200
@@ -160,10 +169,10 @@ WebServer server(80);
 #define SERVO_TICK_MIN 111
 #define SERVO_TICK_MAX 491
 
-void servo_write(int pin, int angle) {
+void servo_write(int channel, int angle) {
   angle = constrain(angle, 0, 180);
   int duty = map(angle, 0, 180, SERVO_TICK_MIN, SERVO_TICK_MAX);
-  ledcWrite(pin, duty);
+  ledcWrite(channel, duty);
 }
 
 // ===================== OBJECTS =====================
@@ -205,15 +214,18 @@ void setup() {
   pinMode(LIFT_RPWM, OUTPUT);  digitalWrite(LIFT_RPWM, LOW);
   pinMode(LIFT_LPWM, OUTPUT);  digitalWrite(LIFT_LPWM, LOW);
 
-  // --- STEP 3: Attach LEDC PWM with EXPLICIT channels ---
-  // Motors: channels 0-5 (1kHz, 8-bit)
-  // Swapped ch1/ch3 to test if left LPWM channel was faulty
-  ledcAttachChannel(LEFT_RPWM,  PWM_FREQ, PWM_RES, 0);  // ch0: left fwd
-  ledcAttachChannel(LEFT_LPWM,  PWM_FREQ, PWM_RES, 3);  // ch3: left rev (was ch1)
-  ledcAttachChannel(RIGHT_RPWM, PWM_FREQ, PWM_RES, 2);  // ch2: right fwd
-  ledcAttachChannel(RIGHT_LPWM, PWM_FREQ, PWM_RES, 1);  // ch1: right rev (was ch3)
-  ledcAttachChannel(LIFT_RPWM,  PWM_FREQ, PWM_RES, 4);  // ch4: lift up
-  ledcAttachChannel(LIFT_LPWM,  PWM_FREQ, PWM_RES, 5);  // ch5: lift down
+  // --- STEP 3: Attach LEDC PWM (ESP32 Arduino core v2 API) ---
+  // Channels paired in natural order so each motor's fwd/rev share one timer:
+  //   LEFT  : ch0+ch1 -> timer 0
+  //   RIGHT : ch2+ch3 -> timer 1
+  //   LIFT  : ch4+ch5 -> timer 2
+  //   SERVOS: ch6+ch7 -> timer 3 (50Hz)
+  ledcSetup(LEFT_RPWM_CH,  PWM_FREQ, PWM_RES); ledcAttachPin(LEFT_RPWM,  LEFT_RPWM_CH);
+  ledcSetup(LEFT_LPWM_CH,  PWM_FREQ, PWM_RES); ledcAttachPin(LEFT_LPWM,  LEFT_LPWM_CH);
+  ledcSetup(RIGHT_RPWM_CH, PWM_FREQ, PWM_RES); ledcAttachPin(RIGHT_RPWM, RIGHT_RPWM_CH);
+  ledcSetup(RIGHT_LPWM_CH, PWM_FREQ, PWM_RES); ledcAttachPin(RIGHT_LPWM, RIGHT_LPWM_CH);
+  ledcSetup(LIFT_RPWM_CH,  PWM_FREQ, PWM_RES); ledcAttachPin(LIFT_RPWM,  LIFT_RPWM_CH);
+  ledcSetup(LIFT_LPWM_CH,  PWM_FREQ, PWM_RES); ledcAttachPin(LIFT_LPWM,  LIFT_LPWM_CH);
 
   // --- STEP 4: Zero all PWM ---
   wheels_stop();
@@ -230,8 +242,10 @@ void setup() {
   stepper.setCurrentPosition(0);
 
   // --- Servos via raw LEDC (channels 6 & 7, no library conflicts) ---
-  ledcAttachChannel(SERVO_LEFT_PIN,  SERVO_FREQ, SERVO_RES, SERVO_CH_LEFT);
-  ledcAttachChannel(SERVO_RIGHT_PIN, SERVO_FREQ, SERVO_RES, SERVO_CH_RIGHT);
+  ledcSetup(SERVO_CH_LEFT,  SERVO_FREQ, SERVO_RES);
+  ledcAttachPin(SERVO_LEFT_PIN, SERVO_CH_LEFT);
+  ledcSetup(SERVO_CH_RIGHT, SERVO_FREQ, SERVO_RES);
+  ledcAttachPin(SERVO_RIGHT_PIN, SERVO_CH_RIGHT);
   servos_open();
 
   // --- LCD I2C ---
@@ -595,7 +609,7 @@ void executeCommand(String cmd) {
     case 'L':  // Left servo
       {
         int angle = constrain(cmd.substring(1).toInt(), 0, 180);
-        servo_write(SERVO_LEFT_PIN, angle);
+        servo_write(SERVO_CH_LEFT, angle);
         currentLeftServo = angle;
         Serial.printf("Left Servo: %d deg\n", angle);
       }
@@ -604,7 +618,7 @@ void executeCommand(String cmd) {
     case 'R':  // Right servo
       {
         int angle = constrain(cmd.substring(1).toInt(), 0, 180);
-        servo_write(SERVO_RIGHT_PIN, angle);
+        servo_write(SERVO_CH_RIGHT, angle);
         currentRightServo = angle;
         Serial.printf("Right Servo: %d deg\n", angle);
       }
@@ -629,15 +643,16 @@ void executeCommand(String cmd) {
 
 // ===================== DRIVE WHEELS (BTS7960B #1 & #2) =====================
 
-void bts_drive(int rpwm, int lpwm, int en, int speed) {
+// Note: rpwm_ch / lpwm_ch are LEDC channel numbers (not pins).
+void bts_drive(int rpwm_ch, int lpwm_ch, int en, int speed) {
   speed = constrain(speed, -255, 255);
   digitalWrite(en, HIGH);
   if (speed >= 0) {
-    ledcWrite(rpwm, speed);
-    ledcWrite(lpwm, 0);
+    ledcWrite(rpwm_ch, speed);
+    ledcWrite(lpwm_ch, 0);
   } else {
-    ledcWrite(rpwm, 0);
-    ledcWrite(lpwm, -speed);
+    ledcWrite(rpwm_ch, 0);
+    ledcWrite(lpwm_ch, -speed);
   }
 }
 
@@ -645,8 +660,8 @@ void set_wheels(int left, int right) {
   if (!motorsEnabled) { Serial.println("Motors disabled! Send 'H' to re-enable."); return; }
   left = constrain(left, -255, 255);
   right = constrain(right, -255, 255);
-  bts_drive(LEFT_RPWM, LEFT_LPWM, LEFT_EN, left);
-  bts_drive(RIGHT_RPWM, RIGHT_LPWM, RIGHT_EN, right);
+  bts_drive(LEFT_RPWM_CH, LEFT_LPWM_CH, LEFT_EN, left);
+  bts_drive(RIGHT_RPWM_CH, RIGHT_LPWM_CH, RIGHT_EN, right);
   leftWheelSpeed = left;
   rightWheelSpeed = right;
   Serial.printf("Wheels: L=%d R=%d\n", left, right);
@@ -658,8 +673,8 @@ void turn_left(int speed)      { set_wheels(-speed, speed); }
 void turn_right(int speed)     { set_wheels(speed, -speed); }
 
 void wheels_stop() {
-  ledcWrite(LEFT_RPWM, 0);  ledcWrite(LEFT_LPWM, 0);
-  ledcWrite(RIGHT_RPWM, 0); ledcWrite(RIGHT_LPWM, 0);
+  ledcWrite(LEFT_RPWM_CH, 0);  ledcWrite(LEFT_LPWM_CH, 0);
+  ledcWrite(RIGHT_RPWM_CH, 0); ledcWrite(RIGHT_LPWM_CH, 0);
   leftWheelSpeed = 0;
   rightWheelSpeed = 0;
   Serial.println("Wheels: STOPPED");
@@ -702,20 +717,20 @@ void stepper_release() {
 
 void lift_up(int speed) {
   if (!motorsEnabled) { Serial.println("Motors disabled!"); return; }
-  bts_drive(LIFT_RPWM, LIFT_LPWM, LIFT_EN, constrain(speed, 0, 255));
+  bts_drive(LIFT_RPWM_CH, LIFT_LPWM_CH, LIFT_EN, constrain(speed, 0, 255));
   liftMoving = true;
   Serial.printf("Lift: UP %d\n", speed);
 }
 
 void lift_down(int speed) {
   if (!motorsEnabled) { Serial.println("Motors disabled!"); return; }
-  bts_drive(LIFT_RPWM, LIFT_LPWM, LIFT_EN, -constrain(speed, 0, 255));
+  bts_drive(LIFT_RPWM_CH, LIFT_LPWM_CH, LIFT_EN, -constrain(speed, 0, 255));
   liftMoving = true;
   Serial.printf("Lift: DOWN %d\n", speed);
 }
 
 void lift_stop() {
-  ledcWrite(LIFT_RPWM, 0); ledcWrite(LIFT_LPWM, 0);
+  ledcWrite(LIFT_RPWM_CH, 0); ledcWrite(LIFT_LPWM_CH, 0);
   liftMoving = false;
   Serial.println("Lift: STOPPED");
 }
@@ -726,16 +741,16 @@ void lift_down_timed(int speed, int ms) { lift_down(speed); delay(ms); lift_stop
 // ===================== SERVOS (Left & Right) =====================
 
 void servos_open() {
-  servo_write(SERVO_LEFT_PIN, SERVO_OPEN_ANGLE);
-  servo_write(SERVO_RIGHT_PIN, SERVO_OPEN_ANGLE);
+  servo_write(SERVO_CH_LEFT, SERVO_OPEN_ANGLE);
+  servo_write(SERVO_CH_RIGHT, SERVO_OPEN_ANGLE);
   currentLeftServo = SERVO_OPEN_ANGLE;
   currentRightServo = SERVO_OPEN_ANGLE;
   Serial.println("Servos: BOTH OPEN");
 }
 
 void servos_close() {
-  servo_write(SERVO_LEFT_PIN, SERVO_CLOSE_ANGLE);
-  servo_write(SERVO_RIGHT_PIN, SERVO_CLOSE_ANGLE);
+  servo_write(SERVO_CH_LEFT, SERVO_CLOSE_ANGLE);
+  servo_write(SERVO_CH_RIGHT, SERVO_CLOSE_ANGLE);
   currentLeftServo = SERVO_CLOSE_ANGLE;
   currentRightServo = SERVO_CLOSE_ANGLE;
   Serial.println("Servos: BOTH CLOSED");
