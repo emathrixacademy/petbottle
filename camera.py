@@ -32,27 +32,19 @@ from hailo_platform import (
 MODEL_CONFIGS = {
     "yolov5": {
         "name": "YOLOv5s",
-        "hef_path": "yolov5s.hef",
-        "type": "raw",
+        "hef_path": "yolov5s_h8.hef",   # Hailo-8 native with built-in NMS
+        "type": "nms",
         "color": (0, 255, 255),     # yellow
-        "anchors": [
-            [[10, 13], [16, 30], [33, 23]],       # P3 stride 8
-            [[30, 61], [62, 45], [59, 119]],       # P4 stride 16
-            [[116, 90], [156, 198], [373, 326]],   # P5 stride 32
-        ],
-        "strides": [8, 16, 32],
+        "anchors": None,
+        "strides": None,
     },
     "yolov7": {
         "name": "YOLOv7",
-        "hef_path": "yolov7.hef",
-        "type": "raw",
+        "hef_path": "yolov7_h8.hef",    # Hailo-8 native with built-in NMS
+        "type": "nms",
         "color": (255, 0, 255),     # magenta
-        "anchors": [
-            [[12, 16], [19, 36], [40, 28]],        # P3 stride 8
-            [[36, 75], [76, 55], [72, 146]],        # P4 stride 16
-            [[142, 110], [192, 243], [459, 401]],   # P5 stride 32
-        ],
-        "strides": [8, 16, 32],
+        "anchors": None,
+        "strides": None,
     },
     "yolov8": {
         "name": "YOLOv8s",
@@ -427,6 +419,7 @@ class ModelManager:
         self.active_key = None
         self._pipeline = None
         self._ng_activated = None
+        self._ng_ctx = None
 
         keys = model_keys or self.MODEL_ORDER
         for key in keys:
@@ -454,8 +447,19 @@ class ModelManager:
     # ── activation helpers ────────────────────────────────────
     def _deactivate_current(self):
         """Release the current pipeline and network group."""
+        if self._pipeline is not None:
+            try:
+                self._pipeline.__exit__(None, None, None)
+            except Exception:
+                pass
+        if hasattr(self, '_ng_ctx') and self._ng_ctx is not None:
+            try:
+                self._ng_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
         self._pipeline = None
         self._ng_activated = None
+        self._ng_ctx = None
 
     def activate(self, key):
         """Configure and activate the model identified by *key*."""
@@ -477,9 +481,12 @@ class ModelManager:
         inp_params = InputVStreamParams.make(ng, format_type=FormatType.UINT8)
         out_params = OutputVStreamParams.make(ng, format_type=FormatType.FLOAT32)
 
+        # Activate network group FIRST, then open the inference pipeline
+        self._ng_ctx = ng.activate(ng_params)
+        self._ng_ctx.__enter__()
+
         pipeline = InferVStreams(ng, inp_params, out_params)
         pipeline.__enter__()
-        ng.activate(ng_params).__enter__()
 
         self._pipeline     = pipeline
         self._ng_activated = ng
