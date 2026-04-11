@@ -129,6 +129,7 @@ WebServer server(80);
 #define PWM_FREQ       1000
 #define PWM_RES        8
 #define DRIVE_DEFAULT  80
+#define DRIVE_MAX      100    // hard cap for wheel speed
 #define LIFT_DEFAULT   80
 
 // LEDC channel assignments (paired by hardware timer: 0/1, 2/3, 4/5, 6/7)
@@ -431,7 +432,7 @@ button:active{transform:scale(.94)}
 <h2>Drive Wheels</h2>
 <div class="slider-row">
   <label>Speed</label>
-  <input type="range" id="dspd" min="50" max="255" value="80">
+  <input type="range" id="dspd" min="50" max="100" value="80">
   <span id="dspdV">80</span>
 </div>
 <div class="grid g3">
@@ -658,8 +659,8 @@ void bts_drive(int rpwm_ch, int lpwm_ch, int en, int speed) {
 
 void set_wheels(int left, int right) {
   if (!motorsEnabled) { Serial.println("Motors disabled! Send 'H' to re-enable."); return; }
-  left = constrain(left, -255, 255);
-  right = constrain(right, -255, 255);
+  left = constrain(left, -DRIVE_MAX, DRIVE_MAX);
+  right = constrain(right, -DRIVE_MAX, DRIVE_MAX);
   bts_drive(LEFT_RPWM_CH, LEFT_LPWM_CH, LEFT_EN, left);
   bts_drive(RIGHT_RPWM_CH, RIGHT_LPWM_CH, RIGHT_EN, right);
   leftWheelSpeed = left;
