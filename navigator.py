@@ -52,15 +52,16 @@ ESP32_TIMEOUT   = 0.5           # HTTP timeout (seconds)
 SENSOR_POLL_HZ  = 10            # ultrasonic poll rate
 
 # Obstacle avoidance thresholds (cm)
-STOP_DIST       = 15            # emergency stop
-SLOW_DIST       = 40            # reduce speed
-TURN_DIST       = 60            # start steering away
+# Robot is ~100cm long x 30cm wide — sensors are at the front
+STOP_DIST       = 50            # emergency stop — back up immediately
+SLOW_DIST       = 80            # reduce speed
+TURN_DIST       = 120           # start steering away (1.2m clearance)
 
-# Driving speeds
-ROAM_SPEED      = 80            # normal roaming speed
-SLOW_SPEED      = 50            # near obstacles
-APPROACH_SPEED  = 60            # approaching a bottle
-TURN_SPEED      = 70            # turning speed
+# Driving speeds (ESP32 caps at DRIVE_MAX=80, drivers explode above 100)
+ROAM_SPEED      = 60            # normal roaming speed
+SLOW_SPEED      = 35            # near obstacles
+APPROACH_SPEED  = 40            # approaching a bottle
+TURN_SPEED      = 50            # turning speed
 
 # Bottle approach
 BOTTLE_CLOSE_FILL = 0.15        # bottle fills 15% of frame → close enough to pick

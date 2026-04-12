@@ -128,8 +128,8 @@ WebServer server(80);
 
 #define PWM_FREQ       1000
 #define PWM_RES        8
-#define DRIVE_DEFAULT  80
-#define DRIVE_MAX      100    // hard cap for wheel speed
+#define DRIVE_DEFAULT  60
+#define DRIVE_MAX      80     // hard cap — drivers explode above 100
 #define LIFT_DEFAULT   80
 
 // LEDC channel assignments (paired by hardware timer: 0/1, 2/3, 4/5, 6/7)
@@ -432,7 +432,7 @@ button:active{transform:scale(.94)}
 <h2>Drive Wheels</h2>
 <div class="slider-row">
   <label>Speed</label>
-  <input type="range" id="dspd" min="50" max="100" value="80">
+  <input type="range" id="dspd" min="30" max="80" value="60">
   <span id="dspdV">80</span>
 </div>
 <div class="grid g3">
