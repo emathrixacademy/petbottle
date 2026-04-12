@@ -86,9 +86,9 @@ WebServer server(80);
 // ===================== PIN DEFINITIONS =====================
 
 // BTS7960B #1 - Left Drive Wheel
-#define LEFT_RPWM    4     // was GPIO18 (boot pull-up caused motor runaway)
-#define LEFT_LPWM    5     // was GPIO23 (not producing PWM)
-#define LEFT_EN      26
+#define LEFT_RPWM    2     // was GPIO18 (boot pull-up caused motor runaway)
+#define LEFT_LPWM    25     // was GPIO23 (not producing PWM)
+#define LEFT_EN      19
 
 // BTS7960B #2 - Right Drive Wheel  (swapped with Arm Lift pins)
 #define RIGHT_RPWM   16
@@ -96,9 +96,9 @@ WebServer server(80);
 #define RIGHT_EN     27
 
 // BTS7960B #3 - Arm Lift (58SW31ZY)  (swapped with Right Wheel pins)
-#define LIFT_RPWM    2
-#define LIFT_LPWM    25
-#define LIFT_EN      19
+#define LIFT_RPWM    4
+#define LIFT_LPWM    5
+#define LIFT_EN      26
 
 // L298N - NEMA 17 Stepper (Base Turning Platform)
 #define STEP_IN1     32
