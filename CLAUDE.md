@@ -3,26 +3,26 @@
 ## Project Overview
 
 Autonomous PET bottle collection robot using dual processors:
-- **ESP32**: Motor control, sensors, WiFi AP, LCD — firmware in `robotic_arm/robotic_arm.ino`
+- **ESP32**: Motor control, sensors, WiFi AP, LCD — test firmware in `esp32_test/esp32_test.ino`
 - **Raspberry Pi 5 + Hailo-8 NPU**: YOLO vision + navigation brain — `camera.py`, `navigator.py`
 
-Communication: Pi connects to ESP32 WiFi AP (`PetBottle_Robot` / `petbottle123` / `192.168.4.1`) and sends HTTP commands.
+Communication: Pi connects to ESP32 WiFi AP (`PetBottle_Robot` / `petbottle123` / `192.168.4.1`) and sends HTTP commands. Pi IP on ESP32 network: `192.168.4.4`.
 
 ## Build & Flash
 
 ### Compile (arduino-cli)
 ```
-arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs --output-dir build_robotic robotic_arm/robotic_arm.ino
+arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs --output-dir build_test esp32_test/esp32_test.ino
 ```
 
-### Flash via OTA (preferred)
-Double-click `flash_ota.bat` — auto compiles, switches WiFi, uploads, reconnects.
-
-### Flash via USB (fallback)
+### Flash via USB
 ```
-arduino-cli upload -p COM3 --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs robotic_arm/robotic_arm.ino
+arduino-cli upload -p COM3 --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs --input-dir build_test
 ```
 Hold BOOT button on ESP32 during upload if it fails to connect.
+
+### Flash via OTA
+Connect to PetBottle_Robot WiFi, open `http://192.168.4.1/ota`, upload `.bin` file.
 
 ### ESP32 Arduino core
 - arduino-cli has v2.0.17 installed — code uses v2 API: `ledcSetup()` + `ledcAttachPin()` + `ledcWrite(channel, duty)`
@@ -33,14 +33,14 @@ Hold BOOT button on ESP32 during upload if it fails to connect.
 
 | File | Purpose |
 |------|---------|
-| `robotic_arm/robotic_arm.ino` | **Main ESP32 firmware** — motors, servos, sensors, WiFi, OTA (the only sketch to flash) |
-| `camera.py` | YOLO v5/v7/v8 model stitching, detection, postprocessing (runs on Pi) |
-| `navigator.py` | Autonomous brain: roam, avoid, approach, align, pickup (runs on Pi) |
+| `esp32_test/esp32_test.ino` | **Active ESP32 firmware** — combined test with WiFi AP, web UI, OTA, camera feed |
+| `camera.py` | YOLO v5/v7/v8 model support, detection, postprocessing (runs on Pi) |
+| `navigator.py` | Autonomous brain + Flask MJPEG video stream on port 5000 (runs on Pi) |
 | `server.py` | OTA update server for remote deployment (runs on Pi) |
 | `flash_ota.bat` | One-click compile + OTA flash from Windows |
-| `petbottle/petbottle.ino` | **LEGACY — do not use.** Sensor-only sketch, pins conflict with robotic_arm.ino |
+| `petbottle/petbottle.ino` | **LEGACY — do not use.** Sensor-only sketch, pins conflict |
 
-## ESP32 Pin Map (21 GPIOs)
+## ESP32 Pin Map (New Schematic)
 
 ### Drive Wheels (BTS7960B x2)
 | Function | GPIO | LEDC Channel |
@@ -52,31 +52,38 @@ Hold BOOT button on ESP32 during upload if it fails to connect.
 | Right LPWM (rev) | 17 | 3 |
 | Right EN | 27 | — |
 
-### Arm Lift (BTS7960B #3)
+### Arm Lift (L298N #1)
 | Function | GPIO | LEDC Channel |
 |----------|------|-------------|
-| Lift RPWM (up) | 2 | 4 |
-| Lift LPWM (down) | 25 | 5 |
-| Lift EN | 19 | — |
+| ARM EN | 14 | 4 |
+| ARM IN1 | 15 | — |
+| ARM IN2 | 19 | — |
+
+### Swing Drive (L298N #2) — rotates Pi+Camera platform 180°
+| Function | GPIO | LEDC Channel |
+|----------|------|-------------|
+| SWING EN | 2 | 5 |
+| SWING IN1 | 25 | — |
+| SWING IN2 | 23 | — |
 
 ### Other
 | Function | GPIO |
 |----------|------|
-| Stepper IN1/IN2/IN3/IN4 | 32, 33, 22, 21 |
 | Servo Left / Right | 13 (ch6) / 18 (ch7) |
-| LCD SDA / SCL | 14 / 15 |
-| Buzzer | 23 |
+| LCD SDA / SCL | 21 / 22 |
+| Buzzer | 3 |
 | Ultrasonic TRIG (shared) | 12 |
-| Ultrasonic ECHO L / R | 34 / 35 |
+| Ultrasonic ECHO 1/2/3/4 | 33 / 35 / 32 / 34 |
+| Limit Switch 1 / 2 | 36 / 39 |
 
-**Note:** Right Wheel and Arm Lift pins were swapped from the original schematic to diagnose a BTS7960B hardware issue. The schematic PDF still shows the original (2/25/19 = Right, 16/17/27 = Lift).
+**Note:** GPIO 36 and 39 are input-only with no internal pull-up. External 10kΩ pull-up resistors to 3.3V are required for the limit switches.
 
 ## LEDC Channel Pairing Rules
 
 ESP32 LEDC channels share hardware timers in pairs: ch0/1, ch2/3, ch4/5, ch6/7. Both channels in a pair MUST use the same frequency and resolution. Current layout:
 - Timer 0: ch0 + ch1 → Left wheel (1 kHz, 8-bit)
 - Timer 1: ch2 + ch3 → Right wheel (1 kHz, 8-bit)
-- Timer 2: ch4 + ch5 → Arm lift (1 kHz, 8-bit)
+- Timer 2: ch4 + ch5 → Arm lift (ch4) + Swing drive (ch5) via L298N (1 kHz, 8-bit)
 - Timer 3: ch6 + ch7 → Servos (50 Hz, 12-bit)
 
 Never assign channels out-of-order or across timer pairs for different motors.
@@ -85,36 +92,45 @@ Never assign channels out-of-order or across timer pairs for different motors.
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/` | GET | Web control dashboard |
-| `/cmd?c=<CMD>` | GET | Execute command (F80, J80, TL60, TR60, X, P, H, E, etc.) |
-| `/sensor` | GET | JSON: `{left, right, wheels:{left,right}, base, lift, motors}` |
+| `/` | GET | Web control dashboard (tabbed test UI) |
+| `/cmd?c=<CMD>` | GET | Execute command |
+| `/sensor` | GET | JSON: ultrasonic, limits, speeds |
+| `/cmdlog` | GET | JSON: recent Pi-ESP32 command log |
 | `/ota` | GET/POST | Firmware upload page |
-
-## Command Reference
-
-| Command | Action |
-|---------|--------|
-| `F<speed>` | Forward (0-255) |
-| `J<speed>` | Backward |
-| `TL<speed>` / `TR<speed>` | Turn left / right |
-| `W<l>,<r>` | Raw wheel (-255 to 255) |
-| `X` | Stop wheels |
-| `B<angle>` / `BH` | Rotate base / home base |
-| `U<speed>` / `D<speed>` / `S` | Lift up / down / stop |
-| `L<angle>` / `R<angle>` | Left / right servo |
-| `O` / `C` | Both servos open / close |
-| `P` | Full pickup sequence (~15s) |
-| `H` | Home all motors |
-| `E` | Emergency stop |
 
 ## Navigator State Machine
 
-`ROAMING` → bottle detected → `APPROACHING` → centered & close → `ALIGNING` → aligned → `PICKING_UP` → done → `ROAMING`
+`WAITING` → user starts → `SCANNING` → bottle detected → `VERIFYING` → confirmed → `APPROACHING` → centered & close → `ALIGNING` → aligned → `PICKING_UP` → done → `SCANNING`
 
-At any point: ultrasonic < 15 cm → `AVOIDING` (back up + turn) → `ROAMING`
+At any point: ultrasonic < 60 cm → `AVOIDING` (back up + turn) → `SCANNING`
+
+## Navigator Video Stream (Pi)
+
+navigator.py serves a Flask MJPEG stream on port 5000:
+- `http://192.168.4.4:5000/video_feed` — live MJPEG stream with YOLO detections
+- `http://192.168.4.4:5000/stats` — JSON detection stats (fps, bottles, model, state)
+
+Auto-starts on boot via systemd service `petbottle-navigator`.
+
+## Changes from Original Schematic
+
+- LCD moved from GPIO 14/15 to **21/22**
+- Buzzer moved from GPIO 23 to **3**
+- Stepper motor (NEMA 17 + L298N) **removed**, replaced by geared motor
+- Arm lift changed from BTS7960B to **L298N #1** (EN=14, IN1=15, IN2=19)
+- **Swing drive** added via **L298N #2** (EN=2, IN1=25, IN2=23) — rotates Pi+Camera platform 180° to scan for bottles
+- Right wheel motor has **inverted polarity** — corrected in software via `setRight()` (no physical wire change)
+- Drive wheel speed **capped at 80** (was 255) to prevent BTS7960 burnout
+- Ultrasonic sensors increased from **2 to 4** (ECHO: 33, 35, 32, 34)
+- **Limit switches** added on GPIO 36, 39 (need external 10kΩ pull-up)
+- Ensemble mode **removed** — single YOLO model only (yolov8)
+- Navigator now includes **Flask MJPEG video stream** on port 5000
 
 ## Known Issues
 
-- Right wheel reverse was failing due to LEDC channel-pair timer conflict (fixed: channels now in natural pair order 0/1, 2/3, 4/5)
-- GPIO 2 is a boot strapping pin with pull-down — avoid using it for motor PWM (currently used for Arm Lift RPWM which is safe since EN starts LOW)
-- `petbottle/petbottle.ino` has conflicting GPIO assignments (5, 18, 19, 32, 33 overlap with robotic_arm.ino) — never flash it on the robot's ESP32
+- **GPIO 0 must NOT be used for motor drivers** — it is a boot strapping pin (LOW = download mode). Previously ARM_IN1 was accidentally set to GPIO 0 in code, which prevented flashing when the L298N was connected. Fixed: ARM_IN1 = GPIO 15.
+- GPIO 2 is a boot strapping pin with pull-down — used for L298N #2 EN which is safe since it starts LOW
+- GPIO 36/39 have no internal pull-up — need external 10kΩ resistors for limit switches, otherwise they read as always pressed
+- HEF models compiled for Hailo8L show warnings on Hailo8 (lower performance)
+- `petbottle/petbottle.ino` has conflicting GPIO assignments — never flash it on the robot's ESP32
+- **Motor isolation issue (WIP)**: Arm/swing/servo commands were also moving wheels — fix applied (safe boot sequence + per-command EN management) but needs testing after recompile

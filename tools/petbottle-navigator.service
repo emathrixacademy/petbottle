@@ -1,0 +1,17 @@
+[Unit]
+Description=PET Bottle Robot Navigator (YOLO + autonomous nav + video stream)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=set-admin
+WorkingDirectory=/home/set-admin/testing
+ExecStart=/usr/bin/python3 /home/set-admin/testing/navigator.py --no-show --model yolov8
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

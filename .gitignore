@@ -1,0 +1,20 @@
+# Build artifacts
+build_*/
+*.bin
+*.elf
+*.map
+*.merged.bin
+
+# IDE
+.vscode/
+.claude/
+
+# OS
+*.crdownload
+Thumbs.db
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+results/

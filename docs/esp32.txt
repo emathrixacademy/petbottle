@@ -1,0 +1,63 @@
+#include "BluetoothSerial.h"
+
+BluetoothSerial SerialBT;
+
+// LED control
+#define LED_PIN 2  // Built-in LED on most ESP32 boards (GPIO 2)
+unsigned long previousMillis = 0;
+int blinkInterval = 1000;  // Start with slow blink (1000ms)
+bool ledState = false;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Setup LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  // Start Bluetooth
+  SerialBT.begin("ESP32_BOTTLE_COLLECTOR");
+  Serial.println("Bluetooth started. Device name: ESP32_BOTTLE_COLLECTOR");
+  Serial.println("Waiting for Raspberry Pi connection...");
+}
+
+void loop() {
+  // Check for incoming Bluetooth data
+  if (SerialBT.available()) {
+    char c = SerialBT.read();
+    
+    if (c == 'u') {
+      Serial.println("HAND DETECTED - Increasing blink speed");
+      // Increase blinking speed (decrease interval)
+      blinkInterval -= 50;
+      if (blinkInterval < 50) blinkInterval = 50;  // Min 50ms
+      Serial.print("Blink interval: ");
+      Serial.println(blinkInterval);
+    } 
+    else if (c == 'd') {
+      Serial.println("NO HAND - Decreasing blink speed");
+      // Decrease blinking speed (increase interval)
+      blinkInterval += 50;
+      if (blinkInterval > 2000) blinkInterval = 2000;  // Max 2000ms
+      Serial.print("Blink interval: ");
+      Serial.println(blinkInterval);
+    }
+
+    // Read and print the following text line if available
+    if (SerialBT.available()) {
+      String msg = SerialBT.readStringUntil('\n');
+      if (msg.length() > 0) {
+        Serial.print("Received message: ");
+        Serial.println(msg);
+      }
+    }
+  }
+  
+  // Non-blocking LED blink
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= blinkInterval) {
+    previousMillis = currentMillis;
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState);
+  }
+}
