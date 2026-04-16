@@ -18,3 +18,10 @@ Thumbs.db
 __pycache__/
 *.pyc
 results/
+
+# Logs
+*.log
+
+# Large binaries (backed up on Google Drive, not GitHub)
+fromgooglecolab/
+models/archive/

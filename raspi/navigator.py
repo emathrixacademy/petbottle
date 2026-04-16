@@ -66,6 +66,7 @@ SLOW_SPEED      = 30            # near obstacles — slow crawl
 APPROACH_SPEED  = 40            # approaching a bottle — 40%
 TURN_SPEED      = 60            # turning — 60% (tracks need more to skid-steer)
 SCAN_SPEED      = 60            # scanning rotation — 60%
+ALIGN_SPEED     = 35            # fine alignment turns before pickup — slow to avoid overshoot
 VERIFY_SPEED    = 30            # verification approach — extra cautious
 
 # Bottle detection & verification
@@ -88,10 +89,11 @@ COCO_OBSTACLE_CLASSES = {
 stream_app = Flask(__name__)
 stream_lock = threading.Lock()
 stream_frame = None  # latest JPEG-encoded frame
-stream_stats = {"fps": 0, "bottles": 0, "persons": 0, "model": "", "inference_ms": 0, "state": "WAITING"}
+stream_stats = {"fps": 0, "bottles": 0, "persons": 0, "model": "", "inference_ms": 0, "state": "WAITING",
+                "ultrasonic": {"s1": 999, "s2": 999, "s3": 999, "s4": 999}}
 _navigator_ref = None  # set by Navigator.__init__ so Flask routes can control it
 
-def update_stream(frame_bgr, bottles, persons, model_name, inference_ms, state_name):
+def update_stream(frame_bgr, bottles, persons, model_name, inference_ms, state_name, ultrasonic=None):
     """Called from navigator loop to update the shared frame and stats."""
     global stream_frame, stream_stats
     _, jpeg = cv2.imencode('.jpg', frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
@@ -102,6 +104,8 @@ def update_stream(frame_bgr, bottles, persons, model_name, inference_ms, state_n
         stream_stats["model"] = model_name
         stream_stats["inference_ms"] = round(inference_ms, 1)
         stream_stats["state"] = state_name
+        if ultrasonic:
+            stream_stats["ultrasonic"] = ultrasonic
 
 def generate_mjpeg():
     while True:
@@ -286,13 +290,15 @@ class State(Enum):
 
 class ESP32Link:
     """Talks to the ESP32 robot controller over WiFi HTTP.
+    Uses PI-prefixed commands that bypass the ESP32's test-UI mode system,
+    so the navigator always has direct motor control.
     Logs all commands and responses for the live monitor."""
 
     MAX_LOG = 20  # keep last 20 command/response entries
 
     def __init__(self, ip=ESP32_IP):
         self.base_url = f"http://{ip}"
-        self.sensor_data = {"left": 999, "right": 999, "motors": 1}
+        self.sensor_data = {}
         self._lock = threading.Lock()
         self._running = True
         self.cmd_log = []  # list of (timestamp, command, response)
@@ -314,7 +320,7 @@ class ESP32Link:
 
     def _log(self, command, response):
         """Log command/response, skip duplicates."""
-        if command == self._last_cmd and command not in ("X", "E", "P", "H"):
+        if command == self._last_cmd and command not in ("PIX", "PISTOP", "P", "PA"):
             return
         self._last_cmd = command
         ts = time.strftime("%H:%M:%S")
@@ -331,9 +337,22 @@ class ESP32Link:
 
     @property
     def ultrasonic(self):
-        """Returns (left_cm, right_cm)."""
+        """Returns dict with all 4 sensors: {s1: front, s2: right, s3: back, s4: left}.
+        ESP32 /sensor returns: {"ultrasonic": {"s1": N, "s2": N, "s3": N, "s4": N}}"""
         with self._lock:
-            return self.sensor_data.get("left", 999), self.sensor_data.get("right", 999)
+            us = self.sensor_data.get("ultrasonic", {})
+            return {
+                "s1": us.get("s1", 999),  # front
+                "s2": us.get("s2", 999),  # right
+                "s3": us.get("s3", 999),  # back
+                "s4": us.get("s4", 999),  # left
+            }
+
+    @property
+    def ultrasonic_min(self):
+        """Returns the minimum distance across all 4 sensors."""
+        us = self.ultrasonic
+        return min(us["s1"], us["s2"], us["s3"], us["s4"])
 
     @property
     def sensors(self):
@@ -344,7 +363,8 @@ class ESP32Link:
     @property
     def is_connected(self):
         with self._lock:
-            return self.sensor_data.get("motors", 0) == 1
+            # If we got ultrasonic data, the ESP32 is alive
+            return "ultrasonic" in self.sensor_data
 
     def cmd(self, command):
         """Send a command to the ESP32 (non-blocking), log it."""
@@ -356,19 +376,28 @@ class ESP32Link:
             self._log(command, f"ERR: {e}")
 
     def forward(self, speed=ROAM_SPEED):
-        self.cmd(f"F{speed}")
+        self.cmd(f"PIFW{speed}")
 
     def backward(self, speed=ROAM_SPEED):
-        self.cmd(f"J{speed}")
+        self.cmd(f"PIBW{speed}")
 
     def turn_left(self, speed=TURN_SPEED):
-        self.cmd(f"TL{speed}")
+        self.cmd(f"PITL{speed}")
 
     def turn_right(self, speed=TURN_SPEED):
-        self.cmd(f"TR{speed}")
+        self.cmd(f"PITR{speed}")
+
+    def differential(self, left_speed, right_speed):
+        """Drive wheels at different speeds for gentle steering.
+        Speeds can be negative (reverse). Clamped to [-80, 80]."""
+        self.cmd(f"PIDW{left_speed},{right_speed}")
 
     def stop(self):
-        self.cmd("X")
+        self.cmd("PIX")
+
+    def emergency_stop(self):
+        """Stop ALL motors, servos, buzzer — everything."""
+        self.cmd("PISTOP")
 
     def pickup(self):
         """Triggers the full pickup sequence on ESP32 (blocking ~15s)."""
@@ -474,19 +503,19 @@ class Navigator:
                 smoothed = self.tracker.update(bottles)
 
                 # ── Get ultrasonic data ───────────────────────
-                us_left, us_right = self.esp32.ultrasonic
+                us = self.esp32.ultrasonic  # {s1:front, s2:right, s3:back, s4:left}
 
                 # ── Navigation decision ───────────────────────
                 self._navigate(smoothed, persons, orig_w, orig_h,
-                               frame_area, us_left, us_right)
+                               frame_area, us)
 
                 # ── Draw results ──────────────────────────────
                 result = draw_detections(frame.copy(), smoothed, persons)
-                self._draw_nav_overlay(result, smoothed, us_left, us_right, ms, frame_idx)
+                self._draw_nav_overlay(result, smoothed, us, ms, frame_idx)
 
                 # ── Update web stream ────────────────────────
                 model_name = self.manager.active_name
-                update_stream(result, smoothed, persons, model_name, ms, self.state.name)
+                update_stream(result, smoothed, persons, model_name, ms, self.state.name, us)
 
                 # ── FPS counter for stream stats ─────────────
                 self._fps_count = getattr(self, '_fps_count', 0) + 1
@@ -501,7 +530,8 @@ class Navigator:
                 # ── Console output ────────────────────────────
                 icon = "OK" if smoothed else "--"
                 print(f"\r  [{icon}] {self.state.name:12s} "
-                      f"US L:{us_left:3d} R:{us_right:3d} | "
+                      f"US F:{us['s1']:3d} R:{us['s2']:3d} "
+                      f"B:{us['s3']:3d} L:{us['s4']:3d} | "
                       f"{len(smoothed)} det | {ms:.0f}ms   ",
                       end="", flush=True)
 
@@ -525,14 +555,26 @@ class Navigator:
                             self.state = State.STOPPED
                             print("\n  >>> MANUAL STOP")
                 else:
-                    # Headless mode: check for Enter key on stdin
+                    # Headless mode: check for Enter key on stdin (cross-platform)
                     if self.state == State.WAITING:
-                        import select, sys
-                        if select.select([sys.stdin], [], [], 0)[0]:
-                            sys.stdin.readline()
-                            self.state = State.SCANNING
-                            self.scan_start = time.time()
-                            print("\n  >>> MOTORS ENABLED — SCANNING (slow look-around)")
+                        try:
+                            import sys
+                            if sys.platform == "win32":
+                                import msvcrt
+                                if msvcrt.kbhit():
+                                    msvcrt.getch()
+                                    self.state = State.SCANNING
+                                    self.scan_start = time.time()
+                                    print("\n  >>> MOTORS ENABLED — SCANNING (slow look-around)")
+                            else:
+                                import select
+                                if select.select([sys.stdin], [], [], 0)[0]:
+                                    sys.stdin.readline()
+                                    self.state = State.SCANNING
+                                    self.scan_start = time.time()
+                                    print("\n  >>> MOTORS ENABLED — SCANNING (slow look-around)")
+                        except Exception:
+                            pass  # stdin not available (e.g., systemd service)
 
                 frame_idx += 1
 
@@ -548,8 +590,9 @@ class Navigator:
 
     # ── Navigation logic ──────────────────────────────────────
 
-    def _navigate(self, bottles, persons, w, h, frame_area, us_left, us_right):
-        """State machine: slow, careful navigation. Safety is #1 priority."""
+    def _navigate(self, bottles, persons, w, h, frame_area, us):
+        """State machine: slow, careful navigation. Safety is #1 priority.
+        us = dict with keys s1(front), s2(right), s3(back), s4(left) in cm."""
 
         # ── Safety hold: no motor commands until user confirms ──
         if self.state == State.WAITING:
@@ -563,7 +606,34 @@ class Navigator:
         if self.state == State.PICKING_UP:
             return
 
-        us_min = min(us_left, us_right)
+        us_front = us["s1"]
+        us_right = us["s2"]
+        us_back  = us["s3"]
+        us_left  = us["s4"]
+        us_min_forward = min(us_front, us_left, us_right)  # sensors facing forward path
+
+        # ── Avoiding state: back up SLOWLY and turn away ──
+        # Must be checked FIRST so the avoidance timer isn't reset by
+        # the STOP_DIST check below while the robot is still backing up.
+        if self.state == State.AVOIDING:
+            elapsed = time.time() - self.avoid_timer
+            if elapsed < 1.5:
+                # Back up (check rear sensor first)
+                if us_back > STOP_DIST:
+                    self.esp32.backward(SLOW_SPEED)
+                else:
+                    self.esp32.stop()  # blocked front AND back
+            elif elapsed < 3.0:
+                # Turn away from the closer side
+                if us_left < us_right:
+                    self.esp32.turn_right(SCAN_SPEED)
+                else:
+                    self.esp32.turn_left(SCAN_SPEED)
+            else:
+                self.esp32.stop()
+                self.state = State.SCANNING
+                self.scan_start = time.time()
+            return
 
         # ── PERSON DETECTED → immediate stop (safety first!) ──
         for p in persons:
@@ -577,31 +647,15 @@ class Navigator:
                 print("\n  >>> PERSON DETECTED — stopping for safety")
                 return
 
-        # ── Emergency stop: ultrasonic too close ──────────
-        if us_min < STOP_DIST:
+        # ── Emergency stop: front ultrasonic too close ────
+        if us_front < STOP_DIST:
             self.esp32.stop()
             self.state = State.AVOIDING
             self.avoid_timer = time.time()
             return
 
-        # ── Avoiding state: back up SLOWLY and turn away ──
-        if self.state == State.AVOIDING:
-            elapsed = time.time() - self.avoid_timer
-            if elapsed < 1.5:
-                self.esp32.backward(SLOW_SPEED)
-            elif elapsed < 3.0:
-                if us_left < us_right:
-                    self.esp32.turn_right(SCAN_SPEED)
-                else:
-                    self.esp32.turn_left(SCAN_SPEED)
-            else:
-                self.esp32.stop()
-                self.state = State.SCANNING
-                self.scan_start = time.time()
-            return
-
         # ── Ultrasonic: slow zone → steer away gently ────
-        if us_min < TURN_DIST and us_left != us_right:
+        if us_min_forward < TURN_DIST:
             if us_left < us_right:
                 self.esp32.turn_right(SCAN_SPEED)
             else:
@@ -687,19 +741,19 @@ class Navigator:
                     if abs(b_cx_norm - 0.5) < BOTTLE_CENTER_TOL:
                         self._start_pickup()
                     else:
-                        # Align slowly
+                        # Align slowly — use ALIGN_SPEED to avoid overshooting
                         self.state = State.ALIGNING
                         if b_cx_norm < 0.5:
-                            self.esp32.turn_left(SCAN_SPEED)
+                            self.esp32.turn_left(ALIGN_SPEED)
                         else:
-                            self.esp32.turn_right(SCAN_SPEED)
+                            self.esp32.turn_right(ALIGN_SPEED)
                 else:
-                    # Drive towards bottle slowly, steer gently
+                    # Drive towards bottle slowly, steer gently with differential
                     if abs(b_cx_norm - 0.5) > 0.25:
                         if b_cx_norm < 0.5:
-                            self.esp32.cmd(f"W{VERIFY_SPEED},{APPROACH_SPEED}")
+                            self.esp32.differential(VERIFY_SPEED, APPROACH_SPEED)
                         else:
-                            self.esp32.cmd(f"W{APPROACH_SPEED},{VERIFY_SPEED}")
+                            self.esp32.differential(APPROACH_SPEED, VERIFY_SPEED)
                     else:
                         self.esp32.forward(APPROACH_SPEED)
             else:
@@ -721,9 +775,9 @@ class Navigator:
                     self._start_pickup()
                 else:
                     if b_cx_norm < 0.5:
-                        self.esp32.turn_left(SCAN_SPEED)
+                        self.esp32.turn_left(ALIGN_SPEED)
                     else:
-                        self.esp32.turn_right(SCAN_SPEED)
+                        self.esp32.turn_right(ALIGN_SPEED)
             else:
                 self.esp32.stop()
                 self.state = State.SCANNING
@@ -747,7 +801,7 @@ class Navigator:
             if elapsed < 5.0:
                 # Move forward slowly for 5 seconds
                 speed = ROAM_SPEED
-                if us_min < SLOW_DIST:
+                if us_min_forward < SLOW_DIST:
                     speed = SLOW_SPEED
                 self.esp32.forward(speed)
             else:
@@ -757,7 +811,7 @@ class Navigator:
                 self.scan_start = time.time()
 
     def _start_pickup(self):
-        """Stop, run pickup sequence in a thread, then resume roaming."""
+        """Stop, run pickup sequence in a thread, then resume scanning."""
         self.state = State.PICKING_UP
         self.esp32.stop()
         time.sleep(0.3)
@@ -765,16 +819,33 @@ class Navigator:
         def _do_pickup():
             print("\n  >>> PICKUP SEQUENCE STARTED")
             self.esp32.pickup()
-            print("\n  >>> PICKUP DONE — resuming roam")
+            # Wait for the ESP32 pickup state machine to actually finish.
+            # The HTTP response comes back instantly — the arm is still moving.
+            # Poll /sensor until pickup field returns "idle" or "done".
+            timeout = time.time() + 35  # 30s ESP32 timeout + 5s margin
+            while time.time() < timeout:
+                sensor = self.esp32.sensors
+                pu_state = sensor.get("pickup", "idle")
+                if pu_state in ("idle", "done"):
+                    break
+                time.sleep(0.5)
+            else:
+                print("\n  >>> PICKUP TIMEOUT waiting for ESP32 — aborting")
+                self.esp32.cmd("PA")  # send abort
+                time.sleep(1)
+
+            print("\n  >>> PICKUP DONE — scanning for next bottle")
             self.tracker = DetectionTracker()  # reset tracker
-            self.state = State.ROAMING
+            self.state = State.SCANNING
+            self.scan_start = time.time()
 
         threading.Thread(target=_do_pickup, daemon=True).start()
 
     # ── HUD overlay ───────────────────────────────────────
 
-    def _draw_nav_overlay(self, frame, bottles, us_left, us_right, ms, frame_idx):
-        """Draw navigation HUD on frame."""
+    def _draw_nav_overlay(self, frame, bottles, us, ms, frame_idx):
+        """Draw navigation HUD on frame.
+        us = dict with keys s1(front), s2(right), s3(back), s4(left)."""
         h, w = frame.shape[:2]
 
         # State badge (top-right)
@@ -796,15 +867,19 @@ class Navigator:
         cv2.putText(frame, badge, (w - tw - 10, th + 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
 
-        # Ultrasonic bars (bottom-left and bottom-right)
+        # Ultrasonic bars — all 4 sensors
         bar_max_h = 100
         bar_w = 30
         margin = 10
+        # Layout: left edge=S4(left), center-left=S1(front), center-right=S3(back), right edge=S2(right)
+        bar_positions = [
+            ("F", us["s1"], margin),
+            ("L", us["s4"], margin + bar_w + 6),
+            ("R", us["s2"], w - bar_w - margin),
+            ("B", us["s3"], w - 2 * bar_w - margin - 6),
+        ]
 
-        for side, dist, x_pos in [
-            ("L", us_left, margin),
-            ("R", us_right, w - bar_w - margin),
-        ]:
+        for side, dist, x_pos in bar_positions:
             fill_h = int(min(dist, 200) / 200.0 * bar_max_h)
             bar_color = (0, 255, 0) if dist > SLOW_DIST else (
                 (0, 200, 255) if dist > STOP_DIST else (0, 0, 255)
@@ -913,9 +988,9 @@ def main():
     print(f"  Connecting to ESP32 at {args.esp32_ip}...")
     esp32 = ESP32Link(ip=args.esp32_ip)
     time.sleep(0.5)
-    us_l, us_r = esp32.ultrasonic
-    if us_l < 999 or us_r < 999:
-        print(f"  ESP32 connected! Ultrasonic: L={us_l}cm R={us_r}cm")
+    us = esp32.ultrasonic
+    if any(v < 999 for v in us.values()):
+        print(f"  ESP32 connected! Ultrasonic: F={us['s1']}cm R={us['s2']}cm B={us['s3']}cm L={us['s4']}cm")
     else:
         print(f"  WARNING: ESP32 not responding — running camera-only mode")
 

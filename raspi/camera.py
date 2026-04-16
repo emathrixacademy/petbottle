@@ -677,38 +677,6 @@ class ModelManager:
 
         return bottles, persons
 
-    def infer_ensemble(self, frame, conf_thresh):
-        """Run all 3 models on *frame*, each covering its own range,
-        then merge results with NMS. Bottles held by a person are excluded.
-        All bottle orientations (standing, lying, tilted) are detected.
-        Returns (merged_bottles, persons).
-        """
-        all_bottles = []
-        all_persons = []
-
-        for key in self.models:
-            self.activate(key)
-            bottles, persons = self.infer(frame, conf_thresh, apply_range_filter=True)
-            all_bottles.extend(bottles)
-            all_persons.extend(persons)
-
-        # NMS on merged person list
-        if all_persons:
-            pboxes = [[p[0], p[1], p[2]-p[0], p[3]-p[1]] for p in all_persons]
-            pscores = [p[4] for p in all_persons]
-            pidx = cv2.dnn.NMSBoxes(pboxes, pscores, conf_thresh * 0.25, 0.45)
-            all_persons = [all_persons[i] for i in (pidx.flatten() if len(pidx) else [])]
-
-        if not all_bottles:
-            return [], all_persons
-
-        # Cross-model NMS on bottles
-        boxes  = [[d[0], d[1], d[2] - d[0], d[3] - d[1]] for d in all_bottles]
-        scores = [d[4] for d in all_bottles]
-        idx = cv2.dnn.NMSBoxes(boxes, scores, conf_thresh * 0.25, 0.45)
-        merged = [all_bottles[i] for i in (idx.flatten() if len(idx) else [])]
-        return merged, all_persons
-
     @property
     def active_name(self):
         if self.active_key and self.active_key in self.models:
@@ -746,7 +714,7 @@ def overlay_info(frame, detections, ms, model_name, model_color, mode, extra="")
                     (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 2)
 
     # Toggle hint (bottom)
-    hint = "5=v5(FAR) 7=v7(MID) 8=v8(CLOSE) A=All Q=Quit | Held=filtered"
+    hint = "5=v5 7=v7 8=v8 Q=Quit | Held=filtered"
     cv2.putText(frame, hint, (10, h - 15),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 120, 120), 1)
 
@@ -788,14 +756,9 @@ def run_camera(manager, conf_thresh, camera_index, no_show, out_dir, mode):
     print(f"  model={manager.active_name} | mode={mode}")
     print(f"  conf={conf_thresh} | Held-by-human filter: ON")
     print(f"  Detects ALL orientations: standing, lying, tilted")
-    print(f"  Range assignments:")
-    print(f"    5 = YOLOv5  → FAR   (small/distant bottles)")
-    print(f"    7 = YOLOv7  → MID   (medium range)")
-    print(f"    8 = YOLOv8  → CLOSE (nearby bottles)")
-    print(f"    A = All ranges combined | Q = Quit")
+    print(f"  Models: 5=YOLOv5  7=YOLOv7  8=YOLOv8  Q=Quit")
     print(f"{'='*60}\n")
 
-    ensemble = (mode == "all")
     frame_idx = 0
     ms = 0.0
     tracker = DetectionTracker()
@@ -812,26 +775,20 @@ def run_camera(manager, conf_thresh, camera_index, no_show, out_dir, mode):
                     break
 
             t0 = time.time()
-            if ensemble:
-                raw_dets, persons = manager.infer_ensemble(frame, conf_thresh)
-            else:
-                raw_dets, persons = manager.infer(frame, conf_thresh)
+            raw_dets, persons = manager.infer(frame, conf_thresh)
             ms = (time.time() - t0) * 1000
 
             detections = tracker.update(raw_dets)
 
             result = draw_detections(frame.copy(), detections, persons)
-            disp_mode = "ENSEMBLE" if ensemble else "SINGLE"
-            range_tag = MODEL_RANGE.get(manager.active_key, "all") if not ensemble else "all"
-            disp_label = f"{disp_mode}:{range_tag.upper()}"
+            range_tag = MODEL_RANGE.get(manager.active_key, "all")
+            disp_label = f"SINGLE:{range_tag.upper() if range_tag else 'ALL'}"
             overlay_info(result, detections, ms,
-                         manager.active_name if not ensemble else "ALL",
-                         manager.active_color if not ensemble else (255, 255, 255),
+                         manager.active_name, manager.active_color,
                          disp_label, f"Frame {frame_idx}")
 
             icon = "OK" if detections else "--"
-            model_tag = "ALL" if ensemble else manager.active_name
-            print(f"\r  [{icon}] {model_tag:8s} frame={frame_idx:5d} | "
+            print(f"\r  [{icon}] {manager.active_name:8s} frame={frame_idx:5d} | "
                   f"{len(detections):2d} det | {ms:.1f}ms   ", end="", flush=True)
 
             if not no_show:
@@ -842,20 +799,14 @@ def run_camera(manager, conf_thresh, camera_index, no_show, out_dir, mode):
                 if key in (ord('q'), ord('Q'), 27):
                     break
                 elif key == ord('5'):
-                    ensemble = False
                     manager.activate("yolov5")
                     tracker = DetectionTracker()  # reset tracker on switch
                 elif key == ord('7'):
-                    ensemble = False
                     manager.activate("yolov7")
                     tracker = DetectionTracker()
                 elif key == ord('8'):
-                    ensemble = False
                     manager.activate("yolov8")
                     tracker = DetectionTracker()
-                elif key in (ord('a'), ord('A')):
-                    ensemble = True
-                    print("\n  >>> Ensemble mode (all models)")
                 elif key == ord('s'):
                     snap = out_dir / f"snap_{frame_idx:05d}.jpg"
                     cv2.imwrite(str(snap), result)
@@ -876,7 +827,7 @@ def run_camera(manager, conf_thresh, camera_index, no_show, out_dir, mode):
 # Image batch mode
 # ══════════════════════════════════════════════════════════════
 
-def run_images(manager, conf_thresh, images_dir, no_show, out_dir, mode, single=None):
+def run_images(manager, conf_thresh, images_dir, no_show, out_dir, single=None):
     if single:
         image_files = [single]
     else:
@@ -890,10 +841,7 @@ def run_images(manager, conf_thresh, images_dir, no_show, out_dir, mode, single=
         print(f"No images found in: {images_dir or single}")
         return
 
-    ensemble = (mode == "all")
-
-    # In image mode with a single model, run all 3 models for comparison
-    model_keys = list(manager.models.keys()) if ensemble else [manager.active_key]
+    model_keys = [manager.active_key]
 
     print(f"\n{'='*60}")
     print(f"  Testing {len(image_files)} images x {len(model_keys)} model(s)")
@@ -917,23 +865,18 @@ def run_images(manager, conf_thresh, images_dir, no_show, out_dir, mode, single=
                 continue
 
             t0 = time.time()
-            if ensemble:
-                detections, persons = manager.infer_ensemble(frame, conf_thresh)
-            else:
-                detections, persons = manager.infer(frame, conf_thresh)
+            detections, persons = manager.infer(frame, conf_thresh)
             ms = (time.time() - t0) * 1000
             total_det += len(detections)
             total_ms += ms
 
             result = draw_detections(frame.copy(), detections, persons)
-            disp_mode = "ENSEMBLE" if ensemble else "SINGLE"
-            range_tag = MODEL_RANGE.get(manager.active_key, "all") if not ensemble else "all"
+            range_tag = MODEL_RANGE.get(manager.active_key, "all")
             overlay_info(result, detections, ms, model_name,
-                         manager.active_color, f"{disp_mode}:{range_tag.upper()}",
+                         manager.active_color, f"SINGLE:{range_tag.upper() if range_tag else 'ALL'}",
                          f"[{idx+1}/{len(image_files)}] {img_path.name}")
 
-            suffix = "ensemble" if ensemble else model_key
-            out_path = out_dir / f"result_{suffix}_{img_path.name}"
+            out_path = out_dir / f"result_{model_key}_{img_path.name}"
             cv2.imwrite(str(out_path), result)
 
             icon = "OK" if detections else "--"
@@ -951,9 +894,6 @@ def run_images(manager, conf_thresh, images_dir, no_show, out_dir, mode, single=
         print(f"  Total detections : {total_det}")
         print(f"  Avg infer time   : {avg_ms:.1f}ms  ({1000/avg_ms:.1f} FPS)" if avg_ms > 0 else "")
 
-        if ensemble:
-            break  # ensemble already runs all models per frame
-
     if not no_show:
         cv2.destroyAllWindows()
 
@@ -969,8 +909,8 @@ def main():
         description="PET Bottle detection — YOLOv5/v7/v8 model stitching on Hailo-8"
     )
     parser.add_argument("--model", default="yolov8",
-                        choices=["yolov5", "yolov7", "yolov8", "all"],
-                        help="Model to use (default: yolov8). 'all' = ensemble mode")
+                        choices=["yolov5", "yolov7", "yolov8"],
+                        help="Model to use (default: yolov8)")
     parser.add_argument("--image",   default=None,  help="Path to a single image file")
     parser.add_argument("--images",  default=None,  help="Path to image folder")
     parser.add_argument("--camera",  type=int, default=0, help="Camera index (default: 0)")
@@ -991,20 +931,16 @@ def main():
     with VDevice() as target:
         manager = ModelManager(target)
 
-        # Set initial model (skip for ensemble — models activate per-frame)
-        if args.model != "all":
-            manager.activate(args.model)
+        manager.activate(args.model)
 
         print(f"\n  Active model: {manager.active_name}")
-        print(f"  Mode: {'ENSEMBLE' if args.model == 'all' else 'SINGLE'}")
 
         try:
             if args.image:
                 run_images(manager, args.conf, None, args.no_show, out_dir,
-                           args.model, single=Path(args.image))
+                           single=Path(args.image))
             elif args.images:
-                run_images(manager, args.conf, args.images, args.no_show, out_dir,
-                           args.model)
+                run_images(manager, args.conf, args.images, args.no_show, out_dir)
             else:
                 run_camera(manager, args.conf, args.camera, args.no_show, out_dir,
                            args.model)

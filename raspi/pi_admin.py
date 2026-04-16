@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pi Admin — WiFi connect, model switch, live video, bottle count, data recording.
+Pi Admin — Autonomous Robot Control Panel.
 Port 8080. All navigator calls proxied through here (no CORS issues).
 """
 
@@ -14,7 +14,6 @@ NAV = "http://127.0.0.1:5000"
 DATA_DIR = "/home/set-admin/testing/test_data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Recording state
 recording = {"active": False, "session": None, "file": None, "writer": None,
              "model": "", "start": 0, "rows": 0, "lock": threading.Lock()}
 
@@ -26,20 +25,18 @@ def run(cmd, timeout=10):
         return str(e)
 
 def get_wifi():
-    return run("iwgetid -r") or "Not connected"
+    return run("nmcli -t -f active,ssid dev wifi | grep '^yes' | cut -d: -f2") or "Not connected"
 
 def get_ip():
     return run("ip -4 addr show wlan0 | grep -oP 'inet \\K[\\d.]+'") or "--"
 
 def nav_get(path, timeout=5):
-    """Fetch from navigator Flask (localhost:5000)."""
     try:
         req = urllib.request.urlopen(f"{NAV}{path}", timeout=timeout)
         return json.loads(req.read())
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# Background recorder
 def recorder_loop():
     while True:
         with recording["lock"]:
@@ -57,13 +54,13 @@ def recorder_loop():
                     recording["writer"].writerow(row)
                     recording["file"].flush()
                     recording["rows"] += 1
-        except:
-            pass
+        except Exception as e:
+            print(f"[recorder] error: {e}")
         time.sleep(1)
 
 threading.Thread(target=recorder_loop, daemon=True).start()
 
-# ── Proxy routes to navigator (avoids CORS) ──────────────────
+# ── Proxy routes ─────────────────────────────────────────────
 
 @app.route("/nav/stats")
 def nav_stats():
@@ -88,7 +85,6 @@ def nav_stop():
 
 @app.route("/nav/video_feed")
 def nav_video():
-    """Proxy the MJPEG stream from navigator."""
     try:
         req = urllib.request.urlopen(f"{NAV}/video_feed", timeout=10)
         def generate():
@@ -103,80 +99,137 @@ def nav_video():
 
 # ── Main page ────────────────────────────────────────────────
 
-@app.route("/")
-def index():
-    wifi = get_wifi()
-    ip = get_ip()
-    connected = "PetBottle_Robot" in wifi
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pi Admin</title>
+PAGE_HTML = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>PET Bottle Robot</title>
 <style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:#1a1a2e;color:#e0e0e0;font-family:system-ui;padding:12px;
-  -webkit-user-select:none;user-select:none}}
-h1{{color:#4fc3f7;font-size:1.3rem;text-align:center;margin-bottom:12px}}
-.card{{background:#16213e;border-radius:12px;padding:14px;margin:10px 0}}
-.card h2{{font-size:.8rem;color:#888;margin-bottom:8px}}
-.wifi-row{{display:flex;align-items:center;gap:8px}}
-.wifi-row .ssid{{flex:1;font-weight:bold;font-size:.9rem}}
-.wbtn{{padding:10px 18px;border:none;border-radius:8px;font-size:.85rem;
-  font-weight:bold;cursor:pointer;color:#fff;touch-action:manipulation}}
-.wbtn:active{{transform:scale(.96)}}
-.video-wrap{{position:relative;text-align:center}}
-.video-wrap img{{width:100%;max-width:640px;border-radius:10px;border:2px solid #333}}
-.badge{{position:absolute;top:8px;right:8px;padding:4px 10px;border-radius:6px;
-  font-weight:700;font-size:.8rem;color:#111}}
-.models{{display:flex;gap:8px;justify-content:center}}
-.mbtn{{flex:1;padding:12px 0;border:2px solid #333;border-radius:10px;background:#0d1117;
-  color:#888;font-weight:700;font-size:.9rem;cursor:pointer;text-align:center}}
-.mbtn.active{{border-color:#4fc3f7;color:#4fc3f7;background:#16213e}}
-.mbtn:active{{transform:scale(.94)}}
-#mStatus{{font-size:.75rem;color:#888;text-align:center;margin-top:6px}}
-.stats-grid{{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin:8px 0}}
-.sg{{text-align:center;background:#0d1117;border-radius:8px;padding:8px 4px}}
-.sg .v{{font-size:1.3rem;font-weight:700;color:#4fc3f7}}
-.sg .l{{font-size:.65rem;color:#666;margin-top:2px}}
-.rec-row{{display:flex;align-items:center;gap:8px;margin-top:8px}}
-.rec-btn{{padding:10px 16px;border:none;border-radius:8px;font-size:.85rem;
-  font-weight:bold;cursor:pointer;color:#fff}}
-.rec-btn:active{{transform:scale(.96)}}
-#recInfo{{font-size:.75rem;color:#888;flex:1}}
-.sessions{{max-height:200px;overflow-y:auto;margin-top:8px}}
-.sess{{display:flex;justify-content:space-between;align-items:center;
-  background:#0d1117;border-radius:6px;padding:8px 10px;margin:4px 0;font-size:.8rem}}
-.sess .name{{color:#4fc3f7}}.sess .meta{{color:#888;font-size:.7rem}}
-.dl{{color:#66bb6a;text-decoration:none;font-weight:bold;font-size:.8rem}}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#1a1a2e;color:#e0e0e0;font-family:'Segoe UI',system-ui,sans-serif;
+  padding:12px;-webkit-user-select:none;user-select:none;
+  -webkit-tap-highlight-color:transparent}
+h1{color:#4fc3f7;font-size:1.4rem;text-align:center;font-weight:800;margin-bottom:2px}
+.subtitle{text-align:center;font-size:.8rem;color:#888;margin-bottom:10px}
+.card{background:#16213e;border-radius:14px;padding:14px;margin:10px 0;
+  box-shadow:0 2px 12px rgba(0,0,0,.2);border:1px solid #1e2d4a}
+.card h2{font-size:.75rem;color:#888;font-weight:600;text-transform:uppercase;
+  letter-spacing:.5px;margin-bottom:8px}
+.conn-row{display:flex;align-items:center;gap:8px}
+.conn-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.conn-dot.on{background:#43a047;box-shadow:0 0 8px rgba(67,160,71,.4)}
+.conn-dot.off{background:#e53935;box-shadow:0 0 8px rgba(229,57,53,.3)}
+.conn-label{flex:1;font-weight:600;font-size:.9rem;color:#e0e0e0}
+.conn-ip{color:#666;font-size:.75rem}
+.conn-btn{padding:8px 16px;border:none;border-radius:8px;font-size:.85rem;
+  font-weight:700;cursor:pointer;color:#fff;touch-action:manipulation;transition:transform .08s}
+.conn-btn:active{transform:scale(.94)}
+.conn-btn.connect{background:#1976d2}
+.conn-btn.disconnect{background:#e53935}
+#connStatus{font-size:.7rem;color:#888;text-align:center;margin-top:4px}
+.auto-section{text-align:center;margin:6px 0}
+.auto-btn{width:100%;padding:18px;border:none;border-radius:14px;
+  font-size:1.2rem;font-weight:800;cursor:pointer;color:#fff;
+  transition:transform .08s,box-shadow .2s;touch-action:manipulation}
+.auto-btn:active{transform:scale(.96)}
+.auto-btn.start{background:linear-gradient(135deg,#43a047,#2e7d32);
+  box-shadow:0 4px 16px rgba(46,125,50,.35)}
+.auto-btn.stop{background:linear-gradient(135deg,#e53935,#c62828);
+  box-shadow:0 4px 16px rgba(198,40,40,.35)}
+.auto-btn:disabled{opacity:.4;cursor:not-allowed}
+.state-badge{display:inline-block;padding:6px 16px;border-radius:20px;
+  font-size:.85rem;font-weight:700;margin-top:8px;letter-spacing:.5px;color:#fff}
+.video-wrap{position:relative;text-align:center}
+.video-wrap img{width:100%;max-width:640px;border-radius:10px;border:2px solid #333}
+.live-badge{position:absolute;top:8px;right:8px;padding:4px 10px;border-radius:6px;
+  font-weight:700;font-size:.8rem;color:#fff}
+.models{display:flex;gap:6px;justify-content:center}
+.mbtn{flex:1;padding:10px 0;border:2px solid #333;border-radius:10px;
+  background:#0d1117;color:#888;font-weight:700;font-size:.85rem;
+  cursor:pointer;text-align:center;transition:all .15s}
+.mbtn.active{border-color:#43a047;color:#fff;background:#43a047;
+  box-shadow:0 0 12px rgba(67,160,71,.3)}
+.mbtn:active{transform:scale(.94)}
+#mStatus{font-size:.72rem;color:#888;text-align:center;margin-top:4px}
+.stats-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px}
+.sg{text-align:center;background:#0d1117;border:1px solid #1e2d4a;border-radius:8px;padding:8px 4px}
+.sg .v{font-size:1.2rem;font-weight:800;color:#4fc3f7}
+.sg .l{font-size:.6rem;color:#666;margin-top:2px;font-weight:600}
+.us-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin-top:8px}
+.us-item{text-align:center;background:#0d1117;border:1px solid #1e2d4a;border-radius:8px;padding:6px 4px}
+.us-item .v{font-size:1rem;font-weight:700;font-family:monospace}
+.us-item .l{font-size:.55rem;color:#666;font-weight:600}
+.us-item.close .v{color:#e53935}
+.us-item.mid .v{color:#e65100}
+.us-item.far .v{color:#2e7d32}
+.emergency{width:100%;padding:16px;border:none;border-radius:12px;
+  font-size:1.1rem;font-weight:800;cursor:pointer;color:#fff;
+  background:#d32f2f;box-shadow:0 3px 10px rgba(211,47,47,.3);
+  touch-action:manipulation;transition:transform .08s}
+.emergency:active{transform:scale(.96)}
+.rec-row{display:flex;align-items:center;gap:8px;margin-top:6px}
+.rec-btn{padding:8px 14px;border:none;border-radius:8px;font-size:.8rem;
+  font-weight:700;cursor:pointer;color:#fff;transition:transform .08s}
+.rec-btn:active{transform:scale(.94)}
+#recInfo{font-size:.7rem;color:#888;flex:1}
+.sessions{max-height:150px;overflow-y:auto;margin-top:6px}
+.sess{display:flex;justify-content:space-between;align-items:center;
+  background:#0d1117;border:1px solid #1e2d4a;border-radius:6px;
+  padding:6px 10px;margin:3px 0;font-size:.75rem}
+.sess .name{color:#4fc3f7;font-weight:600}
+.dl{color:#2e7d32;text-decoration:none;font-weight:700;font-size:.75rem}
+.footer{text-align:center;margin-top:12px;font-size:.65rem;color:#555}
 </style></head><body>
-<h1>Pi Admin</h1>
 
-<!-- WIFI -->
+<h1>PET Bottle Robot</h1>
+<div class="subtitle">Autonomous Collection System</div>
+
 <div class="card">
-  <h2>ESP32 WiFi</h2>
-  <div class="wifi-row">
-    <span class="ssid" id="wifiName" style="color:{'#66bb6a' if connected else '#ef5350'}">{wifi}</span>
-    <span style="color:#555;font-size:.75rem">{ip}</span>
-    <button class="wbtn" id="wifiBtn"
-      style="background:{'#c62828' if connected else '#1565c0'}"
-      onclick="toggleWifi()">{'Disconnect' if connected else 'Connect'}</button>
+  <h2>Robot Connection</h2>
+  <div class="conn-row">
+    <div class="conn-dot $$CONN_DOT$$" id="connDot"></div>
+    <span class="conn-label" id="connName">$$CONN_LABEL$$</span>
+    <span class="conn-ip">$$IP$$</span>
+    <button class="conn-btn $$CONN_BTN_CLASS$$" id="connBtn"
+      onclick="toggleWifi()">$$CONN_BTN_TEXT$$</button>
   </div>
-  <div id="wifiStatus" style="font-size:.7rem;color:#888;text-align:center;margin-top:4px"></div>
+  <div id="connStatus"></div>
 </div>
 
-<!-- LIVE VIDEO -->
+<div class="card">
+  <h2>Autonomous Mode</h2>
+  <div class="auto-section">
+    <button class="auto-btn start" id="autoBtn" onclick="toggleAuto()">START AUTONOMOUS</button>
+    <div><span class="state-badge" id="stateBadge" style="background:#90a4ae">WAITING</span></div>
+  </div>
+</div>
+
 <div class="card">
   <h2>Live Camera</h2>
   <div class="video-wrap">
     <img id="vidFeed" src="/nav/video_feed" alt="Loading..."
-      onerror="this.style.opacity=0.3;setTimeout(()=>{{this.src='/nav/video_feed?t='+Date.now();this.style.opacity=1}},3000)">
-    <div class="badge" id="badge" style="background:#ff9800">--</div>
+      onerror="this.style.opacity=0.3;var self=this;setTimeout(function(){self.src='/nav/video_feed?t='+Date.now();self.style.opacity=1},3000)">
+    <div class="live-badge" id="badge" style="background:#90a4ae">WAITING</div>
   </div>
 </div>
 
-<!-- MODELS -->
+<div class="card">
+  <h2>Detection</h2>
+  <div class="stats-grid">
+    <div class="sg"><div class="v" id="sBot" style="color:#2e7d32">0</div><div class="l">Bottles</div></div>
+    <div class="sg"><div class="v" id="sFps">--</div><div class="l">FPS</div></div>
+    <div class="sg"><div class="v" id="sInf" style="color:#e65100">--</div><div class="l">Infer</div></div>
+    <div class="sg"><div class="v" id="sMod" style="color:#7b1fa2;font-size:.7rem">--</div><div class="l">Model</div></div>
+  </div>
+  <div class="us-grid">
+    <div class="us-item far" id="usF"><div class="v">--</div><div class="l">FRONT</div></div>
+    <div class="us-item far" id="usL"><div class="v">--</div><div class="l">LEFT</div></div>
+    <div class="us-item far" id="usR"><div class="v">--</div><div class="l">RIGHT</div></div>
+    <div class="us-item far" id="usB"><div class="v">--</div><div class="l">BACK</div></div>
+  </div>
+</div>
+
 <div class="card">
   <h2>YOLO Model</h2>
-  <div class="models" id="modelBtns">
+  <div class="models">
     <button class="mbtn" onclick="switchModel('yolov5')">YOLOv5</button>
     <button class="mbtn" onclick="switchModel('yolov7')">YOLOv7</button>
     <button class="mbtn" onclick="switchModel('yolov8')">YOLOv8</button>
@@ -184,133 +237,162 @@ h1{{color:#4fc3f7;font-size:1.3rem;text-align:center;margin-bottom:12px}}
   <div id="mStatus"></div>
 </div>
 
-<!-- LIVE STATS -->
-<div class="card">
-  <h2>Detection Stats</h2>
-  <div class="stats-grid">
-    <div class="sg"><div class="v" id="sBot" style="color:#66bb6a">0</div><div class="l">Bottles</div></div>
-    <div class="sg"><div class="v" id="sFps">--</div><div class="l">FPS</div></div>
-    <div class="sg"><div class="v" id="sInf" style="color:#ffd54f">--</div><div class="l">Infer ms</div></div>
-    <div class="sg"><div class="v" id="sMod" style="color:#ce93d8">--</div><div class="l">Model</div></div>
-  </div>
+<div style="margin:12px 0">
+  <button class="emergency" onclick="emergencyStop()">EMERGENCY STOP</button>
 </div>
 
-<!-- RECORDING -->
 <div class="card">
   <h2>Data Recording</h2>
   <div class="rec-row">
-    <button class="rec-btn" id="recBtn" style="background:#2e7d32" onclick="toggleRec()">Start Recording</button>
+    <button class="rec-btn" id="recBtn" style="background:#1976d2" onclick="toggleRec()">Record</button>
     <span id="recInfo">Not recording</span>
   </div>
-  <h2 style="margin-top:12px">Saved Sessions</h2>
-  <div class="sessions" id="sessions">Loading...</div>
+  <div class="sessions" id="sessions"></div>
 </div>
 
-<script>
-const stateColors={{WAITING:'#ff9800',SCANNING:'#ffeb3b',ROAMING:'#66bb6a',
-  VERIFYING:'#ffcc80',APPROACHING:'#4fc3f7',ALIGNING:'#ffd54f',
-  PICKING_UP:'#ab47bc',AVOIDING:'#ef5350',STOPPED:'#666'}};
+<div class="footer">PET Bottle Robot &mdash; Autonomous Collection System</div>
 
-function poll(){{
-  fetch('/nav/stats').then(r=>r.json()).then(d=>{{
+<script>
+var autoRunning=false;
+var stateColors={WAITING:'#90a4ae',SCANNING:'#1976d2',ROAMING:'#2e7d32',
+  VERIFYING:'#e65100',APPROACHING:'#1565c0',ALIGNING:'#f57f17',
+  PICKING_UP:'#7b1fa2',AVOIDING:'#c62828',STOPPED:'#78909c'};
+
+function poll(){
+  fetch('/nav/stats').then(function(r){return r.json()}).then(function(d){
     document.getElementById('sBot').textContent=d.bottles||0;
     document.getElementById('sFps').textContent=d.fps||'--';
     document.getElementById('sInf').textContent=(d.inference_ms||'--')+'ms';
     document.getElementById('sMod').textContent=d.model||'--';
-    let b=document.getElementById('badge');
-    b.textContent=d.state||'--';
-    b.style.background=stateColors[d.state]||'#666';
-  }}).catch(()=>{{}});
-}}
-setInterval(poll,1200); poll();
+    var st=d.state||'WAITING';
+    var sc=stateColors[st]||'#90a4ae';
+    document.getElementById('badge').textContent=st;
+    document.getElementById('badge').style.background=sc;
+    var sb=document.getElementById('stateBadge');
+    sb.textContent=st;sb.style.background=sc;
+    var btn=document.getElementById('autoBtn');
+    var espWifi=document.getElementById('connName').textContent.indexOf('Connected')>=0;
+    if(st==='WAITING'||st==='STOPPED'){
+      autoRunning=false;btn.textContent='START AUTONOMOUS';btn.className='auto-btn start';
+      btn.disabled=!espWifi;
+      if(!espWifi)btn.textContent='CONNECT ESP32 FIRST';
+    }else{
+      autoRunning=true;btn.textContent='STOP AUTONOMOUS';btn.className='auto-btn stop';
+      btn.disabled=false;
+    }
+    if(d.ultrasonic){
+      setUS('usF',d.ultrasonic.s1);setUS('usR',d.ultrasonic.s2);
+      setUS('usB',d.ultrasonic.s3);setUS('usL',d.ultrasonic.s4);
+    }
+  }).catch(function(){});
+}
+function setUS(id,val){
+  var el=document.getElementById(id);if(!el)return;
+  var v=val||999;
+  el.querySelector('.v').textContent=v>=999?'--':v+'cm';
+  el.className='us-item '+(v<20?'close':v<60?'mid':'far');
+}
+setInterval(poll,1000);poll();
 
-function pollRec(){{
-  fetch('/rec_status').then(r=>r.json()).then(d=>{{
-    let btn=document.getElementById('recBtn');
-    let info=document.getElementById('recInfo');
-    if(d.active){{
-      btn.textContent='Stop Recording';btn.style.background='#c62828';
-      info.textContent=d.model+' | '+d.rows+' samples | '+d.duration+'s';
-      info.style.color='#ef5350';
-    }}else{{
-      btn.textContent='Start Recording';btn.style.background='#2e7d32';
-      if(d.rows>0)info.textContent='Last: '+d.rows+' samples saved';
-      info.style.color='#888';
-    }}
-  }}).catch(()=>{{}});
-}}
-setInterval(pollRec,2000); pollRec();
+function toggleAuto(){
+  var btn=document.getElementById('autoBtn');btn.disabled=true;
+  var sb=document.getElementById('stateBadge');
+  fetch(autoRunning?'/nav/stop':'/nav/start').then(function(r){return r.json()}).then(function(d){
+    btn.disabled=false;
+    if(d.ok===false){
+      sb.textContent=d.msg||'ERROR';sb.style.background='#c62828';
+      setTimeout(poll,2000);
+    }else{poll();}
+  }).catch(function(){btn.disabled=false});
+}
 
-function loadModels(){{
-  fetch('/nav/models').then(r=>r.json()).then(d=>{{
+function emergencyStop(){
+  fetch('/nav/stop').then(function(){poll()});
+  try{fetch('http://192.168.4.1/cmd?c=M')}catch(e){}
+}
+
+function loadModels(){
+  fetch('/nav/models').then(function(r){return r.json()}).then(function(d){
     if(!d.ok)return;
-    document.querySelectorAll('.mbtn').forEach(b=>{{
-      let key=b.textContent.toLowerCase().replace('yolo','yolov');
-      b.classList.toggle('active',key===d.active);
-    }});
-  }}).catch(()=>{{}});
-}}
+    var nameMap={yolov5:'YOLOv5s-COCO',yolov7:'YOLOv7-COCO',yolov8:'PetBot-v8s'};
+    document.querySelectorAll('.mbtn').forEach(function(b){
+      b.classList.toggle('active',b.textContent.toLowerCase()===d.active);
+    });
+    var st=document.getElementById('mStatus');
+    st.textContent='Active: '+(nameMap[d.active]||d.active);st.style.color='#2e7d32';
+  }).catch(function(){});
+}
 loadModels();
 
-function switchModel(key){{
-  document.getElementById('mStatus').textContent='Switching to '+key+'...';
-  document.getElementById('mStatus').style.color='#ffd54f';
-  fetch('/nav/switch_model?model='+key).then(r=>r.json()).then(d=>{{
-    if(d.ok){{
-      document.getElementById('mStatus').textContent='Active: '+d.name;
-      document.getElementById('mStatus').style.color='#66bb6a';
-      loadModels();
-    }}else{{
-      document.getElementById('mStatus').textContent=d.msg||d.error||'Failed';
-      document.getElementById('mStatus').style.color='#ef5350';
-    }}
-  }}).catch(e=>{{
-    document.getElementById('mStatus').textContent='Error: '+e;
-    document.getElementById('mStatus').style.color='#ef5350';
-  }});
-}}
+function switchModel(key){
+  document.getElementById('mStatus').textContent='Switching...';
+  document.getElementById('mStatus').style.color='#e65100';
+  fetch('/nav/switch_model?model='+key).then(function(r){return r.json()}).then(function(d){
+    if(d.ok){document.getElementById('mStatus').textContent='Active: '+d.name;
+      document.getElementById('mStatus').style.color='#2e7d32';loadModels();
+    }else{document.getElementById('mStatus').textContent=d.msg||d.error||'Failed';
+      document.getElementById('mStatus').style.color='#c62828';}
+  }).catch(function(){});
+}
 
-function toggleWifi(){{
-  let btn=document.getElementById('wifiBtn');
-  let st=document.getElementById('wifiStatus');
-  let name=document.getElementById('wifiName');
-  if(name.textContent.includes('PetBottle_Robot')){{
+function toggleWifi(){
+  var btn=document.getElementById('connBtn'),st=document.getElementById('connStatus'),
+      name=document.getElementById('connName'),dot=document.getElementById('connDot');
+  if(name.textContent.indexOf('Connected')>=0){
     st.textContent='Disconnecting...';
-    fetch('/disconnect_esp32').then(r=>r.json()).then(d=>{{
-      st.textContent=d.status;name.textContent=d.wifi||'Not connected';
-      name.style.color='#ef5350';btn.textContent='Connect';btn.style.background='#1565c0';
-    }}).catch(e=>{{st.textContent='Error'}});
-  }}else{{
-    st.textContent='Connecting...';
-    fetch('/connect_esp32').then(r=>r.json()).then(d=>{{
-      st.textContent=d.status;name.textContent=d.wifi||'--';
-      if(d.wifi&&d.wifi.includes('PetBottle')){{
-        name.style.color='#66bb6a';btn.textContent='Disconnect';btn.style.background='#c62828';
-      }}
-    }}).catch(e=>{{st.textContent='Error'}});
-  }}
-}}
+    fetch('/disconnect_esp32').then(function(r){return r.json()}).then(function(d){
+      st.textContent=d.status;name.textContent='Not Connected';
+      dot.className='conn-dot off';btn.textContent='Connect';btn.className='conn-btn connect';
+    }).catch(function(){st.textContent='Error'});
+  }else{
+    st.textContent='Connecting to ESP32...';
+    fetch('/connect_esp32').then(function(r){return r.json()}).then(function(d){
+      st.textContent=d.status;
+      if(d.wifi&&d.wifi.indexOf('PetBottle')>=0){
+        name.textContent='Connected to ESP32';dot.className='conn-dot on';
+        btn.textContent='Disconnect';btn.className='conn-btn disconnect';
+      }
+    }).catch(function(){st.textContent='Error'});
+  }
+}
 
-function toggleRec(){{
-  fetch('/toggle_recording').then(r=>r.json()).then(d=>{{
-    pollRec(); loadSessions();
-  }});
-}}
+function toggleRec(){fetch('/toggle_recording').then(function(){pollRec();loadSessions()})}
+function pollRec(){
+  fetch('/rec_status').then(function(r){return r.json()}).then(function(d){
+    var btn=document.getElementById('recBtn'),info=document.getElementById('recInfo');
+    if(d.active){btn.textContent='Stop';btn.style.background='#c62828';
+      info.textContent=d.model+' | '+d.rows+' samples | '+d.duration+'s';info.style.color='#c62828';
+    }else{btn.textContent='Record';btn.style.background='#1976d2';
+      info.textContent=d.rows>0?'Last: '+d.rows+' samples':'Not recording';info.style.color='#78909c';}
+  }).catch(function(){});
+}
+setInterval(pollRec,3000);pollRec();
 
-function loadSessions(){{
-  fetch('/sessions').then(r=>r.json()).then(d=>{{
-    let el=document.getElementById('sessions');
-    if(!d.sessions||d.sessions.length===0){{el.innerHTML='<div style="color:#555;font-size:.8rem">No sessions yet</div>';return;}}
-    el.innerHTML=d.sessions.map(s=>
-      '<div class="sess"><div><span class="name">'+s.name+'</span><br>'+
-      '<span class="meta">'+s.model+' | '+s.rows+' samples | '+s.duration+'</span></div>'+
-      '<a class="dl" href="/download/'+s.file+'">CSV</a></div>'
-    ).join('');
-  }});
-}}
+function loadSessions(){
+  fetch('/sessions').then(function(r){return r.json()}).then(function(d){
+    var el=document.getElementById('sessions');
+    if(!d.sessions||!d.sessions.length){el.innerHTML='';return}
+    el.innerHTML=d.sessions.slice(0,5).map(function(s){
+      return '<div class="sess"><div><span class="name">'+s.name+'</span></div>'+
+      '<a class="dl" href="/download/'+s.file+'">CSV</a></div>';}).join('');
+  });
+}
 loadSessions();
 </script>
 </body></html>"""
+
+@app.route("/")
+def index():
+    wifi = get_wifi()
+    ip = get_ip()
+    esp = "PetBottle_Robot" in wifi
+    html = PAGE_HTML
+    html = html.replace("$$CONN_DOT$$", "on" if esp else "off")
+    html = html.replace("$$CONN_LABEL$$", "Connected to ESP32" if esp else "Not Connected")
+    html = html.replace("$$IP$$", ip)
+    html = html.replace("$$CONN_BTN_CLASS$$", "disconnect" if esp else "connect")
+    html = html.replace("$$CONN_BTN_TEXT$$", "Disconnect" if esp else "Connect")
+    return html
 
 # ── WiFi routes ──────────────────────────────────────────────
 
@@ -323,8 +405,6 @@ def connect_esp32():
 def disconnect_esp32():
     out = run("sudo nmcli con down ESP32-Robot 2>&1", timeout=10)
     return jsonify({"status": out, "wifi": get_wifi(), "ip": get_ip()})
-
-# ── Recording routes ─────────────────────────────────────────
 
 @app.route("/toggle_recording")
 def toggle_recording():
@@ -339,8 +419,8 @@ def toggle_recording():
             try:
                 d = nav_get("/stats", timeout=3)
                 model = d.get("model", "unknown")
-            except:
-                pass
+            except Exception:
+                model = "unknown"
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             fname = f"{model}_{ts}.csv"
             fpath = os.path.join(DATA_DIR, fname)
@@ -374,17 +454,9 @@ def sessions():
         try:
             with open(fpath) as csvf:
                 rows = sum(1 for _ in csvf) - 1
-            parts = f.replace(".csv", "").split("_")
-            model = parts[0] if parts else "?"
-            with open(fpath) as csvf:
-                reader = csv.reader(csvf)
-                next(reader)
-                timestamps = [r[0] for r in reader if r]
-            dur = f"{len(timestamps)}s" if len(timestamps) >= 2 else f"{rows} rows"
-            result.append({"file": f, "name": f.replace(".csv", ""), "model": model,
-                          "rows": rows, "duration": dur})
-        except:
-            result.append({"file": f, "name": f, "model": "?", "rows": 0, "duration": "?"})
+            result.append({"file": f, "name": f.replace(".csv", ""), "rows": rows})
+        except Exception:
+            result.append({"file": f, "name": f, "rows": 0})
     return jsonify({"sessions": result})
 
 @app.route("/download/<filename>")

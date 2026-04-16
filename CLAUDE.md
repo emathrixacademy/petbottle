@@ -73,7 +73,7 @@ Connect to PetBottle_Robot WiFi, open `http://192.168.4.1/ota`, upload `.bin` fi
 | LCD SDA / SCL | 21 / 22 |
 | Buzzer | 3 |
 | Ultrasonic TRIG (shared) | 12 |
-| Ultrasonic ECHO 1/2/3/4 | 33 / 35 / 32 / 34 |
+| Ultrasonic S1-Front/S2-Right/S3-Back/S4-Left | 33 / 35 / 32 / 34 |
 | Limit Switch 1 / 2 | 36 / 39 |
 
 **Note:** GPIO 36 and 39 are input-only with no internal pull-up. External 10kΩ pull-up resistors to 3.3V are required for the limit switches.
@@ -97,6 +97,22 @@ Never assign channels out-of-order or across timer pairs for different motors.
 | `/sensor` | GET | JSON: ultrasonic, limits, speeds |
 | `/cmdlog` | GET | JSON: recent Pi-ESP32 command log |
 | `/ota` | GET/POST | Firmware upload page |
+
+### Pi Direct Commands (bypass test-UI mode system)
+
+The navigator sends these `PI`-prefixed commands so it always has motor control regardless of the ESP32's current web-UI mode:
+
+| Command | Action |
+|---------|--------|
+| `PIFW<spd>` | Wheels forward at speed (0-80) |
+| `PIBW<spd>` | Wheels backward |
+| `PITL<spd>` | Turn left (spin in place) |
+| `PITR<spd>` | Turn right (spin in place) |
+| `PIDW<l>,<r>` | Differential wheel (left_spd, right_spd, range -80..80) |
+| `PIX` | Stop wheels |
+| `PISTOP` | Emergency stop all motors/servos/buzzer |
+| `P` | Start pickup sequence (also works from any mode) |
+| `PA` | Abort pickup sequence |
 
 ## Navigator State Machine
 
@@ -134,3 +150,5 @@ Auto-starts on boot via systemd service `petbottle-navigator`.
 - HEF models compiled for Hailo8L show warnings on Hailo8 (lower performance)
 - `petbottle/petbottle.ino` has conflicting GPIO assignments — never flash it on the robot's ESP32
 - **Motor isolation issue (WIP)**: Arm/swing/servo commands were also moving wheels — fix applied (safe boot sequence + per-command EN management) but needs testing after recompile
+- **No OTA/API authentication** — anyone on the ESP32 WiFi can upload firmware or send commands. Add token auth before deploying in public
+- Pickup sequence has a **30-second timeout** — if limit switch doesn't trigger, arm motor stops automatically to prevent burnout

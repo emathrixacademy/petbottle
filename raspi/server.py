@@ -22,11 +22,11 @@ SERVER_SCRIPT = Path(__file__).resolve()             # this file (self-restart)
 
 MCU_TARGETS = [
     {
-        "name": "Robotic Arm (ESP32)",
-        "sketch": str(REPO_DIR / "robotic_arm" / "robotic_arm.ino"),
+        "name": "PET Bottle Robot (ESP32)",
+        "sketch": str(REPO_DIR / "esp32_test" / "esp32_test.ino"),
         "port": "COM3",
-        "fqbn": "esp32:esp32:esp32",
-        "folder_prefixes": ["robotic_arm", "esp32_", "arduino_", "firmware_"],
+        "fqbn": "esp32:esp32:esp32:PartitionScheme=min_spiffs",
+        "folder_prefixes": ["esp32_test", "esp32_main"],
     },
 ]
 

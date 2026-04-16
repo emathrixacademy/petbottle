@@ -101,6 +101,15 @@ const int NUM_SENSORS = 4;
 #define DUTY_MIN        102
 #define DUTY_MAX        512
 
+// ==================== CACHED SENSOR DATA ====================
+// Reads ONE sensor per tick (round-robin) to avoid ultrasonic crosstalk.
+// HC-SR04 needs ~60ms between triggers on a shared TRIG line — reading
+// one sensor every 60ms gives each sensor a full echo-decay window.
+long cachedDist[4] = {999, 999, 999, 999};
+unsigned long lastSensorRead = 0;
+int nextSensorIdx = 0;              // which sensor to read next (0-3)
+#define SENSOR_READ_INTERVAL 60     // one sensor every 60ms (full cycle = 240ms)
+
 // ==================== STATE ====================
 
 enum TestMode {
@@ -119,6 +128,35 @@ int wheelSpeed = 60;     // default drive speed
 int turnSpeed  = 60;     // default turn speed, max 80
 int armSpeed   = 150;
 int swingSpeed = 120;
+
+// ==================== PICKUP STATE MACHINE ====================
+// Sequence: Pi sends "P" → lower arm slowly → limit switch → scoop →
+//           lift full speed → limit switch → drop → done
+
+enum PickupState {
+  PU_IDLE,        // not running
+  PU_LOWERING,    // pulsing arm down slowly (on/off)
+  PU_SCOOPING,    // arm at bottom, closing scoopers
+  PU_LIFTING,     // arm going up full speed, scoopers closed
+  PU_DROPPING,    // arm at top, opening scoopers to drop bottle
+  PU_DONE         // finished, resetting
+};
+
+PickupState puState = PU_IDLE;
+unsigned long puTimer = 0;         // general purpose timer for pickup steps
+unsigned long puStartTime = 0;     // when pickup sequence began (for timeout)
+bool puArmOn = false;              // tracks arm pulse on/off during lowering
+#define PU_LOWER_SPEED    100      // slow lowering PWM (out of 255)
+#define PU_LOWER_ON_MS    200      // arm on duration during pulsed lowering
+#define PU_LOWER_OFF_MS   300      // arm off duration during pulsed lowering
+#define PU_SCOOP_CLOSE_MS 800      // time to wait after closing scoopers
+#define PU_LIFT_SPEED     255      // full speed lifting
+#define PU_DROP_OPEN_MS   800      // time to wait after opening scoopers
+#define PU_SERVO_OPEN_L   180      // scooper open angles
+#define PU_SERVO_OPEN_R   0
+#define PU_SERVO_CLOSE_L  0        // scooper closed angles
+#define PU_SERVO_CLOSE_R  180
+#define PU_TIMEOUT_MS     30000    // abort pickup if stuck for 30 seconds
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
@@ -223,10 +261,19 @@ void setServo(int ch, int angle) {
   ledcWrite(ch, angleToDuty(angle));
 }
 
+// Non-blocking buzzer — call buzzerUpdate() from loop()
+unsigned long buzzerOffAt = 0;
+
 void beep(int ms) {
   digitalWrite(BUZZER, HIGH);
-  delay(ms);
-  digitalWrite(BUZZER, LOW);
+  buzzerOffAt = millis() + ms;
+}
+
+void buzzerUpdate() {
+  if (buzzerOffAt > 0 && millis() >= buzzerOffAt) {
+    digitalWrite(BUZZER, LOW);
+    buzzerOffAt = 0;
+  }
 }
 
 void stopAll() {
@@ -238,16 +285,237 @@ void stopAll() {
   digitalWrite(BUZZER, LOW);
 }
 
+// ==================== PICKUP SEQUENCE ====================
+
+void pickupStart() {
+  if (puState != PU_IDLE) {
+    Serial.println("Pickup already running!");
+    return;
+  }
+  Serial.println("=== PICKUP SEQUENCE START ===");
+  puStartTime = millis();
+  stopWheels();
+  // Open scoopers first (ready to receive bottle)
+  setServo(SERVO_L_CH, PU_SERVO_OPEN_L);
+  setServo(SERVO_R_CH, PU_SERVO_OPEN_R);
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("PICKUP: Lower");
+  beep(100);
+  puState = PU_LOWERING;
+  puArmOn = true;
+  puTimer = millis();
+  // Start lowering arm slowly
+  armSpeed = PU_LOWER_SPEED;
+  setArm(-1);  // down
+  Serial.println("Lowering arm (pulsed)...");
+}
+
+void pickupAbort() {
+  Serial.println("=== PICKUP ABORTED ===");
+  stopArm();
+  setServo(SERVO_L_CH, PU_SERVO_OPEN_L);
+  setServo(SERVO_R_CH, PU_SERVO_OPEN_R);
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("PICKUP ABORTED");
+  puState = PU_IDLE;
+  beep(300);
+}
+
+// Called every loop() iteration — non-blocking state machine
+void pickupUpdate() {
+  if (puState == PU_IDLE) return;
+
+  unsigned long now = millis();
+
+  // Safety timeout — abort if sequence takes too long (limit switch broken?)
+  if (now - puStartTime >= PU_TIMEOUT_MS) {
+    Serial.println("=== PICKUP TIMEOUT — ABORTING ===");
+    pickupAbort();
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("PICKUP TIMEOUT!");
+    return;
+  }
+  bool limBottom = (digitalRead(LIMIT_1) == LOW);  // GPIO 36
+  bool limTop    = (digitalRead(LIMIT_2) == LOW);  // GPIO 39
+
+  switch (puState) {
+
+    case PU_LOWERING:
+      // Check if arm reached bottom
+      if (limBottom) {
+        stopArm();
+        Serial.println("Bottom limit hit — scooping!");
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print("PICKUP: Scoop");
+        // Close scoopers to grab bottle
+        setServo(SERVO_L_CH, PU_SERVO_CLOSE_L);
+        setServo(SERVO_R_CH, PU_SERVO_CLOSE_R);
+        puTimer = now;
+        puState = PU_SCOOPING;
+        beep(50);
+        break;
+      }
+      // Pulse arm on/off for slow controlled lowering
+      if (puArmOn && (now - puTimer >= PU_LOWER_ON_MS)) {
+        // Turn arm off
+        stopArm();
+        puArmOn = false;
+        puTimer = now;
+      } else if (!puArmOn && (now - puTimer >= PU_LOWER_OFF_MS)) {
+        // Turn arm on again
+        armSpeed = PU_LOWER_SPEED;
+        setArm(-1);  // down
+        puArmOn = true;
+        puTimer = now;
+      }
+      break;
+
+    case PU_SCOOPING:
+      // Wait for scoopers to fully close
+      if (now - puTimer >= PU_SCOOP_CLOSE_MS) {
+        Serial.println("Scooped! Lifting full speed...");
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print("PICKUP: Lift");
+        // Lift arm at full speed
+        armSpeed = PU_LIFT_SPEED;
+        setArm(1);  // up
+        puState = PU_LIFTING;
+        break;
+      }
+      break;
+
+    case PU_LIFTING:
+      // Check if arm reached top (90° upright)
+      if (limTop) {
+        stopArm();
+        Serial.println("Top limit hit — dropping bottle!");
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print("PICKUP: Drop");
+        // Open scoopers to drop bottle into bin
+        setServo(SERVO_L_CH, PU_SERVO_OPEN_L);
+        setServo(SERVO_R_CH, PU_SERVO_OPEN_R);
+        puTimer = now;
+        puState = PU_DROPPING;
+        beep(50);
+        break;
+      }
+      break;
+
+    case PU_DROPPING:
+      // Wait for bottle to fall into bin
+      if (now - puTimer >= PU_DROP_OPEN_MS) {
+        Serial.println("=== PICKUP COMPLETE ===");
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print("PICKUP: Done!");
+        puState = PU_DONE;
+        puTimer = now;
+        beep(50);  // single beep = success (non-blocking)
+        break;
+      }
+      break;
+
+    case PU_DONE:
+      // Short pause then return to idle
+      if (now - puTimer >= 500) {
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print("Ready");
+        armSpeed = 150;  // restore default
+        puState = PU_IDLE;
+        Serial.println("Pickup idle — ready for next bottle");
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
 // ==================== COMMAND EXECUTOR ====================
 
 void executeCmd(String cmd) {
   cmd.trim();
-  cmd.toUpperCase();
   if (cmd.length() == 0) return;
+
+  // ── Direct Pi commands (bypass mode system) ──────────────
+  // These work from ANY mode so the navigator never needs to
+  // know or switch the ESP32's current test-UI mode.
+  //   PIFW <spd>   = wheels forward
+  //   PIBW <spd>   = wheels backward
+  //   PITL <spd>   = turn left (spin in place)
+  //   PITR <spd>   = turn right (spin in place)
+  //   PIDW <l>,<r> = differential wheel (left_spd, right_spd)
+  //   PIX          = stop wheels
+  //   PISTOP       = emergency stop all
+  //   P            = pickup sequence
+  //   PA           = pickup abort
+  if (cmd.startsWith("PI") || cmd.startsWith("pi")) {
+    String pi = cmd.substring(2);
+    pi.toUpperCase();
+    pi.trim();
+
+    if (pi.startsWith("FW")) {
+      int spd = constrain(pi.substring(2).toInt(), 0, 80);
+      if (spd == 0) spd = wheelSpeed;
+      setLeft(spd); setRight(spd);
+      Serial.printf("PI: FORWARD %d\n", spd);
+    } else if (pi.startsWith("BW")) {
+      int spd = constrain(pi.substring(2).toInt(), 0, 80);
+      if (spd == 0) spd = wheelSpeed;
+      setLeft(-spd); setRight(-spd);
+      Serial.printf("PI: BACKWARD %d\n", spd);
+    } else if (pi.startsWith("TL")) {
+      int spd = constrain(pi.substring(2).toInt(), 0, 80);
+      if (spd == 0) spd = turnSpeed;
+      setLeft(-spd); setRight(spd);
+      Serial.printf("PI: TURN LEFT %d\n", spd);
+    } else if (pi.startsWith("TR")) {
+      int spd = constrain(pi.substring(2).toInt(), 0, 80);
+      if (spd == 0) spd = turnSpeed;
+      setLeft(spd); setRight(-spd);
+      Serial.printf("PI: TURN RIGHT %d\n", spd);
+    } else if (pi.startsWith("DW")) {
+      // Differential wheel: PIDW<left>,<right>
+      String params = pi.substring(2);
+      int comma = params.indexOf(',');
+      if (comma > 0) {
+        int lspd = constrain(params.substring(0, comma).toInt(), -80, 80);
+        int rspd = constrain(params.substring(comma + 1).toInt(), -80, 80);
+        setLeft(lspd); setRight(rspd);
+        Serial.printf("PI: DIFF L=%d R=%d\n", lspd, rspd);
+      }
+    } else if (pi == "X") {
+      stopWheels();
+      Serial.println("PI: WHEELS STOPPED");
+    } else if (pi == "STOP") {
+      stopAll();
+      Serial.println("PI: EMERGENCY STOP ALL");
+    } else {
+      Serial.printf("PI: unknown command '%s'\n", pi.c_str());
+    }
+    return;
+  }
+
+  cmd.toUpperCase();
 
   char c0 = cmd.charAt(0);
   int val = 0;
   if (cmd.length() > 1) val = cmd.substring(1).toInt();
+
+  // Pickup command — works from ANY mode (Pi sends this)
+  if (cmd == "P") {
+    pickupStart();
+    return;
+  }
+  if (cmd == "PA") {  // Pickup Abort
+    pickupAbort();
+    return;
+  }
+
+  // Block other commands while pickup is running
+  if (puState != PU_IDLE) {
+    Serial.println("Pickup in progress — send PA to abort");
+    return;
+  }
 
   // Mode switching
   if (cmd == "M") {
@@ -507,10 +775,8 @@ void handleWebSensor() {
 
   json += "\"ultrasonic\":{";
   for (int i = 0; i < NUM_SENSORS; i++) {
-    long d = readDistance(echoPins[i]);
-    json += "\"s" + String(i+1) + "\":" + String(d);
+    json += "\"s" + String(i+1) + "\":" + String(cachedDist[i]);
     if (i < NUM_SENSORS - 1) json += ",";
-    delay(50);
   }
   json += "},";
 
@@ -521,7 +787,14 @@ void handleWebSensor() {
 
   json += "\"wheelSpeed\":" + String(wheelSpeed) + ",";
   json += "\"armSpeed\":" + String(armSpeed) + ",";
-  json += "\"swingSpeed\":" + String(swingSpeed);
+  json += "\"swingSpeed\":" + String(swingSpeed) + ",";
+
+  json += "\"pickup\":\"" + String(
+    puState == PU_IDLE ? "idle" :
+    puState == PU_LOWERING ? "lowering" :
+    puState == PU_SCOOPING ? "scooping" :
+    puState == PU_LIFTING ? "lifting" :
+    puState == PU_DROPPING ? "dropping" : "done") + "\"";
   json += "}";
 
   server.send(200, "application/json", json);
@@ -692,9 +965,18 @@ button:active{transform:scale(.94)}
 
 <!-- ARM LIFT -->
 <div id="p-arm" class="panel">
+<div style="margin-bottom:10px">
+  <button class="bf" style="width:100%;padding:14px;font-size:1rem;border-radius:12px;
+    box-shadow:0 3px 10px rgba(25,118,210,.25)" onpointerdown="cmd('P')">
+    Start Pickup Sequence
+  </button>
+  <div id="puStatus" style="text-align:center;font-size:.85rem;font-weight:600;
+    color:#78909c;margin-top:6px">Idle</div>
+  <button class="bs" style="width:100%;margin-top:6px;padding:8px" onpointerdown="cmd('PA')">Abort Pickup</button>
+</div>
 <div class="slider-row">
   <label>Speed</label>
-  <input type="range" id="aspd" min="50" max="255" value="150">
+  <input type="range" id="aspd" min="25" max="180" value="150">
   <span id="aspdV">150</span>
 </div>
 <div class="grid g3">
@@ -708,8 +990,8 @@ button:active{transform:scale(.94)}
 <div id="p-swing" class="panel">
 <div class="slider-row">
   <label>Speed</label>
-  <input type="range" id="sspd" min="50" max="255" value="120">
-  <span id="sspdV">120</span>
+  <input type="range" id="sspd" min="30" max="80" value="60">
+  <span id="sspdV">60</span>
 </div>
 <div class="grid g3">
   <button class="bl" onpointerdown="swcmd('L')">Swing Left</button>
@@ -955,6 +1237,17 @@ function poll(){
     if(d.limits.sw1) lim+='SW1(36) PRESSED  ';
     if(d.limits.sw2) lim+='SW2(39) PRESSED  ';
     document.getElementById('limStatus').textContent=lim;
+    // Pickup status
+    var pu=d.pickup||'idle';
+    var puEl=document.getElementById('puStatus');
+    if(puEl){
+      var puLabels={idle:'Idle',lowering:'Lowering arm...',scooping:'Scooping bottle...',
+        lifting:'Lifting arm...',dropping:'Dropping bottle...',done:'Done!'};
+      var puColors={idle:'#78909c',lowering:'#e65100',scooping:'#1565c0',
+        lifting:'#2e7d32',dropping:'#7b1fa2',done:'#2e7d32'};
+      puEl.textContent=puLabels[pu]||pu;
+      puEl.style.color=puColors[pu]||'#78909c';
+    }
   }).catch(()=>{});
 }
 setInterval(poll,1000);
@@ -1226,6 +1519,20 @@ void setup() {
 
 void loop() {
   server.handleClient();
+
+  // Non-blocking buzzer
+  buzzerUpdate();
+
+  // Pickup state machine (non-blocking)
+  pickupUpdate();
+
+  // Background ultrasonic reads — ONE sensor per tick (round-robin).
+  // Shared TRIG needs ~60ms between fires to let echoes decay.
+  if (millis() - lastSensorRead >= SENSOR_READ_INTERVAL) {
+    lastSensorRead = millis();
+    cachedDist[nextSensorIdx] = readDistance(echoPins[nextSensorIdx]);
+    nextSensorIdx = (nextSensorIdx + 1) % NUM_SENSORS;
+  }
 
   // Ultrasonic auto-reads on serial when in that mode
   if (currentMode == MODE_ULTRASONIC) {
