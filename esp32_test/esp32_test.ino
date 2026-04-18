@@ -15,8 +15,8 @@
     Ultrasonic:  TRIG=12, ECHO=33,35,32,34
     BTS7960 L:   RPWM=4(ch0), LPWM=5(ch1), EN=26
     BTS7960 R:   RPWM=16(ch2), LPWM=17(ch3), EN=27
-    L298N #1:    EN=14(ch4), IN1=15, IN2=19
-    L298N #2:    EN=2(ch5), IN1=25, IN2=23
+    Hybrid 2R0:  PWM=14(ch4), DIR=19  (arm lift — replaces L298N #1)
+    L298N #2:    EN=2(ch5), IN1=25, IN2=23  (swing drive)
     Limit SW:    36, 39 (need external 10k pull-up to 3.3V)
     Servo L:     13(ch6)
     Servo R:     18(ch7)
@@ -65,10 +65,12 @@ const int NUM_SENSORS = 4;
 #define R_FWD_CH  2   // Timer 1
 #define R_REV_CH  3   // Timer 1
 
-// --- Arm Lift (L298N #1) ---
-#define ARM_EN   14
-#define ARM_IN1  15
-#define ARM_IN2  19
+// --- Arm Lift (e-Gizmo DC Motor Hybrid Drive 2R0, ~6A) ---
+// Active-HIGH wiring: PWM+ → GPIO14, DIR+ → GPIO19, PWM-/DIR- → GND
+// DIR moved off GPIO 15 (boot strapping pin — was unreliable for relay drive).
+// GPIO 15 (old ARM_IN1) is now FREE.
+#define ARM_PWM  14
+#define ARM_DIR  19
 #define ARM_CH   4     // Timer 2
 
 // --- Swing Drive (L298N #2) — rotates Pi+Camera platform 180° ---
@@ -80,6 +82,9 @@ const int NUM_SENSORS = 4;
 // --- Limit Switches ---
 #define LIMIT_1  36
 #define LIMIT_2  39
+
+// --- IR Proximity (E18-D80NK, NPN open-collector, idle HIGH, LOW on detect) ---
+#define IR_PROX  15
 
 // --- Servos ---
 #define SERVO_L     13
@@ -126,8 +131,21 @@ enum TestMode {
 TestMode currentMode = MODE_MENU;
 int wheelSpeed = 60;     // default drive speed
 int turnSpeed  = 60;     // default turn speed, max 80
-int armSpeed   = 150;
+int armSpeed   = 127;    // default 50% PWM (safer for hardware)
 int swingSpeed = 120;
+
+// --- Manual arm motion safety profile ---
+// DOWN: pulsed (stop-and-go) at 50% PWM until BOTTOM limit (SW2) trips.
+//       Bottom limit must be physically positioned ~5° above 0 to act as
+//       the "lowest allowable" stop.
+// UP:   continuous full force (180 PWM) until TOP limit (SW1) trips.
+#define MANUAL_DOWN_SPEED    127       // 50% of 255
+#define MANUAL_DOWN_ON_MS    200       // motor on per pulse
+#define MANUAL_DOWN_OFF_MS   300       // motor off between pulses
+#define MANUAL_UP_SPEED      180       // full force going up
+bool armManualPulseActive = false;     // true while user-held DOWN is active
+bool armManualPulseOn     = false;     // current phase of the on/off pulse
+unsigned long armManualPulseTimer = 0; // millis() of last phase change
 
 // ==================== PICKUP STATE MACHINE ====================
 // Sequence: Pi sends "P" → lower arm slowly → limit switch → scoop →
@@ -152,10 +170,12 @@ bool puArmOn = false;              // tracks arm pulse on/off during lowering
 #define PU_SCOOP_CLOSE_MS 800      // time to wait after closing scoopers
 #define PU_LIFT_SPEED     255      // full speed lifting
 #define PU_DROP_OPEN_MS   800      // time to wait after opening scoopers
-#define PU_SERVO_OPEN_L   180      // scooper open angles
-#define PU_SERVO_OPEN_R   0
-#define PU_SERVO_CLOSE_L  0        // scooper closed angles
-#define PU_SERVO_CLOSE_R  180
+// Servos are MIRRORED — sweep inward to scoop, outward to release.
+// If scooper direction is backwards, swap OPEN/CLOSE for both.
+#define PU_SERVO_OPEN_L   0        // scooper open (spread apart)
+#define PU_SERVO_OPEN_R   180
+#define PU_SERVO_CLOSE_L  180      // scooper closed (swept inward to scoop)
+#define PU_SERVO_CLOSE_R  0
 #define PU_TIMEOUT_MS     30000    // abort pickup if stuck for 30 seconds
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -221,18 +241,48 @@ void stopWheels() {
   digitalWrite(R_EN, LOW);
 }
 
-// Arm lift motor (L298N #1) — polarity inverted in software
+// Arm lift motor (Hybrid Drive 2R0) — single DIR pin + PWM.
+// IMPORTANT: direction is switched by an internal relay. Never flip DIR
+// while PWM is non-zero — that hot-switches the relay contacts and burns
+// them out. Always: PWM=0 → wait → flip DIR → settle → ramp PWM up.
+// We track the last commanded direction so the relay-protect dance only
+// runs on actual direction changes (repeated same-direction calls are
+// no-ops, which is what the pickup pulse-lowering needs).
+int lastArmDir = 0;
+bool limitsReady = false;   // becomes true once a limit pin reads HIGH (pull-up installed)
+
 void setArm(int dir) {
-  if (dir > 0) {
-    digitalWrite(ARM_IN1, LOW); digitalWrite(ARM_IN2, HIGH);
-    ledcWrite(ARM_CH, armSpeed);
-  } else if (dir < 0) {
-    digitalWrite(ARM_IN1, HIGH); digitalWrite(ARM_IN2, LOW);
-    ledcWrite(ARM_CH, armSpeed);
-  } else {
-    digitalWrite(ARM_IN1, LOW); digitalWrite(ARM_IN2, LOW);
+  if (dir == 0) {
     ledcWrite(ARM_CH, 0);
+    // Keep lastArmDir — the relay didn't physically move, so the next
+    // same-direction call should NOT trigger the relay-flip dance.
+    // This is critical for pulsed lowering: relays only survive ~10^5
+    // cycles, and resetting would throw the relay every ~500ms pulse.
+    return;
   }
+  // Direction-aware limit guard: refuse to drive INTO a pressed limit,
+  // but allow motion AWAY from it.
+  // Physical wiring: SW1 (GPIO 36) = BOTTOM/DOWN limit, SW2 (GPIO 39) = TOP/UP limit.
+  if (limitsReady) {
+    if (dir > 0 && digitalRead(LIMIT_2) == LOW) {
+      Serial.println("ARM: TOP limit (SW2) pressed — UP blocked (DOWN still allowed)");
+      return;
+    }
+    if (dir < 0 && digitalRead(LIMIT_1) == LOW) {
+      Serial.println("ARM: BOTTOM limit (SW1) pressed — DOWN blocked (UP still allowed)");
+      return;
+    }
+  }
+  if (dir != lastArmDir) {
+    ledcWrite(ARM_CH, 0);
+    delay(20);  // let motor coast & PWM rail settle
+    digitalWrite(ARM_DIR, dir > 0 ? HIGH : LOW);
+    delay(10);  // relay throw time
+    lastArmDir = dir;
+    Serial.printf("ARM: DIR pin (GPIO19) = %s  | armSpeed=%d  | physical pin readback=%d\n",
+                  dir > 0 ? "HIGH (UP)" : "LOW (DOWN)", armSpeed, digitalRead(ARM_DIR));
+  }
+  ledcWrite(ARM_CH, armSpeed);
 }
 
 void stopArm() { setArm(0); }
@@ -335,8 +385,8 @@ void pickupUpdate() {
     lcd.setCursor(0, 0); lcd.print("PICKUP TIMEOUT!");
     return;
   }
-  bool limBottom = (digitalRead(LIMIT_1) == LOW);  // GPIO 36
-  bool limTop    = (digitalRead(LIMIT_2) == LOW);  // GPIO 39
+  bool limBottom = (digitalRead(LIMIT_1) == LOW);  // GPIO 36 = SW1 = BOTTOM/DOWN
+  bool limTop    = (digitalRead(LIMIT_2) == LOW);  // GPIO 39 = SW2 = TOP/UP
 
   switch (puState) {
 
@@ -419,7 +469,7 @@ void pickupUpdate() {
       if (now - puTimer >= 500) {
         lcd.clear();
         lcd.setCursor(0, 0); lcd.print("Ready");
-        armSpeed = 150;  // restore default
+        armSpeed = 127;  // restore safe 50% default
         puState = PU_IDLE;
         Serial.println("Pickup idle — ready for next bottle");
       }
@@ -540,8 +590,8 @@ void executeCmd(String cmd) {
       case '7': currentMode = MODE_SWING; Serial.println("Mode: SWING DRIVE"); break;
       case '4':
         currentMode = MODE_SERVOS;
-        setServo(SERVO_L_CH, 90); setServo(SERVO_R_CH, 90);
-        Serial.println("Mode: SERVOS");
+        setServo(SERVO_L_CH, PU_SERVO_OPEN_L); setServo(SERVO_R_CH, PU_SERVO_OPEN_R);
+        Serial.println("Mode: SERVOS (mirrored, starting OPEN)");
         break;
       case '5': currentMode = MODE_BUZZER; Serial.println("Mode: BUZZER"); break;
       case '6':
@@ -593,14 +643,26 @@ void executeCmd(String cmd) {
   if (currentMode == MODE_ARM) {
     switch (c0) {
       case 'U':
-        if (val > 0) armSpeed = constrain(val, 0, 255);
+        // Force full-speed continuous lift; slider value ignored for safety.
+        armManualPulseActive = false;
+        armSpeed = MANUAL_UP_SPEED;
         setArm(1);
-        Serial.printf("ARM UP at %d\n", armSpeed); break;
+        Serial.printf("ARM UP at %d (full force, until TOP limit)\n", armSpeed);
+        break;
       case 'D':
-        if (val > 0) armSpeed = constrain(val, 0, 255);
+        // Start pulsed (stop-and-go) descent at 50% PWM until BOTTOM limit.
+        armSpeed = MANUAL_DOWN_SPEED;
         setArm(-1);
-        Serial.printf("ARM DOWN at %d\n", armSpeed); break;
-      case 'S': stopArm(); Serial.println("STOPPED"); break;
+        armManualPulseActive = true;
+        armManualPulseOn = true;
+        armManualPulseTimer = millis();
+        Serial.printf("ARM DOWN pulsed at %d (until BOTTOM limit ~5deg above 0)\n", armSpeed);
+        break;
+      case 'S':
+        armManualPulseActive = false;
+        stopArm();
+        Serial.println("STOPPED");
+        break;
       case '+':
         armSpeed = constrain(armSpeed + 10, 0, 255);
         Serial.printf("Speed: %d\n", armSpeed); break;
@@ -633,32 +695,36 @@ void executeCmd(String cmd) {
     return;
   }
 
-  // Servos mode
+  // Servos mode — MIRRORED: right servo = 180 - left servo
   if (currentMode == MODE_SERVOS) {
     switch (c0) {
       case 'O':
-        setServo(SERVO_L_CH, 180); setServo(SERVO_R_CH, 0);
-        Serial.println("OPEN (L=180, R=0)"); break;
+        setServo(SERVO_L_CH, PU_SERVO_OPEN_L); setServo(SERVO_R_CH, PU_SERVO_OPEN_R);
+        Serial.printf("OPEN (L=%d, R=%d)\n", PU_SERVO_OPEN_L, PU_SERVO_OPEN_R); break;
       case 'C':
-        setServo(SERVO_L_CH, 0); setServo(SERVO_R_CH, 180);
-        Serial.println("CLOSE (L=0, R=180)"); break;
+        setServo(SERVO_L_CH, PU_SERVO_CLOSE_L); setServo(SERVO_R_CH, PU_SERVO_CLOSE_R);
+        Serial.printf("SCOOP (L=%d, R=%d)\n", PU_SERVO_CLOSE_L, PU_SERVO_CLOSE_R); break;
       case 'H':
         setServo(SERVO_L_CH, 90); setServo(SERVO_R_CH, 90);
         Serial.println("HALF (L=90, R=90)"); break;
       case 'L':
-        if (val >= 0 && val <= 180) { setServo(SERVO_L_CH, val); Serial.printf("Left servo: %d\n", val); }
-        else {
-          Serial.println("Left sweep...");
-          for (int a = 0; a <= 180; a += 5) { setServo(SERVO_L_CH, a); delay(30); }
-          for (int a = 180; a >= 0; a -= 5) { setServo(SERVO_L_CH, a); delay(30); }
+        if (val >= 0 && val <= 180) {
+          setServo(SERVO_L_CH, val); setServo(SERVO_R_CH, 180 - val);
+          Serial.printf("Mirror: L=%d R=%d\n", val, 180 - val);
+        } else {
+          Serial.println("Mirrored sweep...");
+          for (int a = 0; a <= 180; a += 5) { setServo(SERVO_L_CH, a); setServo(SERVO_R_CH, 180 - a); delay(30); }
+          for (int a = 180; a >= 0; a -= 5) { setServo(SERVO_L_CH, a); setServo(SERVO_R_CH, 180 - a); delay(30); }
         }
         break;
       case 'R':
-        if (val >= 0 && val <= 180) { setServo(SERVO_R_CH, val); Serial.printf("Right servo: %d\n", val); }
-        else {
-          Serial.println("Right sweep...");
-          for (int a = 0; a <= 180; a += 5) { setServo(SERVO_R_CH, a); delay(30); }
-          for (int a = 180; a >= 0; a -= 5) { setServo(SERVO_R_CH, a); delay(30); }
+        if (val >= 0 && val <= 180) {
+          setServo(SERVO_R_CH, val); setServo(SERVO_L_CH, 180 - val);
+          Serial.printf("Mirror: R=%d L=%d\n", val, 180 - val);
+        } else {
+          Serial.println("Mirrored sweep...");
+          for (int a = 0; a <= 180; a += 5) { setServo(SERVO_R_CH, a); setServo(SERVO_L_CH, 180 - a); delay(30); }
+          for (int a = 180; a >= 0; a -= 5) { setServo(SERVO_R_CH, a); setServo(SERVO_L_CH, 180 - a); delay(30); }
         }
         break;
       default:
@@ -721,7 +787,7 @@ void printMenu() {
   Serial.println("=========================================");
   Serial.println("  1 = Ultrasonic Sensors (x4)");
   Serial.println("  2 = Drive Wheels (BTS7960 x2)");
-  Serial.println("  3 = Arm Lift (L298N x2 + Limits)");
+  Serial.println("  3 = Arm Lift (Hybrid Drive 2R0 + Limits)");
   Serial.println("  4 = Servos (Gripper L+R)");
   Serial.println("  5 = Buzzer");
   Serial.println("  6 = LCD Display");
@@ -784,6 +850,8 @@ void handleWebSensor() {
   json += "\"sw1\":" + String(digitalRead(LIMIT_1) == LOW ? "true" : "false") + ",";
   json += "\"sw2\":" + String(digitalRead(LIMIT_2) == LOW ? "true" : "false");
   json += "},";
+
+  json += "\"irProx\":" + String(digitalRead(IR_PROX) == LOW ? "true" : "false") + ",";
 
   json += "\"wheelSpeed\":" + String(wheelSpeed) + ",";
   json += "\"armSpeed\":" + String(armSpeed) + ",";
@@ -1412,10 +1480,9 @@ void setup() {
   pinMode(L_LPWM, OUTPUT);  digitalWrite(L_LPWM, LOW);
   pinMode(R_RPWM, OUTPUT);  digitalWrite(R_RPWM, LOW);
   pinMode(R_LPWM, OUTPUT);  digitalWrite(R_LPWM, LOW);
-  // L298N arm pins
-  pinMode(ARM_EN, OUTPUT);   digitalWrite(ARM_EN, LOW);
-  pinMode(ARM_IN1, OUTPUT);  digitalWrite(ARM_IN1, LOW);
-  pinMode(ARM_IN2, OUTPUT);  digitalWrite(ARM_IN2, LOW);
+  // Hybrid Drive 2R0 arm pins (PWM + single DIR; opto-isolated inputs)
+  pinMode(ARM_PWM, OUTPUT);  digitalWrite(ARM_PWM, LOW);
+  pinMode(ARM_DIR, OUTPUT);  digitalWrite(ARM_DIR, LOW);
   // L298N swing pins
   pinMode(SWING_EN, OUTPUT);  digitalWrite(SWING_EN, LOW);
   pinMode(SWING_IN1, OUTPUT); digitalWrite(SWING_IN1, LOW);
@@ -1434,7 +1501,7 @@ void setup() {
   // L298N EN pins (ch4-5, Timer 2)
   ledcSetup(ARM_CH, ARM_PWM_FREQ, ARM_PWM_RES);
   ledcSetup(SWING_CH, ARM_PWM_FREQ, ARM_PWM_RES);
-  ledcAttachPin(ARM_EN, ARM_CH);
+  ledcAttachPin(ARM_PWM, ARM_CH);
   ledcAttachPin(SWING_EN, SWING_CH);
   // Servos (ch6-7, Timer 3)
   ledcSetup(SERVO_L_CH, SERVO_FREQ, SERVO_RES);
@@ -1457,6 +1524,8 @@ void setup() {
   // Limit switches (input-only, need external 10k pull-up to 3.3V)
   pinMode(LIMIT_1, INPUT);
   pinMode(LIMIT_2, INPUT);
+  // E18-D80NK IR proximity sensor (open-collector, internal pull-up needed)
+  pinMode(IR_PROX, INPUT_PULLUP);
   // Buzzer
   pinMode(BUZZER, OUTPUT);
   digitalWrite(BUZZER, LOW);
@@ -1556,20 +1625,41 @@ void loop() {
   // Arm limit switch check
   // NOTE: GPIO 36/39 have no internal pull-up. Without external 10kΩ
   // pull-ups to 3.3V they float LOW (always "pressed") and block the arm.
-  // Only enforce limit stops when the pin reads HIGH at least once (pull-up installed).
-  static bool limitsReady = false;
+  // Only enforce limit stops when a pin reads HIGH at least once (pull-up installed).
+  // limitsReady is file-scope so setArm() can also consult it.
   if (!limitsReady) {
     if (digitalRead(LIMIT_1) == HIGH || digitalRead(LIMIT_2) == HIGH)
       limitsReady = true;
   }
+  // Direction-aware stop: only kill the motor if the limit being pressed
+  // is the one in the current direction of travel.
+  // Physical wiring: SW1 (GPIO 36) = BOTTOM/DOWN limit, SW2 (GPIO 39) = TOP/UP limit.
   if (limitsReady && currentMode == MODE_ARM) {
-    bool lim1 = digitalRead(LIMIT_1) == LOW;
-    bool lim2 = digitalRead(LIMIT_2) == LOW;
-    if (lim1 || lim2) {
+    bool lim_bottom = digitalRead(LIMIT_1) == LOW;
+    bool lim_top    = digitalRead(LIMIT_2) == LOW;
+    bool hit_going_up   = lim_top    && lastArmDir > 0;
+    bool hit_going_down = lim_bottom && lastArmDir < 0;
+    if (hit_going_up || hit_going_down) {
       stopArm();
-      if (lim1) Serial.println("*** LIMIT 1 (GPIO 36) TRIGGERED ***");
-      if (lim2) Serial.println("*** LIMIT 2 (GPIO 39) TRIGGERED ***");
-      delay(500);
+      armManualPulseActive = false;
+      if (hit_going_up)   Serial.println("*** TOP LIMIT (SW2) hit while going UP — stopped (DOWN still works) ***");
+      if (hit_going_down) Serial.println("*** BOTTOM LIMIT (SW1) hit while going DOWN — stopped (UP still works) ***");
+    }
+  }
+
+  // Manual ARM DOWN pulse loop — runs only outside the pickup state machine.
+  // Toggles motor on/off so arm descends in small controlled steps.
+  if (armManualPulseActive && puState == PU_IDLE) {
+    unsigned long now = millis();
+    if (armManualPulseOn && (now - armManualPulseTimer >= MANUAL_DOWN_ON_MS)) {
+      stopArm();
+      armManualPulseOn = false;
+      armManualPulseTimer = now;
+    } else if (!armManualPulseOn && (now - armManualPulseTimer >= MANUAL_DOWN_OFF_MS)) {
+      armSpeed = MANUAL_DOWN_SPEED;
+      setArm(-1);
+      armManualPulseOn = true;
+      armManualPulseTimer = now;
     }
   }
 

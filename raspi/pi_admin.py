@@ -157,9 +157,19 @@ h1{color:#4fc3f7;font-size:1.4rem;text-align:center;font-weight:800;margin-botto
 .us-item{text-align:center;background:#0d1117;border:1px solid #1e2d4a;border-radius:8px;padding:6px 4px}
 .us-item .v{font-size:1rem;font-weight:700;font-family:monospace}
 .us-item .l{font-size:.55rem;color:#666;font-weight:600}
-.us-item.close .v{color:#e53935}
-.us-item.mid .v{color:#e65100}
-.us-item.far .v{color:#2e7d32}
+.us-item.stop .v{color:#e53935}
+.us-item.slow .v{color:#e65100}
+.us-item.warn .v{color:#fbc02d}
+.us-item.clear .v{color:#2e7d32}
+.obstacle-status{margin-top:8px;padding:8px 12px;border-radius:8px;
+  text-align:center;font-weight:700;font-size:.85rem;
+  background:#0d1117;border:1px solid #1e2d4a}
+.obstacle-status .lbl{font-size:.6rem;color:#666;font-weight:600;letter-spacing:.5px}
+.obstacle-status .val{margin-top:2px}
+.obstacle-status.clear .val{color:#2e7d32}
+.obstacle-status.warn .val{color:#fbc02d}
+.obstacle-status.slow .val{color:#e65100}
+.obstacle-status.stop .val{color:#e53935}
 .emergency{width:100%;padding:16px;border:none;border-radius:12px;
   font-size:1.1rem;font-weight:800;cursor:pointer;color:#fff;
   background:#d32f2f;box-shadow:0 3px 10px rgba(211,47,47,.3);
@@ -220,10 +230,14 @@ h1{color:#4fc3f7;font-size:1.4rem;text-align:center;font-weight:800;margin-botto
     <div class="sg"><div class="v" id="sMod" style="color:#7b1fa2;font-size:.7rem">--</div><div class="l">Model</div></div>
   </div>
   <div class="us-grid">
-    <div class="us-item far" id="usF"><div class="v">--</div><div class="l">FRONT</div></div>
-    <div class="us-item far" id="usL"><div class="v">--</div><div class="l">LEFT</div></div>
-    <div class="us-item far" id="usR"><div class="v">--</div><div class="l">RIGHT</div></div>
-    <div class="us-item far" id="usB"><div class="v">--</div><div class="l">BACK</div></div>
+    <div class="us-item clear" id="usF"><div class="v">--</div><div class="l">FRONT</div></div>
+    <div class="us-item clear" id="usL"><div class="v">--</div><div class="l">LEFT</div></div>
+    <div class="us-item clear" id="usR"><div class="v">--</div><div class="l">RIGHT</div></div>
+    <div class="us-item clear" id="usB"><div class="v">--</div><div class="l">BACK</div></div>
+  </div>
+  <div class="obstacle-status clear" id="obsStatus">
+    <div class="lbl">CLOSEST OBSTACLE</div>
+    <div class="val" id="obsVal">-- &middot; waiting for ESP32</div>
   </div>
 </div>
 
@@ -283,14 +297,41 @@ function poll(){
     if(d.ultrasonic){
       setUS('usF',d.ultrasonic.s1);setUS('usR',d.ultrasonic.s2);
       setUS('usB',d.ultrasonic.s3);setUS('usL',d.ultrasonic.s4);
+      updateObstacle(d.ultrasonic);
     }
   }).catch(function(){});
+}
+function usClass(v){
+  // Match navigator thresholds: STOP=60, SLOW=100, TURN=150 cm
+  if(v>=999)return 'clear';
+  if(v<60)return 'stop';
+  if(v<100)return 'slow';
+  if(v<150)return 'warn';
+  return 'clear';
 }
 function setUS(id,val){
   var el=document.getElementById(id);if(!el)return;
   var v=val||999;
   el.querySelector('.v').textContent=v>=999?'--':v+'cm';
-  el.className='us-item '+(v<20?'close':v<60?'mid':'far');
+  el.className='us-item '+usClass(v);
+}
+function updateObstacle(us){
+  var vals=[us.s1,us.s2,us.s3,us.s4].map(function(x){return x||999});
+  var dirs=['FRONT','RIGHT','BACK','LEFT'];
+  var minIdx=0;
+  for(var i=1;i<4;i++){if(vals[i]<vals[minIdx])minIdx=i;}
+  var min=vals[minIdx];
+  var dir=dirs[minIdx];
+  var cls=usClass(min);
+  var msg;
+  if(min>=999)msg='-- &middot; no echo (path clear or out of range)';
+  else if(cls==='stop')msg=min+'cm '+dir+' &middot; STOP / BACKING UP';
+  else if(cls==='slow')msg=min+'cm '+dir+' &middot; SLOW CRAWL';
+  else if(cls==='warn')msg=min+'cm '+dir+' &middot; STEERING AWAY';
+  else msg=min+'cm '+dir+' &middot; CLEAR';
+  var el=document.getElementById('obsStatus');
+  el.className='obstacle-status '+cls;
+  document.getElementById('obsVal').innerHTML=msg;
 }
 setInterval(poll,1000);poll();
 
