@@ -1,6 +1,6 @@
-# Build artifacts
-build_*/
-*.bin
+# Build artifacts (keep .bin for OTA flashing)
+build_*/*
+!build_*/*.bin
 *.elf
 *.map
 *.merged.bin
