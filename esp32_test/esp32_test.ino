@@ -131,7 +131,7 @@ enum TestMode {
 TestMode currentMode = MODE_MENU;
 int wheelSpeed = 0;      // default drive speed — 0 for safety; nudge up via web UI
 int turnSpeed  = 0;      // default turn speed (max 80) — 0 for safety
-int armSpeed   = 0;      // default arm PWM — 0 for safety; pickup overrides as needed
+int armSpeed   = 30;     // default arm PWM
 int swingSpeed = 0;      // default swing PWM — 0 for safety
 
 // --- Manual arm motion safety profile ---
@@ -139,10 +139,10 @@ int swingSpeed = 0;      // default swing PWM — 0 for safety
 //       Bottom limit must be physically positioned ~5° above 0 to act as
 //       the "lowest allowable" stop.
 // UP:   continuous full force (180 PWM) until TOP limit (SW1) trips.
-#define MANUAL_DOWN_SPEED    127       // 50% of 255
+#define MANUAL_DOWN_SPEED    127
 #define MANUAL_DOWN_ON_MS    200       // motor on per pulse
 #define MANUAL_DOWN_OFF_MS   300       // motor off between pulses
-#define MANUAL_UP_SPEED      180       // full force going up
+#define MANUAL_UP_SPEED      180
 bool armManualPulseActive = false;     // true while user-held DOWN is active
 bool armManualPulseOn     = false;     // current phase of the on/off pulse
 unsigned long armManualPulseTimer = 0; // millis() of last phase change
@@ -164,11 +164,11 @@ PickupState puState = PU_IDLE;
 unsigned long puTimer = 0;         // general purpose timer for pickup steps
 unsigned long puStartTime = 0;     // when pickup sequence began (for timeout)
 bool puArmOn = false;              // tracks arm pulse on/off during lowering
-#define PU_LOWER_SPEED    100      // slow lowering PWM (out of 255)
+#define PU_LOWER_SPEED    100
 #define PU_LOWER_ON_MS    200      // arm on duration during pulsed lowering
 #define PU_LOWER_OFF_MS   300      // arm off duration during pulsed lowering
 #define PU_SCOOP_CLOSE_MS 800      // time to wait after closing scoopers
-#define PU_LIFT_SPEED     255      // full speed lifting
+#define PU_LIFT_SPEED     255
 #define PU_DROP_OPEN_MS   800      // time to wait after opening scoopers
 // Servos are MIRRORED — sweep inward to scoop, outward to release.
 // If scooper direction is backwards, swap OPEN/CLOSE for both.
@@ -486,7 +486,7 @@ void pickupUpdate() {
       if (now - puTimer >= 500) {
         lcd.clear();
         lcd.setCursor(0, 0); lcd.print("Ready");
-        armSpeed = 127;  // restore safe 50% default
+        armSpeed = 30;
         puState = PU_IDLE;
         Serial.println("Pickup idle — ready for next bottle");
       }
@@ -1046,8 +1046,8 @@ button:active{transform:scale(.94)}
 <div id="p-wheels" class="panel active">
 <div class="slider-row">
   <label>Speed</label>
-  <input type="range" id="wspd" min="30" max="80" value="60">
-  <span id="wspdV">60</span>
+  <input type="range" id="wspd" min="30" max="80" value="30">
+  <span id="wspdV">30</span>
 </div>
 <div class="grid g3">
   <div></div>
@@ -1075,8 +1075,8 @@ button:active{transform:scale(.94)}
 </div>
 <div class="slider-row">
   <label>Speed</label>
-  <input type="range" id="aspd" min="25" max="180" value="150">
-  <span id="aspdV">150</span>
+  <input type="range" id="aspd" min="25" max="180" value="30">
+  <span id="aspdV">30</span>
 </div>
 <div class="grid g3">
   <button class="bu" onpointerdown="acmd('U')">Arm Up</button>
@@ -1089,8 +1089,8 @@ button:active{transform:scale(.94)}
 <div id="p-swing" class="panel">
 <div class="slider-row">
   <label>Speed</label>
-  <input type="range" id="sspd" min="30" max="80" value="60">
-  <span id="sspdV">60</span>
+  <input type="range" id="sspd" min="30" max="80" value="30">
+  <span id="sspdV">30</span>
 </div>
 <div class="grid g3">
   <button class="bl" onpointerdown="swcmd('L')">Swing Left</button>
