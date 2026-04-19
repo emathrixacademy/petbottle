@@ -28,6 +28,35 @@ from hailo_platform import (
     InputVStreamParams, OutputVStreamParams, FormatType
 )
 
+# ── HEF lookup paths ─────────────────────────────────────────
+# MODEL_CONFIGS uses bare filenames. Resolve them by checking these
+# locations in order — works whether navigator.py is launched from
+# the project root, the raspi/ subdir, or by a systemd service with
+# its own cwd. `models/archive/` is included so older/coco HEFs that
+# were moved out of the active set still load.
+HEF_SEARCH_DIRS = [
+    Path(__file__).resolve().parent.parent / "models",
+    Path(__file__).resolve().parent.parent / "models" / "archive",
+    Path(__file__).resolve().parent / "models",
+    Path(__file__).resolve().parent,            # Pi: HEFs sit flat next to camera.py
+    Path("models"),
+    Path("models/archive"),
+    Path("."),
+]
+
+
+def _resolve_hef(name):
+    """Return the first existing path for a HEF filename, or None."""
+    p = Path(name)
+    if p.is_absolute() and p.exists():
+        return p
+    for d in HEF_SEARCH_DIRS:
+        cand = d / name
+        if cand.exists():
+            return cand
+    return None
+
+
 # ── Model Definitions ────────────────────────────────────────
 MODEL_CONFIGS = {
     "yolov5": {
@@ -554,9 +583,11 @@ class ModelManager:
         keys = model_keys or self.MODEL_ORDER
         for key in keys:
             cfg = MODEL_CONFIGS[key]
-            hef_path = Path(cfg["hef_path"])
-            if not hef_path.exists():
-                print(f"  WARNING: {hef_path} not found — skipping {cfg['name']}")
+            hef_path = _resolve_hef(cfg["hef_path"])
+            if hef_path is None:
+                searched = ", ".join(str(d) for d in HEF_SEARCH_DIRS)
+                print(f"  WARNING: {cfg['hef_path']} not found in any of "
+                      f"[{searched}] — skipping {cfg['name']}")
                 continue
             hef = HEF(str(hef_path))
             input_info  = hef.get_input_vstream_infos()[0]

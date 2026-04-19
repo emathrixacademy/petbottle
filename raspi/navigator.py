@@ -11,23 +11,28 @@ The robot continuously:
   4. Triggers the pickup sequence on the ESP32
   5. Resumes roaming
 
+Transport: Pi <-> ESP32 is USB serial (115200 baud). ESP32's WiFi AP is
+still up for OTA / web debug, but the navigator does NOT use it.
+
 Usage:
-  python3 navigator.py                    # default (YOLOv8, auto-connect)
+  python3 navigator.py                    # default (YOLOv8, auto-detect serial)
   python3 navigator.py --model yolov8     # default model
-  python3 navigator.py --esp32-ip 192.168.4.1
+  python3 navigator.py --serial-port /dev/ttyUSB0
   python3 navigator.py --no-show          # headless
 """
 
 import cv2
 import numpy as np
 import argparse
+import glob
 import time
 import threading
-import requests
 import json
 from pathlib import Path
 from enum import Enum, auto
 from flask import Flask, Response, jsonify, request
+
+import serial  # pyserial — install on Pi: sudo apt install python3-serial
 
 # Import detection system from camera.py
 from camera import (
@@ -48,9 +53,19 @@ from hailo_platform import (
 # Configuration
 # ══════════════════════════════════════════════════════════════
 
-ESP32_IP        = "192.168.4.1"
-ESP32_TIMEOUT   = 0.5           # HTTP timeout (seconds)
-SENSOR_POLL_HZ  = 10            # ultrasonic poll rate
+SERIAL_BAUD     = 115200        # ESP32 USB serial baud
+SERIAL_TIMEOUT  = 0.1           # serial read timeout (seconds)
+# ESP32 dev boards usually expose either CH340/CP2102 (ttyUSB*) or
+# native USB (ttyACM*). Auto-detect picks the first match in /dev/serial/by-id.
+SERIAL_PORT_GLOBS = [
+    "/dev/serial/by-id/usb-*CP210*",
+    "/dev/serial/by-id/usb-*CH340*",
+    "/dev/serial/by-id/usb-*Silicon_Labs*",
+    "/dev/serial/by-id/usb-*Espressif*",
+    "/dev/serial/by-id/usb-*ESP32*",
+    "/dev/ttyUSB0",
+    "/dev/ttyACM0",
+]
 
 # Obstacle avoidance thresholds (cm)
 # Robot is ~100cm long x 30cm wide — sensors are at the front
@@ -90,10 +105,12 @@ stream_app = Flask(__name__)
 stream_lock = threading.Lock()
 stream_frame = None  # latest JPEG-encoded frame
 stream_stats = {"fps": 0, "bottles": 0, "persons": 0, "model": "", "inference_ms": 0, "state": "WAITING",
-                "ultrasonic": {"s1": 999, "s2": 999, "s3": 999, "s4": 999}}
+                "ultrasonic": {"s1": 999, "s2": 999, "s3": 999, "s4": 999},
+                "binFull": False}
 _navigator_ref = None  # set by Navigator.__init__ so Flask routes can control it
 
-def update_stream(frame_bgr, bottles, persons, model_name, inference_ms, state_name, ultrasonic=None):
+def update_stream(frame_bgr, bottles, persons, model_name, inference_ms, state_name,
+                  ultrasonic=None, bin_full=None):
     """Called from navigator loop to update the shared frame and stats."""
     global stream_frame, stream_stats
     _, jpeg = cv2.imencode('.jpg', frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
@@ -106,6 +123,8 @@ def update_stream(frame_bgr, bottles, persons, model_name, inference_ms, state_n
         stream_stats["state"] = state_name
         if ultrasonic:
             stream_stats["ultrasonic"] = ultrasonic
+        if bin_full is not None:
+            stream_stats["binFull"] = bool(bin_full)
 
 def generate_mjpeg():
     while True:
@@ -131,6 +150,11 @@ def get_stats():
 @stream_app.route('/start')
 def nav_start():
     if _navigator_ref and _navigator_ref.state == State.WAITING:
+        # Fresh mission — reset counters so the bin backstop starts at 0
+        # and the IR-never-tripped warning isn't carried over.
+        _navigator_ref.pickup_success_count = 0
+        _navigator_ref.ir_ever_tripped = False
+        _navigator_ref.infer_fail_streak = 0
         _navigator_ref.state = State.SCANNING
         _navigator_ref.scan_start = time.time()
         return jsonify({"ok": True, "state": "SCANNING"})
@@ -228,6 +252,7 @@ button:active{transform:scale(.94)}
   <div class="stat"><div class="val" id="persons">0</div><div class="lbl">Persons</div></div>
   <div class="stat"><div class="val" id="infer">-</div><div class="lbl">Infer ms</div></div>
   <div class="stat"><div class="val" id="model">-</div><div class="lbl">Model</div></div>
+  <div class="stat"><div class="val" id="bin">-</div><div class="lbl">Bin</div></div>
 </div>
 
 <div id="log">Ready.\n</div>
@@ -235,7 +260,8 @@ button:active{transform:scale(.94)}
 <script>
 const stateColors={WAITING:'#ff9800',SCANNING:'#ffeb3b',ROAMING:'#66bb6a',
   VERIFYING:'#ffcc80',APPROACHING:'#4fc3f7',ALIGNING:'#ffd54f',
-  PICKING_UP:'#ab47bc',AVOIDING:'#ef5350',STOPPED:'#666'};
+  PICKING_UP:'#ab47bc',AVOIDING:'#ef5350',STOPPED:'#666',
+  MISSION_COMPLETE:'#ffc107'};
 const log=document.getElementById('log');
 
 function act(url){
@@ -252,9 +278,15 @@ function poll(){
     document.getElementById('persons').textContent=d.persons||0;
     document.getElementById('infer').textContent=d.inference_ms||'-';
     document.getElementById('model').textContent=d.model||'-';
+    const binEl=document.getElementById('bin');
+    binEl.textContent=d.binFull?'FULL':'OK';
+    binEl.style.color=d.binFull?'#ffc107':'#4fc3f7';
     const b=document.getElementById('badge');
     b.textContent=d.state||'?';
     b.style.background=stateColors[d.state]||'#666';
+    if(d.state==='MISSION_COMPLETE'){
+      b.textContent='BIN FULL — press STOP, empty bin, START';
+    }
   }).catch(()=>{});
 }
 setInterval(poll,1000);
@@ -273,53 +305,121 @@ def start_stream_server(port=5000):
 # ══════════════════════════════════════════════════════════════
 
 class State(Enum):
-    WAITING     = auto()   # safety hold — motors disabled until user confirms
-    SCANNING    = auto()   # slow rotation to look around for bottles
-    ROAMING     = auto()   # slow forward movement, exploring
-    VERIFYING   = auto()   # bottle maybe seen — moving closer slowly to confirm
-    APPROACHING = auto()   # bottle confirmed — driving towards it slowly
-    ALIGNING    = auto()   # close to bottle, fine-tuning position
-    PICKING_UP  = auto()   # running pickup sequence on ESP32
-    AVOIDING    = auto()   # obstacle detected, steering away slowly
-    STOPPED     = auto()   # emergency stop / idle
+    WAITING          = auto()   # safety hold — motors disabled until user confirms
+    SCANNING         = auto()   # slow rotation to look around for bottles
+    ROAMING          = auto()   # slow forward movement, exploring
+    VERIFYING        = auto()   # bottle maybe seen — moving closer slowly to confirm
+    APPROACHING      = auto()   # bottle confirmed — driving towards it slowly
+    ALIGNING         = auto()   # close to bottle, fine-tuning position
+    PICKING_UP       = auto()   # running pickup sequence on ESP32
+    AVOIDING         = auto()   # obstacle detected, steering away slowly
+    STOPPED          = auto()   # emergency stop / idle
+    MISSION_COMPLETE = auto()   # bin full (IR proximity tripped) — terminal state
+
+
+# Bin-full detection (E18-D80NK IR proximity sensor over bin opening)
+BIN_SETTLE_DELAY_S   = 1.5  # wait after pickup for dropped bottle to settle
+BIN_DEBOUNCE_SAMPLES = 3    # consecutive irProx=true readings to declare full
+BIN_DEBOUNCE_PERIOD  = 0.25 # seconds between samples
+
+# Backup safeguard for the bin-full IR sensor. With INPUT_PULLUP, an
+# unplugged or broken E18-D80NK reads HIGH → "false" → bin always
+# reports empty → mission never ends. Hard-cap pickups so the robot
+# can't loop forever in that failure mode.
+MAX_PICKUPS_BACKSTOP = 20   # absolute cap regardless of IR sensor
+
+# Sensor freshness watchdog: ESP32 pushes a JSON packet every 100 ms.
+# If we haven't seen one for this long, assume the link is dead (USB
+# unplug, reader thread crash) and force a stop — otherwise the
+# navigator would keep deciding based on frozen sensor values.
+SENSOR_STALE_S = 2.0
+
+# YOLO inference watchdog: if the model errors N times in a row,
+# stop driving — we have no eyes.
+INFER_FAIL_LIMIT = 3
 
 
 # ══════════════════════════════════════════════════════════════
-# ESP32 Communication (thread-safe, non-blocking)
+# ESP32 Communication — USB serial transport
 # ══════════════════════════════════════════════════════════════
 
-class ESP32Link:
-    """Talks to the ESP32 robot controller over WiFi HTTP.
-    Uses PI-prefixed commands that bypass the ESP32's test-UI mode system,
-    so the navigator always has direct motor control.
-    Logs all commands and responses for the live monitor."""
+def _autodetect_serial_port():
+    """Return the first matching ESP32 serial device, or None."""
+    for pattern in SERIAL_PORT_GLOBS:
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            return matches[0]
+    return None
+
+
+class ESP32SerialLink:
+    """Talks to the ESP32 over USB serial (115200 baud, line-based).
+    Same PI-prefixed command set as the old HTTP link — only the transport
+    changed. ESP32 pushes a JSON sensor packet every 100ms; we parse those
+    in a background reader thread.
+
+    The Pi parser ignores any line that doesn't start with '{', 'OK ', or
+    'ERR ' — so all of the firmware's existing Serial.print debug output
+    just gets logged as debug without breaking the protocol."""
 
     MAX_LOG = 20  # keep last 20 command/response entries
 
-    def __init__(self, ip=ESP32_IP):
-        self.base_url = f"http://{ip}"
-        self.sensor_data = {}
-        self._lock = threading.Lock()
-        self._running = True
-        self.cmd_log = []  # list of (timestamp, command, response)
-        self._last_cmd = None  # avoid logging duplicate consecutive commands
-        self._sensor_thread = threading.Thread(target=self._poll_sensors, daemon=True)
-        self._sensor_thread.start()
+    def __init__(self, port=None):
+        if port is None:
+            port = _autodetect_serial_port()
+        if port is None:
+            raise RuntimeError(
+                "No ESP32 serial port found. Plug in USB and try "
+                "--serial-port /dev/ttyUSB0"
+            )
+        self.port = port
+        self.ser = serial.Serial(port, SERIAL_BAUD, timeout=SERIAL_TIMEOUT)
+        time.sleep(2.0)  # ESP32 auto-resets on USB open; wait for boot
+        self.ser.reset_input_buffer()
 
-    def _poll_sensors(self):
-        """Background thread: polls /sensor at SENSOR_POLL_HZ."""
+        self.sensor_data = {}
+        self._sensor_data_ts = 0.0  # monotonic-ish stamp of last JSON packet
+        self.cmd_log = []           # list of (timestamp, command, response)
+        self._last_cmd = None       # avoid logging duplicate consecutive commands
+        self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._running = True
+        self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader_thread.start()
+
+    def _read_loop(self):
+        """Background reader: parses incoming serial lines into sensor_data
+        and command-response log."""
         while self._running:
             try:
-                r = requests.get(f"{self.base_url}/sensor", timeout=ESP32_TIMEOUT)
-                data = r.json()
-                with self._lock:
-                    self.sensor_data = data
+                raw = self.ser.readline()
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                if line.startswith("{"):
+                    # JSON sensor packet
+                    try:
+                        data = json.loads(line)
+                        with self._lock:
+                            self.sensor_data = data
+                            self._sensor_data_ts = time.time()
+                    except json.JSONDecodeError:
+                        pass
+                elif line.startswith("OK ") or line.startswith("ERR "):
+                    # Command ACK — attach to most recent log entry
+                    with self._lock:
+                        if self.cmd_log:
+                            ts, cmd, _ = self.cmd_log[-1]
+                            self.cmd_log[-1] = (ts, cmd, line.split(" ", 1)[0])
+                # Anything else is firmware debug output — silently dropped.
             except Exception:
-                pass
-            time.sleep(1.0 / SENSOR_POLL_HZ)
+                # Don't let a parse error kill the reader
+                time.sleep(0.05)
 
     def _log(self, command, response):
-        """Log command/response, skip duplicates."""
+        """Log command/response, skip duplicates of common spam."""
         if command == self._last_cmd and command not in ("PIX", "PISTOP", "P", "PA"):
             return
         self._last_cmd = command
@@ -331,47 +431,51 @@ class ESP32Link:
 
     @property
     def recent_log(self):
-        """Get recent command log (thread-safe copy)."""
         with self._lock:
             return list(self.cmd_log)
 
     @property
     def ultrasonic(self):
-        """Returns dict with all 4 sensors: {s1: front, s2: right, s3: back, s4: left}.
-        ESP32 /sensor returns: {"ultrasonic": {"s1": N, "s2": N, "s3": N, "s4": N}}"""
+        """Returns {s1:front, s2:right, s3:back, s4:left} in cm."""
         with self._lock:
             us = self.sensor_data.get("ultrasonic", {})
             return {
-                "s1": us.get("s1", 999),  # front
-                "s2": us.get("s2", 999),  # right
-                "s3": us.get("s3", 999),  # back
-                "s4": us.get("s4", 999),  # left
+                "s1": us.get("s1", 999),
+                "s2": us.get("s2", 999),
+                "s3": us.get("s3", 999),
+                "s4": us.get("s4", 999),
             }
 
     @property
     def ultrasonic_min(self):
-        """Returns the minimum distance across all 4 sensors."""
         us = self.ultrasonic
         return min(us["s1"], us["s2"], us["s3"], us["s4"])
 
     @property
     def sensors(self):
-        """Returns full sensor dict (thread-safe copy)."""
         with self._lock:
             return dict(self.sensor_data)
 
     @property
     def is_connected(self):
         with self._lock:
-            # If we got ultrasonic data, the ESP32 is alive
             return "ultrasonic" in self.sensor_data
 
+    def sensor_age(self):
+        """Seconds since last JSON sensor packet was received. Returns
+        a very large number if no packet has ever arrived. Used by the
+        navigator to detect serial drop / frozen reader thread."""
+        with self._lock:
+            if self._sensor_data_ts == 0.0:
+                return float('inf')
+            return time.time() - self._sensor_data_ts
+
     def cmd(self, command):
-        """Send a command to the ESP32 (non-blocking), log it."""
+        """Send a single command line over serial."""
+        self._log(command, "...")  # response filled in by _read_loop on ACK
         try:
-            r = requests.get(f"{self.base_url}/cmd", params={"c": command},
-                             timeout=ESP32_TIMEOUT)
-            self._log(command, r.text.strip())
+            with self._write_lock:
+                self.ser.write((command + "\n").encode("ascii"))
         except Exception as e:
             self._log(command, f"ERR: {e}")
 
@@ -388,29 +492,30 @@ class ESP32Link:
         self.cmd(f"PITR{speed}")
 
     def differential(self, left_speed, right_speed):
-        """Drive wheels at different speeds for gentle steering.
-        Speeds can be negative (reverse). Clamped to [-80, 80]."""
         self.cmd(f"PIDW{left_speed},{right_speed}")
 
     def stop(self):
         self.cmd("PIX")
 
     def emergency_stop(self):
-        """Stop ALL motors, servos, buzzer — everything."""
         self.cmd("PISTOP")
 
     def pickup(self):
-        """Triggers the full pickup sequence on ESP32 (blocking ~15s)."""
-        try:
-            r = requests.get(f"{self.base_url}/cmd", params={"c": "P"},
-                             timeout=30)
-            self._log("P", r.text.strip())
-        except Exception as e:
-            self._log("P", f"ERR: {e}")
+        """Trigger pickup sequence. Returns immediately — pickup runs as a
+        non-blocking state machine on ESP32. Caller polls sensors['pickup']
+        for 'idle'/'done' to detect completion."""
+        self.cmd("P")
 
     def shutdown(self):
         self._running = False
-        self.stop()
+        try:
+            self.stop()
+        except Exception:
+            pass
+        try:
+            self.ser.close()
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -441,6 +546,11 @@ class Navigator:
         self.verify_count = 0        # frames bottle has been seen during verify
         self.verify_lost  = 0        # frames bottle was NOT seen during verify
         self.approach_lost_count = 0
+        # Mission counters (drive bin-full backstop & sensor sanity check)
+        self.pickup_success_count = 0   # successful pickups this mission
+        self.ir_ever_tripped      = False  # has irProx ever read True since boot?
+        # Watchdog state (sensor freshness + YOLO inference health)
+        self.infer_fail_streak    = 0
 
     def run(self):
         """Main loop — camera + sensors + navigation."""
@@ -495,15 +605,44 @@ class Navigator:
                 frame_area = orig_w * orig_h
 
                 # ── Run detection ─────────────────────────────
+                # Inference is wrapped: a Hailo runtime hiccup, model
+                # load fault, or driver glitch must NOT crash the main
+                # loop and leave the wheels at last-commanded speed.
+                # On a streak of consecutive failures we stop driving.
                 t0 = time.time()
-                bottles, persons = self.manager.infer(
-                    frame, self.conf_thresh, apply_range_filter=False)
+                try:
+                    bottles, persons = self.manager.infer(
+                        frame, self.conf_thresh, apply_range_filter=False)
+                    self.infer_fail_streak = 0
+                except Exception as e:
+                    bottles, persons = [], []
+                    self.infer_fail_streak += 1
+                    print(f"\n  >>> INFER ERROR ({self.infer_fail_streak}/"
+                          f"{INFER_FAIL_LIMIT}): {e}")
+                    if self.infer_fail_streak >= INFER_FAIL_LIMIT and \
+                       self.state not in (State.WAITING, State.STOPPED,
+                                          State.MISSION_COMPLETE,
+                                          State.PICKING_UP):
+                        print("  >>> blind — forcing STOPPED")
+                        self.esp32.emergency_stop()
+                        self.state = State.STOPPED
                 ms = (time.time() - t0) * 1000
 
                 smoothed = self.tracker.update(bottles)
 
                 # ── Get ultrasonic data ───────────────────────
                 us = self.esp32.ultrasonic  # {s1:front, s2:right, s3:back, s4:left}
+
+                # ── Sensor freshness watchdog ─────────────────
+                # If the ESP32 stops streaming JSON (USB unplug, reader
+                # thread hang) we'd be navigating on frozen sensor
+                # values. Force a stop until packets resume.
+                age = self.esp32.sensor_age()
+                if age > SENSOR_STALE_S and self.state not in (
+                        State.WAITING, State.STOPPED, State.MISSION_COMPLETE):
+                    print(f"\n  >>> SENSOR STALE ({age:.1f}s) — forcing STOPPED")
+                    self.esp32.emergency_stop()
+                    self.state = State.STOPPED
 
                 # ── Navigation decision ───────────────────────
                 self._navigate(smoothed, persons, orig_w, orig_h,
@@ -515,7 +654,9 @@ class Navigator:
 
                 # ── Update web stream ────────────────────────
                 model_name = self.manager.active_name
-                update_stream(result, smoothed, persons, model_name, ms, self.state.name, us)
+                bin_full = self.esp32.sensors.get("irProx", False)
+                update_stream(result, smoothed, persons, model_name, ms,
+                              self.state.name, us, bin_full=bin_full)
 
                 # ── FPS counter for stream stats ─────────────
                 self._fps_count = getattr(self, '_fps_count', 0) + 1
@@ -602,6 +743,11 @@ class Navigator:
         if self.state == State.STOPPED:
             return
 
+        # ── Mission complete (bin full): terminal state ───
+        # Stays here until user presses STOP (-> WAITING) and START again.
+        if self.state == State.MISSION_COMPLETE:
+            return
+
         # ── Picking up: wait for sequence to finish ───────
         if self.state == State.PICKING_UP:
             return
@@ -629,10 +775,26 @@ class Navigator:
                     self.esp32.turn_right(SCAN_SPEED)
                 else:
                     self.esp32.turn_left(SCAN_SPEED)
-            else:
+            elif elapsed < 3.4:
+                # Settle: full stop, give the ultrasonic burst time to
+                # take a fresh forward reading. Without this pause we'd
+                # exit AVOIDING based on the value sampled mid-turn,
+                # which lags reality by hundreds of ms.
                 self.esp32.stop()
-                self.state = State.SCANNING
-                self.scan_start = time.time()
+            else:
+                # Re-check front clearance before resuming. If something
+                # is still too close (the obstacle moved with us, or a
+                # new one entered the path during the turn), restart the
+                # avoid cycle instead of charging into it.
+                if us_front < STOP_DIST or us_min_forward < SLOW_DIST:
+                    print(f"\n  >>> AVOIDING re-check failed "
+                          f"(F={us_front} min_fwd={us_min_forward}) "
+                          f"— restarting avoid")
+                    self.avoid_timer = time.time()
+                else:
+                    self.esp32.stop()
+                    self.state = State.SCANNING
+                    self.scan_start = time.time()
             return
 
         # ── PERSON DETECTED → immediate stop (safety first!) ──
@@ -642,16 +804,13 @@ class Navigator:
             p_fill = (pw * ph) / frame_area
             if p_fill > 0.10:  # person visible → stop immediately
                 self.esp32.stop()
-                self.state = State.AVOIDING
-                self.avoid_timer = time.time()
-                print("\n  >>> PERSON DETECTED — stopping for safety")
+                self._enter_avoiding("PERSON DETECTED")
                 return
 
         # ── Emergency stop: front ultrasonic too close ────
         if us_front < STOP_DIST:
             self.esp32.stop()
-            self.state = State.AVOIDING
-            self.avoid_timer = time.time()
+            self._enter_avoiding(f"FRONT < {STOP_DIST}cm")
             return
 
         # ── Ultrasonic: slow zone → steer away gently ────
@@ -820,13 +979,15 @@ class Navigator:
             print("\n  >>> PICKUP SEQUENCE STARTED")
             self.esp32.pickup()
             # Wait for the ESP32 pickup state machine to actually finish.
-            # The HTTP response comes back instantly — the arm is still moving.
-            # Poll /sensor until pickup field returns "idle" or "done".
+            # `pickup()` returns immediately — arm is still moving.
+            # Poll the JSON sensor stream until pickup field is "idle"/"done".
             timeout = time.time() + 35  # 30s ESP32 timeout + 5s margin
+            pickup_ok = False
             while time.time() < timeout:
                 sensor = self.esp32.sensors
                 pu_state = sensor.get("pickup", "idle")
                 if pu_state in ("idle", "done"):
+                    pickup_ok = (pu_state == "done")
                     break
                 time.sleep(0.5)
             else:
@@ -834,12 +995,78 @@ class Navigator:
                 self.esp32.cmd("PA")  # send abort
                 time.sleep(1)
 
-            print("\n  >>> PICKUP DONE — scanning for next bottle")
+            # Only check the bin-full sensor on a successful drop. A timeout
+            # or aborted pickup means no bottle was actually deposited.
+            if pickup_ok:
+                self.pickup_success_count += 1
+
+                # Hard backstop: even if the IR sensor is broken/unplugged
+                # and the bin is genuinely overflowing, stop the mission
+                # rather than let the robot loop forever.
+                if self.pickup_success_count >= MAX_PICKUPS_BACKSTOP:
+                    print(f"\n  >>> BACKSTOP HIT ({MAX_PICKUPS_BACKSTOP} pickups) — "
+                          f"MISSION COMPLETE (IR sensor may be faulty: "
+                          f"ever_tripped={self.ir_ever_tripped})")
+                    self.esp32.stop()
+                    self.esp32.cmd("PISTOP")
+                    self.tracker = DetectionTracker()
+                    self.state = State.MISSION_COMPLETE
+                    return
+
+                if self._is_bin_full():
+                    print("\n  >>> BIN FULL (IR proximity tripped) — MISSION COMPLETE")
+                    self.esp32.stop()
+                    self.esp32.cmd("PISTOP")  # belt-and-braces
+                    self.tracker = DetectionTracker()
+                    self.state = State.MISSION_COMPLETE
+                    return
+
+                # Suspicious: many pickups in and the IR sensor has never
+                # fired even once. Likely unplugged or pointed wrong.
+                if self.pickup_success_count >= 5 and not self.ir_ever_tripped:
+                    print(f"\n  >>> WARNING: {self.pickup_success_count} pickups "
+                          f"and IR sensor has never read true — check E18-D80NK "
+                          f"wiring/aim")
+
+            print(f"\n  >>> PICKUP DONE ({self.pickup_success_count}) — "
+                  f"scanning for next bottle")
             self.tracker = DetectionTracker()  # reset tracker
             self.state = State.SCANNING
             self.scan_start = time.time()
 
         threading.Thread(target=_do_pickup, daemon=True).start()
+
+    def _enter_avoiding(self, reason):
+        """Transition into AVOIDING. Resets stale verify/approach counters
+        so when SCANNING resumes the state machine starts fresh — otherwise
+        a bottle 'confirmed' before the obstacle would still appear confirmed
+        after the avoid maneuver, even though the robot has since rotated."""
+        self.state = State.AVOIDING
+        self.avoid_timer = time.time()
+        self.verify_count = 0
+        self.verify_lost = 0
+        self.approach_lost_count = 0
+        self.esp32.stop()
+        print(f"\n  >>> AVOIDING ({reason})")
+
+    def _is_bin_full(self):
+        """Sample the E18-D80NK IR proximity reading after a settling delay.
+        Conservative: ALL N samples must read true to declare bin full.
+        A single false reading aborts — better to do an extra pickup loop
+        than to end the mission prematurely on a noisy IR sample.
+
+        Side-effect: sets self.ir_ever_tripped if any sample reads true,
+        so a never-tripping sensor can be flagged as likely unplugged."""
+        time.sleep(BIN_SETTLE_DELAY_S)  # let bottle stop bouncing
+        all_true = True
+        for _ in range(BIN_DEBOUNCE_SAMPLES):
+            sample = bool(self.esp32.sensors.get("irProx", False))
+            if sample:
+                self.ir_ever_tripped = True
+            else:
+                all_true = False
+            time.sleep(BIN_DEBOUNCE_PERIOD)
+        return all_true
 
     # ── HUD overlay ───────────────────────────────────────
 
@@ -850,15 +1077,16 @@ class Navigator:
 
         # State badge (top-right)
         state_colors = {
-            State.WAITING:     (0, 165, 255),
-            State.SCANNING:    (255, 255, 0),
-            State.ROAMING:     (0, 255, 0),
-            State.VERIFYING:   (255, 200, 100),
-            State.APPROACHING: (0, 200, 255),
-            State.ALIGNING:    (255, 200, 0),
-            State.PICKING_UP:  (255, 0, 255),
-            State.AVOIDING:    (0, 0, 255),
-            State.STOPPED:     (80, 80, 80),
+            State.WAITING:          (0, 165, 255),
+            State.SCANNING:         (255, 255, 0),
+            State.ROAMING:          (0, 255, 0),
+            State.VERIFYING:        (255, 200, 100),
+            State.APPROACHING:      (0, 200, 255),
+            State.ALIGNING:         (255, 200, 0),
+            State.PICKING_UP:       (255, 0, 255),
+            State.AVOIDING:         (0, 0, 255),
+            State.STOPPED:          (80, 80, 80),
+            State.MISSION_COMPLETE: (0, 215, 255),  # gold (BGR)
         }
         color = state_colors.get(self.state, (255, 255, 255))
         badge = f"[{self.state.name}]"
@@ -960,8 +1188,10 @@ def main():
     parser.add_argument("--model", default="yolov8",
                         choices=["yolov5", "yolov7", "yolov8"],
                         help="YOLO model (default: yolov8)")
-    parser.add_argument("--esp32-ip", default=ESP32_IP,
-                        help=f"ESP32 WiFi IP (default: {ESP32_IP})")
+    parser.add_argument("--serial-port", default=None,
+                        help="ESP32 USB serial device (default: auto-detect "
+                             "/dev/serial/by-id/usb-*ESP*, falls back to "
+                             "/dev/ttyUSB0)")
     parser.add_argument("--conf", type=float, default=CONF_THRESHOLD,
                         help=f"Confidence threshold (default: {CONF_THRESHOLD})")
     parser.add_argument("--no-show", action="store_true",
@@ -984,15 +1214,21 @@ def main():
     stream_thread.start()
     print(f"  Stream: http://0.0.0.0:5000/video_feed")
 
-    # Connect to ESP32
-    print(f"  Connecting to ESP32 at {args.esp32_ip}...")
-    esp32 = ESP32Link(ip=args.esp32_ip)
-    time.sleep(0.5)
+    # Connect to ESP32 over USB serial
+    port = args.serial_port or _autodetect_serial_port()
+    if port is None:
+        print(f"  ERROR: No ESP32 serial port found.")
+        print(f"  Plug in USB cable and check `ls /dev/serial/by-id/`")
+        print(f"  Or pass --serial-port /dev/ttyUSB0")
+        return
+    print(f"  Connecting to ESP32 on {port} @ {SERIAL_BAUD} baud...")
+    esp32 = ESP32SerialLink(port=port)
+    time.sleep(0.5)  # let first JSON packet arrive
     us = esp32.ultrasonic
     if any(v < 999 for v in us.values()):
         print(f"  ESP32 connected! Ultrasonic: F={us['s1']}cm R={us['s2']}cm B={us['s3']}cm L={us['s4']}cm")
     else:
-        print(f"  WARNING: ESP32 not responding — running camera-only mode")
+        print(f"  WARNING: ESP32 not streaming sensor data yet — first packet may be delayed")
 
     # Load YOLO models
     print(f"  Loading YOLO models...")

@@ -6,7 +6,7 @@ Autonomous PET bottle collection robot using dual processors:
 - **ESP32**: Motor control, sensors, WiFi AP, LCD — test firmware in `esp32_test/esp32_test.ino`
 - **Raspberry Pi 5 + Hailo-8 NPU**: YOLO vision + navigation brain — `camera.py`, `navigator.py`
 
-Communication: Pi connects to ESP32 WiFi AP (`PetBottle_Robot` / `petbottle123` / `192.168.4.1`) and sends HTTP commands. Pi IP on ESP32 network: `192.168.4.4`.
+Communication: Pi <-> ESP32 is **USB serial** (115200 baud, line-based). The Pi auto-detects the port (`/dev/serial/by-id/usb-*ESP*`, falls back to `/dev/ttyUSB0`). The ESP32 still hosts a WiFi AP (`PetBottle_Robot` / `petbottle123` / `192.168.4.1`) for OTA flashing and the web test dashboard, but the navigator does NOT use it for control.
 
 ## Build & Flash
 
@@ -75,6 +75,7 @@ Connect to PetBottle_Robot WiFi, open `http://192.168.4.1/ota`, upload `.bin` fi
 | Ultrasonic TRIG (shared) | 12 |
 | Ultrasonic S1-Front/S2-Right/S3-Back/S4-Left | 33 / 35 / 32 / 34 |
 | Limit Switch 1 / 2 | 36 / 39 |
+| E18-D80NK IR proximity (bin-full sensor) | 15 |
 
 **Note:** GPIO 36 and 39 are input-only with no internal pull-up. External 10kΩ pull-up resistors to 3.3V are required for the limit switches.
 
@@ -88,7 +89,7 @@ ESP32 LEDC channels share hardware timers in pairs: ch0/1, ch2/3, ch4/5, ch6/7. 
 
 Never assign channels out-of-order or across timer pairs for different motors.
 
-## ESP32 HTTP API
+## ESP32 HTTP API (debug / OTA only — navigator does NOT use this)
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
@@ -97,6 +98,16 @@ Never assign channels out-of-order or across timer pairs for different motors.
 | `/sensor` | GET | JSON: ultrasonic, limits, speeds |
 | `/cmdlog` | GET | JSON: recent Pi-ESP32 command log |
 | `/ota` | GET/POST | Firmware upload page |
+
+## ESP32 Serial Protocol (Pi <-> ESP32, primary control path)
+
+Line-based ASCII at 115200 baud. ESP32 accepts the same `PI*`-prefixed commands the HTTP API takes (one per line, terminated by `\n` or `\r`). After each command the ESP32 emits a single `OK <cmd>` or `ERR <cmd>` ACK line.
+
+Every 100 ms the ESP32 also pushes one JSON sensor packet on the same serial line — same schema as the HTTP `/sensor` endpoint:
+```
+{"mode":"menu","ultrasonic":{"s1":120,...},"limits":{...},"pickup":"idle",...}
+```
+The Pi's parser tolerates unrecognized lines (firmware `Serial.print` debug output is silently ignored) — only lines starting with `{`, `OK `, or `ERR ` are interpreted.
 
 ### Pi Direct Commands (bypass test-UI mode system)
 
@@ -116,7 +127,11 @@ The navigator sends these `PI`-prefixed commands so it always has motor control 
 
 ## Navigator State Machine
 
-`WAITING` → user starts → `SCANNING` → bottle detected → `VERIFYING` → confirmed → `APPROACHING` → centered & close → `ALIGNING` → aligned → `PICKING_UP` → done → `SCANNING`
+`WAITING` → user starts → `SCANNING` → bottle detected → `VERIFYING` → confirmed → `APPROACHING` → centered & close → `ALIGNING` → aligned → `PICKING_UP` → done → check bin
+
+After each successful `PICKING_UP`: navigator waits ~1.5 s for the dropped bottle to settle, then samples the E18-D80NK IR proximity reading (`irProx` field in the JSON sensor stream). If `irProx=true` for N consecutive reads → `MISSION_COMPLETE` (terminal). Else → back to `SCANNING`.
+
+`MISSION_COMPLETE` is sticky — operator must press STOP (→ `WAITING`) and START to begin a new mission. This forces a deliberate "bin emptied" confirmation.
 
 At any point: ultrasonic < 60 cm → `AVOIDING` (back up + turn) → `SCANNING`
 

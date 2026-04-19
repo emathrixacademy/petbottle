@@ -129,10 +129,10 @@ enum TestMode {
 };
 
 TestMode currentMode = MODE_MENU;
-int wheelSpeed = 60;     // default drive speed
-int turnSpeed  = 60;     // default turn speed, max 80
-int armSpeed   = 127;    // default 50% PWM (safer for hardware)
-int swingSpeed = 120;
+int wheelSpeed = 0;      // default drive speed — 0 for safety; nudge up via web UI
+int turnSpeed  = 0;      // default turn speed (max 80) — 0 for safety
+int armSpeed   = 0;      // default arm PWM — 0 for safety; pickup overrides as needed
+int swingSpeed = 0;      // default swing PWM — 0 for safety
 
 // --- Manual arm motion safety profile ---
 // DOWN: pulsed (stop-and-go) at 50% PWM until BOTTOM limit (SW2) trips.
@@ -218,20 +218,32 @@ long readDistance(int echoPin) {
   return duration / 58;
 }
 
+// Hard PWM cap on wheels — BTS7960 + the chosen geared motors burn out
+// above ~80/255 duty under load. Every wheel-control path is funnelled
+// through setLeft/setRight, so clamping here is the single chokepoint
+// that keeps the cap honest no matter who calls it (PI* commands from
+// the Pi, web-UI MODE_WHEELS buttons, future code, etc.).
+#define WHEEL_PWM_MAX 80
+
+// Last time a Pi command arrived (any line over USB serial). Wheel
+// watchdog (in loop()) zeros wheels if this gets stale, so a cable
+// drop doesn't leave the robot rolling on the last commanded speed.
+volatile unsigned long lastPiCmdMs = 0;
+
 // Left wheel: normal polarity
 void setLeft(int spd) {
   digitalWrite(L_EN, HIGH);
-  if      (spd > 0) { ledcWrite(L_FWD_CH, 0);              ledcWrite(L_REV_CH, constrain(spd, 0, 255));  }
-  else if (spd < 0) { ledcWrite(L_FWD_CH, constrain(-spd, 0, 255)); ledcWrite(L_REV_CH, 0);             }
-  else              { ledcWrite(L_FWD_CH, 0);              ledcWrite(L_REV_CH, 0);                       }
+  if      (spd > 0) { ledcWrite(L_FWD_CH, 0);                              ledcWrite(L_REV_CH, constrain(spd,  0, WHEEL_PWM_MAX)); }
+  else if (spd < 0) { ledcWrite(L_FWD_CH, constrain(-spd, 0, WHEEL_PWM_MAX)); ledcWrite(L_REV_CH, 0);                              }
+  else              { ledcWrite(L_FWD_CH, 0);                              ledcWrite(L_REV_CH, 0);                                  }
 }
 
 // Right wheel: inverted polarity (motor wired backwards)
 void setRight(int spd) {
   digitalWrite(R_EN, HIGH);
-  if      (spd > 0) { ledcWrite(R_FWD_CH, constrain(spd, 0, 255));  ledcWrite(R_REV_CH, 0);             }
-  else if (spd < 0) { ledcWrite(R_FWD_CH, 0);              ledcWrite(R_REV_CH, constrain(-spd, 0, 255)); }
-  else              { ledcWrite(R_FWD_CH, 0);              ledcWrite(R_REV_CH, 0);                       }
+  if      (spd > 0) { ledcWrite(R_FWD_CH, constrain(spd,  0, WHEEL_PWM_MAX)); ledcWrite(R_REV_CH, 0);                              }
+  else if (spd < 0) { ledcWrite(R_FWD_CH, 0);                              ledcWrite(R_REV_CH, constrain(-spd, 0, WHEEL_PWM_MAX)); }
+  else              { ledcWrite(R_FWD_CH, 0);                              ledcWrite(R_REV_CH, 0);                                  }
 }
 
 void stopWheels() {
@@ -287,14 +299,19 @@ void setArm(int dir) {
 
 void stopArm() { setArm(0); }
 
-// Swing drive motor (L298N #2) — rotates Pi+Camera platform
+// Swing drive motor (L298N #2) — rotates Pi+Camera platform.
+// PWM clamped here so the web UI manual mode (which exposes a 0-255
+// slider) can't burn the gear-train. 150/255 ≈ 60% — plenty for the
+// camera platform's mass; full 255 was overkill and risked stripping.
+#define SWING_PWM_MAX 150
 void setSwing(int dir) {
+  int spd = constrain(swingSpeed, 0, SWING_PWM_MAX);
   if (dir > 0) {
     digitalWrite(SWING_IN1, HIGH); digitalWrite(SWING_IN2, LOW);
-    ledcWrite(SWING_CH, swingSpeed);
+    ledcWrite(SWING_CH, spd);
   } else if (dir < 0) {
     digitalWrite(SWING_IN1, LOW); digitalWrite(SWING_IN2, HIGH);
-    ledcWrite(SWING_CH, swingSpeed);
+    ledcWrite(SWING_CH, spd);
   } else {
     digitalWrite(SWING_IN1, LOW); digitalWrite(SWING_IN2, LOW);
     ledcWrite(SWING_CH, 0);
@@ -505,22 +522,18 @@ void executeCmd(String cmd) {
 
     if (pi.startsWith("FW")) {
       int spd = constrain(pi.substring(2).toInt(), 0, 80);
-      if (spd == 0) spd = wheelSpeed;
       setLeft(spd); setRight(spd);
       Serial.printf("PI: FORWARD %d\n", spd);
     } else if (pi.startsWith("BW")) {
       int spd = constrain(pi.substring(2).toInt(), 0, 80);
-      if (spd == 0) spd = wheelSpeed;
       setLeft(-spd); setRight(-spd);
       Serial.printf("PI: BACKWARD %d\n", spd);
     } else if (pi.startsWith("TL")) {
       int spd = constrain(pi.substring(2).toInt(), 0, 80);
-      if (spd == 0) spd = turnSpeed;
       setLeft(-spd); setRight(spd);
       Serial.printf("PI: TURN LEFT %d\n", spd);
     } else if (pi.startsWith("TR")) {
       int spd = constrain(pi.substring(2).toInt(), 0, 80);
-      if (spd == 0) spd = turnSpeed;
       setLeft(spd); setRight(-spd);
       Serial.printf("PI: TURN RIGHT %d\n", spd);
     } else if (pi.startsWith("DW")) {
@@ -797,13 +810,31 @@ void printMenu() {
 
 // ==================== WEB HANDLERS ====================
 
+// While the Pi is actively driving over USB serial, lock the web /cmd
+// endpoint so a browser tab on the dashboard can't override the
+// navigator's commands. PISTOP and PIX are always allowed through as
+// emergency overrides — operator must always have a kill switch.
+#define AUTO_LOCK_MS 5000
+
 void handleWebCmd() {
   if (server.hasArg("c")) {
     String cmd = server.arg("c");
-    // Detect source: Pi navigator sends from its IP, browser from phone/laptop
     String source = server.client().remoteIP().toString();
-    bool isPi = (source != "192.168.4.1"); // anything not the ESP itself
-    String srcLabel = isPi ? "Pi(" + source + ")" : "Web";
+    String srcLabel = "Web(" + source + ")";
+
+    bool piActive = (lastPiCmdMs > 0) &&
+                    (millis() - lastPiCmdMs < AUTO_LOCK_MS);
+    bool isEmergency = (cmd == "PISTOP" || cmd == "PIX" || cmd == "PA");
+    if (piActive && !isEmergency) {
+      Serial.printf("Web CMD [%s] LOCKED (Pi active): %s\n",
+                    srcLabel.c_str(), cmd.c_str());
+      logCmd(srcLabel, cmd, "LOCKED");
+      server.send(423, "text/plain",
+                  "LOCKED: Pi navigator is driving. Use /stop on the "
+                  "navigator UI (port 5000), or send PISTOP/PIX/PA.");
+      return;
+    }
+
     Serial.printf("Web CMD [%s]: %s\n", srcLabel.c_str(), cmd.c_str());
     executeCmd(cmd);
     String result = "OK: " + cmd;
@@ -1663,16 +1694,83 @@ void loop() {
     }
   }
 
-  // Serial input
-  if (Serial.available()) {
-    String cmd = "";
-    while (Serial.available()) {
-      char c = Serial.read();
-      if (c == '\n' || c == '\r') break;
-      cmd += c;
+  // Serial input — line-buffered command parser for Pi (USB).
+  // Also kept compatible with Arduino IDE Serial Monitor (LF/CR/both).
+  // After each complete command, we emit "OK <cmd>" or "ERR <cmd>" so
+  // the Pi's parser can correlate responses with its sent commands.
+  static String serialBuf;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialBuf.length() > 0) {
+        String cmd = serialBuf;
+        serialBuf = "";
+        lastPiCmdMs = millis();  // pet the wheel watchdog
+        executeCmd(cmd);
+        // Single-line ACK for the Pi parser. Debug prints from
+        // executeCmd remain (the Pi parser ignores any line that
+        // doesn't start with '{', 'OK ', or 'ERR ').
+        Serial.print("OK ");
+        Serial.println(cmd);
+      }
+    } else {
+      serialBuf += c;
+      if (serialBuf.length() > 64) serialBuf = "";  // overflow guard
     }
-    if (cmd.length() > 0) {
-      executeCmd(cmd);
+  }
+
+  // ── Wheel watchdog ───────────────────────────────────────
+  // If the Pi stops sending commands (USB unplug, navigator crash,
+  // serial reader hang), we MUST NOT keep executing the last wheel
+  // command. Force wheels to zero after WHEEL_WATCHDOG_MS of silence.
+  // Arm/swing/servos are intentionally NOT watchdogged here — the
+  // pickup state machine has its own 30 s timeout, and stopping a
+  // mid-pickup arm could leave it dangling. Wheels are the only thing
+  // that can drive the robot into something while unattended.
+  #define WHEEL_WATCHDOG_MS 1000
+  static bool watchdogTripped = false;
+  if (lastPiCmdMs > 0 && (millis() - lastPiCmdMs) > WHEEL_WATCHDOG_MS) {
+    if (!watchdogTripped) {
+      stopWheels();
+      Serial.println("WATCHDOG: no Pi command for >1s — wheels stopped");
+      watchdogTripped = true;
     }
+  } else if (lastPiCmdMs > 0) {
+    watchdogTripped = false;  // re-armed when commands resume
+  }
+
+  // JSON sensor push at 10 Hz — replaces the old HTTP /sensor poll.
+  // Same schema as handleWebSensor() so existing Pi parsing logic works.
+  static unsigned long lastJsonPush = 0;
+  if (millis() - lastJsonPush >= 100) {
+    lastJsonPush = millis();
+    Serial.print("{\"mode\":\"");
+    Serial.print(currentMode == MODE_MENU ? "menu" :
+                 currentMode == MODE_ULTRASONIC ? "ultrasonic" :
+                 currentMode == MODE_WHEELS ? "wheels" :
+                 currentMode == MODE_ARM ? "arm" :
+                 currentMode == MODE_SWING ? "swing" :
+                 currentMode == MODE_SERVOS ? "servos" :
+                 currentMode == MODE_BUZZER ? "buzzer" : "lcd");
+    Serial.print("\",\"ultrasonic\":{");
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      Serial.printf("\"s%d\":%ld%s", i+1, cachedDist[i],
+                    i < NUM_SENSORS - 1 ? "," : "");
+    }
+    Serial.print("},\"limits\":{\"sw1\":");
+    Serial.print(digitalRead(LIMIT_1) == LOW ? "true" : "false");
+    Serial.print(",\"sw2\":");
+    Serial.print(digitalRead(LIMIT_2) == LOW ? "true" : "false");
+    Serial.print("},\"irProx\":");
+    Serial.print(digitalRead(IR_PROX) == LOW ? "true" : "false");
+    Serial.printf(",\"wheelSpeed\":%d,\"armSpeed\":%d,\"swingSpeed\":%d",
+                  wheelSpeed, armSpeed, swingSpeed);
+    Serial.print(",\"pickup\":\"");
+    Serial.print(puState == PU_IDLE ? "idle" :
+                 puState == PU_LOWERING ? "lowering" :
+                 puState == PU_SCOOPING ? "scooping" :
+                 puState == PU_LIFTING ? "lifting" :
+                 puState == PU_DROPPING ? "dropping" : "done");
+    Serial.println("\"}");
   }
 }
