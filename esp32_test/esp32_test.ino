@@ -28,6 +28,10 @@
 #include <Update.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
 // ==================== WiFi AP ====================
 
@@ -94,6 +98,78 @@ const int NUM_SENSORS = 4;
 
 // --- Buzzer ---
 #define BUZZER  3
+
+// Forward declarations for BLE callbacks
+void executeCmd(String cmd);
+volatile unsigned long lastPiCmdMs = 0;
+
+// ==================== BLE UART (Nordic UART Service) ====================
+
+#define BLE_DEVICE_NAME  "PetBottle_Robot"
+#define SERVICE_UUID     "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define CHAR_RX_UUID     "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+#define CHAR_TX_UUID     "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
+BLEServer*         pServer = nullptr;
+BLECharacteristic* pTxChar = nullptr;
+bool bleConnected = false;
+String bleCmdBuf;
+
+void bleSend(const String& s) {
+  if (bleConnected && pTxChar) {
+    const int MTU_PAYLOAD = 200;
+    int len = s.length();
+    int offset = 0;
+    while (offset < len) {
+      int chunk = min(MTU_PAYLOAD, len - offset);
+      pTxChar->setValue((uint8_t*)(s.c_str() + offset), chunk);
+      pTxChar->notify();
+      offset += chunk;
+      if (offset < len) delay(10);
+    }
+  }
+}
+
+class BLEServerCB : public BLEServerCallbacks {
+  void onConnect(BLEServer* s) override {
+    bleConnected = true;
+    Serial.println("BLE: Pi connected");
+  }
+  void onDisconnect(BLEServer* s) override {
+    bleConnected = false;
+    Serial.println("BLE: Pi disconnected — restarting advertising");
+    delay(300);
+    s->getAdvertising()->start();
+  }
+};
+
+class BLERxCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pChar) override {
+    std::string rx = pChar->getValue();
+    for (char c : rx) {
+      if (c == '\n' || c == '\r') {
+        if (bleCmdBuf.length() > 0) {
+          lastPiCmdMs = millis();
+          executeCmd(bleCmdBuf);
+          bleSend("OK " + bleCmdBuf + "\n");
+          Serial.print("BLE cmd: "); Serial.println(bleCmdBuf);
+          bleCmdBuf = "";
+        }
+      } else {
+        bleCmdBuf += c;
+        if (bleCmdBuf.length() > 64) bleCmdBuf = "";
+      }
+    }
+    // Handle commands without trailing newline
+    if (bleCmdBuf.length() > 0) {
+      lastPiCmdMs = millis();
+      executeCmd(bleCmdBuf);
+      bleSend("OK " + bleCmdBuf + "\n");
+      Serial.print("BLE cmd: "); Serial.println(bleCmdBuf);
+      bleCmdBuf = "";
+    }
+  }
+};
 
 // ==================== CONSTANTS ====================
 
@@ -203,8 +279,6 @@ void handleWebSensor();
 void handleWebCmdLog();
 void handleOtaPage();
 void handleOtaUpload();
-void executeCmd(String cmd);
-
 // ==================== HELPER FUNCTIONS ====================
 
 long readDistance(int echoPin) {
@@ -224,11 +298,6 @@ long readDistance(int echoPin) {
 // that keeps the cap honest no matter who calls it (PI* commands from
 // the Pi, web-UI MODE_WHEELS buttons, future code, etc.).
 #define WHEEL_PWM_MAX 80
-
-// Last time a Pi command arrived (any line over USB serial). Wheel
-// watchdog (in loop()) zeros wheels if this gets stale, so a cable
-// drop doesn't leave the robot rolling on the last commanded speed.
-volatile unsigned long lastPiCmdMs = 0;
 
 // Left wheel: normal polarity
 void setLeft(int spd) {
@@ -1601,6 +1670,23 @@ void setup() {
   }, handleOtaUpload);
   server.begin();
 
+  // --- BLE UART ---
+  BLEDevice::init(BLE_DEVICE_NAME);
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new BLEServerCB());
+  BLEService* pService = pServer->createService(SERVICE_UUID);
+  pTxChar = pService->createCharacteristic(CHAR_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  pTxChar->addDescriptor(new BLE2902());
+  BLECharacteristic* pRxChar = pService->createCharacteristic(CHAR_RX_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  pRxChar->setCallbacks(new BLERxCB());
+  pService->start();
+  BLEAdvertising* pAdv = BLEDevice::getAdvertising();
+  pAdv->addServiceUUID(SERVICE_UUID);
+  pAdv->setScanResponse(true);
+  pAdv->setMinPreferred(0x06);
+  pAdv->start();
+  Serial.println("BLE UART started — advertising as " BLE_DEVICE_NAME);
+
   // --- All off ---
   stopAll();
 
@@ -1610,7 +1696,7 @@ void setup() {
   Serial.printf("  WiFi: %s / %s\n", AP_SSID, AP_PASS);
   Serial.printf("  Web:  http://%s\n", WiFi.softAPIP().toString().c_str());
   Serial.printf("  OTA:  http://%s/ota\n", WiFi.softAPIP().toString().c_str());
-  Serial.println("  Serial: 115200 baud");
+  Serial.println("  BLE:  " BLE_DEVICE_NAME);
   Serial.println("=========================================");
   printMenu();
 }
@@ -1694,39 +1780,27 @@ void loop() {
     }
   }
 
-  // Serial input — line-buffered command parser for Pi (USB).
-  // Also kept compatible with Arduino IDE Serial Monitor (LF/CR/both).
-  // After each complete command, we emit "OK <cmd>" or "ERR <cmd>" so
-  // the Pi's parser can correlate responses with its sent commands.
+  // Serial input — debug only (Arduino IDE Serial Monitor).
+  // Pi commands now come via BLE UART, not USB serial.
   static String serialBuf;
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       if (serialBuf.length() > 0) {
-        String cmd = serialBuf;
-        serialBuf = "";
-        lastPiCmdMs = millis();  // pet the wheel watchdog
-        executeCmd(cmd);
-        // Single-line ACK for the Pi parser. Debug prints from
-        // executeCmd remain (the Pi parser ignores any line that
-        // doesn't start with '{', 'OK ', or 'ERR ').
+        executeCmd(serialBuf);
         Serial.print("OK ");
-        Serial.println(cmd);
+        Serial.println(serialBuf);
+        serialBuf = "";
       }
     } else {
       serialBuf += c;
-      if (serialBuf.length() > 64) serialBuf = "";  // overflow guard
+      if (serialBuf.length() > 64) serialBuf = "";
     }
   }
 
   // ── Wheel watchdog ───────────────────────────────────────
-  // If the Pi stops sending commands (USB unplug, navigator crash,
-  // serial reader hang), we MUST NOT keep executing the last wheel
-  // command. Force wheels to zero after WHEEL_WATCHDOG_MS of silence.
-  // Arm/swing/servos are intentionally NOT watchdogged here — the
-  // pickup state machine has its own 30 s timeout, and stopping a
-  // mid-pickup arm could leave it dangling. Wheels are the only thing
-  // that can drive the robot into something while unattended.
+  // If the Pi stops sending BLE commands (disconnect, navigator crash),
+  // force wheels to zero after WHEEL_WATCHDOG_MS of silence.
   #define WHEEL_WATCHDOG_MS 1000
   static bool watchdogTripped = false;
   if (lastPiCmdMs > 0 && (millis() - lastPiCmdMs) > WHEEL_WATCHDOG_MS) {
@@ -1739,38 +1813,40 @@ void loop() {
     watchdogTripped = false;  // re-armed when commands resume
   }
 
-  // JSON sensor push at 10 Hz — replaces the old HTTP /sensor poll.
-  // Same schema as handleWebSensor() so existing Pi parsing logic works.
+  // JSON sensor push over BLE at 5 Hz (200ms interval).
+  // Same schema as handleWebSensor() so Pi parsing logic works.
   static unsigned long lastJsonPush = 0;
-  if (millis() - lastJsonPush >= 100) {
+  if (bleConnected && millis() - lastJsonPush >= 200) {
     lastJsonPush = millis();
-    Serial.print("{\"mode\":\"");
-    Serial.print(currentMode == MODE_MENU ? "menu" :
-                 currentMode == MODE_ULTRASONIC ? "ultrasonic" :
-                 currentMode == MODE_WHEELS ? "wheels" :
-                 currentMode == MODE_ARM ? "arm" :
-                 currentMode == MODE_SWING ? "swing" :
-                 currentMode == MODE_SERVOS ? "servos" :
-                 currentMode == MODE_BUZZER ? "buzzer" : "lcd");
-    Serial.print("\",\"ultrasonic\":{");
+    String json = "{\"mode\":\"";
+    json += (currentMode == MODE_MENU ? "menu" :
+             currentMode == MODE_ULTRASONIC ? "ultrasonic" :
+             currentMode == MODE_WHEELS ? "wheels" :
+             currentMode == MODE_ARM ? "arm" :
+             currentMode == MODE_SWING ? "swing" :
+             currentMode == MODE_SERVOS ? "servos" :
+             currentMode == MODE_BUZZER ? "buzzer" : "lcd");
+    json += "\",\"ultrasonic\":{";
     for (int i = 0; i < NUM_SENSORS; i++) {
-      Serial.printf("\"s%d\":%ld%s", i+1, cachedDist[i],
-                    i < NUM_SENSORS - 1 ? "," : "");
+      json += "\"s" + String(i+1) + "\":" + String(cachedDist[i]);
+      if (i < NUM_SENSORS - 1) json += ",";
     }
-    Serial.print("},\"limits\":{\"sw1\":");
-    Serial.print(digitalRead(LIMIT_1) == LOW ? "true" : "false");
-    Serial.print(",\"sw2\":");
-    Serial.print(digitalRead(LIMIT_2) == LOW ? "true" : "false");
-    Serial.print("},\"irProx\":");
-    Serial.print(digitalRead(IR_PROX) == LOW ? "true" : "false");
-    Serial.printf(",\"wheelSpeed\":%d,\"armSpeed\":%d,\"swingSpeed\":%d",
-                  wheelSpeed, armSpeed, swingSpeed);
-    Serial.print(",\"pickup\":\"");
-    Serial.print(puState == PU_IDLE ? "idle" :
-                 puState == PU_LOWERING ? "lowering" :
-                 puState == PU_SCOOPING ? "scooping" :
-                 puState == PU_LIFTING ? "lifting" :
-                 puState == PU_DROPPING ? "dropping" : "done");
-    Serial.println("\"}");
+    json += "},\"limits\":{\"sw1\":";
+    json += (digitalRead(LIMIT_1) == LOW ? "true" : "false");
+    json += ",\"sw2\":";
+    json += (digitalRead(LIMIT_2) == LOW ? "true" : "false");
+    json += "},\"irProx\":";
+    json += (digitalRead(IR_PROX) == LOW ? "true" : "false");
+    json += ",\"wheelSpeed\":" + String(wheelSpeed);
+    json += ",\"armSpeed\":" + String(armSpeed);
+    json += ",\"swingSpeed\":" + String(swingSpeed);
+    json += ",\"pickup\":\"";
+    json += (puState == PU_IDLE ? "idle" :
+             puState == PU_LOWERING ? "lowering" :
+             puState == PU_SCOOPING ? "scooping" :
+             puState == PU_LIFTING ? "lifting" :
+             puState == PU_DROPPING ? "dropping" : "done");
+    json += "\"}\n";
+    bleSend(json);
   }
 }

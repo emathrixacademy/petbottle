@@ -11,20 +11,20 @@ The robot continuously:
   4. Triggers the pickup sequence on the ESP32
   5. Resumes roaming
 
-Transport: Pi <-> ESP32 is USB serial (115200 baud). ESP32's WiFi AP is
-still up for OTA / web debug, but the navigator does NOT use it.
+Transport: Pi <-> ESP32 is BLE UART (Nordic UART Service). ESP32's WiFi AP
+is still up for OTA / web debug, but the navigator does NOT use it.
 
 Usage:
-  python3 navigator.py                    # default (YOLOv8, auto-detect serial)
+  python3 navigator.py                    # default (YOLOv8, auto-scan BLE)
   python3 navigator.py --model yolov8     # default model
-  python3 navigator.py --serial-port /dev/ttyUSB0
+  python3 navigator.py --ble-address AA:BB:CC:DD:EE:FF
   python3 navigator.py --no-show          # headless
 """
 
 import cv2
 import numpy as np
 import argparse
-import glob
+import asyncio
 import time
 import threading
 import json
@@ -32,7 +32,7 @@ from pathlib import Path
 from enum import Enum, auto
 from flask import Flask, Response, jsonify, request
 
-import serial  # pyserial — install on Pi: sudo apt install python3-serial
+from bleak import BleakClient, BleakScanner  # pip install bleak
 
 # Import detection system from camera.py
 from camera import (
@@ -53,19 +53,10 @@ from hailo_platform import (
 # Configuration
 # ══════════════════════════════════════════════════════════════
 
-SERIAL_BAUD     = 115200        # ESP32 USB serial baud
-SERIAL_TIMEOUT  = 0.1           # serial read timeout (seconds)
-# ESP32 dev boards usually expose either CH340/CP2102 (ttyUSB*) or
-# native USB (ttyACM*). Auto-detect picks the first match in /dev/serial/by-id.
-SERIAL_PORT_GLOBS = [
-    "/dev/serial/by-id/usb-*CP210*",
-    "/dev/serial/by-id/usb-*CH340*",
-    "/dev/serial/by-id/usb-*Silicon_Labs*",
-    "/dev/serial/by-id/usb-*Espressif*",
-    "/dev/serial/by-id/usb-*ESP32*",
-    "/dev/ttyUSB0",
-    "/dev/ttyACM0",
-]
+BLE_DEVICE_NAME = "PetBottle_Robot"
+BLE_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+BLE_RX_UUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # write to ESP32
+BLE_TX_UUID      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # notify from ESP32
 
 # Obstacle avoidance thresholds (cm)
 # Robot is ~100cm long x 30cm wide — sensors are at the front
@@ -340,86 +331,98 @@ INFER_FAIL_LIMIT = 3
 
 
 # ══════════════════════════════════════════════════════════════
-# ESP32 Communication — USB serial transport
+# ESP32 Communication — BLE UART transport
 # ══════════════════════════════════════════════════════════════
 
-def _autodetect_serial_port():
-    """Return the first matching ESP32 serial device, or None."""
-    for pattern in SERIAL_PORT_GLOBS:
-        matches = sorted(glob.glob(pattern))
-        if matches:
-            return matches[0]
-    return None
+class ESP32BLELink:
+    """Talks to the ESP32 over BLE UART (Nordic UART Service).
+    Same PI-prefixed command set — only the transport changed from USB serial.
+    ESP32 pushes JSON sensor packets via BLE notify; we parse those
+    in the notification callback.
 
+    The parser ignores any line that doesn't start with '{', 'OK ', or
+    'ERR ' — firmware debug output is silently dropped."""
 
-class ESP32SerialLink:
-    """Talks to the ESP32 over USB serial (115200 baud, line-based).
-    Same PI-prefixed command set as the old HTTP link — only the transport
-    changed. ESP32 pushes a JSON sensor packet every 100ms; we parse those
-    in a background reader thread.
+    MAX_LOG = 20
 
-    The Pi parser ignores any line that doesn't start with '{', 'OK ', or
-    'ERR ' — so all of the firmware's existing Serial.print debug output
-    just gets logged as debug without breaking the protocol."""
-
-    MAX_LOG = 20  # keep last 20 command/response entries
-
-    def __init__(self, port=None):
-        if port is None:
-            port = _autodetect_serial_port()
-        if port is None:
-            raise RuntimeError(
-                "No ESP32 serial port found. Plug in USB and try "
-                "--serial-port /dev/ttyUSB0"
-            )
-        self.port = port
-        self.ser = serial.Serial(port, SERIAL_BAUD, timeout=SERIAL_TIMEOUT)
-        time.sleep(2.0)  # ESP32 auto-resets on USB open; wait for boot
-        self.ser.reset_input_buffer()
-
+    def __init__(self, address=None):
+        self.address = address
         self.sensor_data = {}
-        self._sensor_data_ts = 0.0  # monotonic-ish stamp of last JSON packet
-        self.cmd_log = []           # list of (timestamp, command, response)
-        self._last_cmd = None       # avoid logging duplicate consecutive commands
+        self._sensor_data_ts = 0.0
+        self.cmd_log = []
+        self._last_cmd = None
         self._lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._running = True
-        self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._reader_thread.start()
+        self._client = None
+        self._loop = None
+        self._rx_buffer = ""
+        self._connected = threading.Event()
+        self._ble_thread = threading.Thread(target=self._run_ble, daemon=True)
+        self._ble_thread.start()
+        if not self._connected.wait(timeout=15):
+            raise RuntimeError(
+                f"Could not connect to BLE device '{BLE_DEVICE_NAME}'. "
+                f"Make sure ESP32 is powered and in range."
+            )
 
-    def _read_loop(self):
-        """Background reader: parses incoming serial lines into sensor_data
-        and command-response log."""
+    def _run_ble(self):
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self._ble_main())
+
+    async def _ble_main(self):
         while self._running:
             try:
-                raw = self.ser.readline()
-                if not raw:
-                    continue
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                if line.startswith("{"):
-                    # JSON sensor packet
-                    try:
-                        data = json.loads(line)
-                        with self._lock:
-                            self.sensor_data = data
-                            self._sensor_data_ts = time.time()
-                    except json.JSONDecodeError:
-                        pass
-                elif line.startswith("OK ") or line.startswith("ERR "):
-                    # Command ACK — attach to most recent log entry
+                if self.address is None:
+                    print(f"  Scanning for BLE device '{BLE_DEVICE_NAME}'...")
+                    device = await BleakScanner.find_device_by_name(
+                        BLE_DEVICE_NAME, timeout=10.0
+                    )
+                    if device is None:
+                        print(f"  BLE device not found, retrying...")
+                        await asyncio.sleep(2)
+                        continue
+                    self.address = device.address
+                    print(f"  Found ESP32 at {self.address}")
+
+                async with BleakClient(self.address) as client:
+                    self._client = client
+                    self._connected.set()
+                    print(f"  BLE connected to {self.address}")
+                    await client.start_notify(BLE_TX_UUID, self._on_notify)
+                    while self._running and client.is_connected:
+                        await asyncio.sleep(0.1)
+                    await client.stop_notify(BLE_TX_UUID)
+            except Exception as e:
+                print(f"  BLE connection error: {e}, reconnecting...")
+                self._client = None
+                self._connected.clear()
+                await asyncio.sleep(2)
+
+    def _on_notify(self, sender, data: bytearray):
+        text = data.decode("utf-8", errors="replace")
+        self._rx_buffer += text
+        while "\n" in self._rx_buffer:
+            line, self._rx_buffer = self._rx_buffer.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("{"):
+                try:
+                    parsed = json.loads(line)
                     with self._lock:
-                        if self.cmd_log:
-                            ts, cmd, _ = self.cmd_log[-1]
-                            self.cmd_log[-1] = (ts, cmd, line.split(" ", 1)[0])
-                # Anything else is firmware debug output — silently dropped.
-            except Exception:
-                # Don't let a parse error kill the reader
-                time.sleep(0.05)
+                        self.sensor_data = parsed
+                        self._sensor_data_ts = time.time()
+                except json.JSONDecodeError:
+                    pass
+            elif line.startswith("OK ") or line.startswith("ERR "):
+                with self._lock:
+                    if self.cmd_log:
+                        ts, cmd, _ = self.cmd_log[-1]
+                        self.cmd_log[-1] = (ts, cmd, line.split(" ", 1)[0])
 
     def _log(self, command, response):
-        """Log command/response, skip duplicates of common spam."""
         if command == self._last_cmd and command not in ("PIX", "PISTOP", "P", "PA"):
             return
         self._last_cmd = command
@@ -436,7 +439,6 @@ class ESP32SerialLink:
 
     @property
     def ultrasonic(self):
-        """Returns {s1:front, s2:right, s3:back, s4:left} in cm."""
         with self._lock:
             us = self.sensor_data.get("ultrasonic", {})
             return {
@@ -462,20 +464,23 @@ class ESP32SerialLink:
             return "ultrasonic" in self.sensor_data
 
     def sensor_age(self):
-        """Seconds since last JSON sensor packet was received. Returns
-        a very large number if no packet has ever arrived. Used by the
-        navigator to detect serial drop / frozen reader thread."""
         with self._lock:
             if self._sensor_data_ts == 0.0:
                 return float('inf')
             return time.time() - self._sensor_data_ts
 
     def cmd(self, command):
-        """Send a single command line over serial."""
-        self._log(command, "...")  # response filled in by _read_loop on ACK
+        self._log(command, "...")
         try:
             with self._write_lock:
-                self.ser.write((command + "\n").encode("ascii"))
+                if self._client and self._loop:
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._client.write_gatt_char(
+                            BLE_RX_UUID, (command + "\n").encode("ascii")
+                        ),
+                        self._loop
+                    )
+                    future.result(timeout=2.0)
         except Exception as e:
             self._log(command, f"ERR: {e}")
 
@@ -501,19 +506,12 @@ class ESP32SerialLink:
         self.cmd("PISTOP")
 
     def pickup(self):
-        """Trigger pickup sequence. Returns immediately — pickup runs as a
-        non-blocking state machine on ESP32. Caller polls sensors['pickup']
-        for 'idle'/'done' to detect completion."""
         self.cmd("P")
 
     def shutdown(self):
         self._running = False
         try:
             self.stop()
-        except Exception:
-            pass
-        try:
-            self.ser.close()
         except Exception:
             pass
 
@@ -580,7 +578,7 @@ class Navigator:
         print(f"\n{'='*60}")
         print(f"  PET Bottle Robot — AUTONOMOUS NAVIGATOR")
         print(f"  Camera + Ultrasonic Fusion")
-        print(f"  ESP32: {self.esp32.base_url}")
+        print(f"  ESP32: BLE ({BLE_DEVICE_NAME})")
         print(f"  SAFETY MODE: Motors DISABLED")
         print(f"  Press G to GO (enable motors) | Q to quit")
         print(f"{'='*60}\n")
@@ -1188,10 +1186,9 @@ def main():
     parser.add_argument("--model", default="yolov8",
                         choices=["yolov5", "yolov7", "yolov8"],
                         help="YOLO model (default: yolov8)")
-    parser.add_argument("--serial-port", default=None,
-                        help="ESP32 USB serial device (default: auto-detect "
-                             "/dev/serial/by-id/usb-*ESP*, falls back to "
-                             "/dev/ttyUSB0)")
+    parser.add_argument("--ble-address", default=None,
+                        help=f"ESP32 BLE MAC address (default: auto-scan for "
+                             f"'{BLE_DEVICE_NAME}')")
     parser.add_argument("--conf", type=float, default=CONF_THRESHOLD,
                         help=f"Confidence threshold (default: {CONF_THRESHOLD})")
     parser.add_argument("--no-show", action="store_true",
@@ -1205,7 +1202,7 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"  PET Bottle Robot — Autonomous Navigator")
-    print(f"  Camera + Ultrasonic Fusion")
+    print(f"  Camera + Ultrasonic Fusion (BLE transport)")
     print(f"{'='*60}")
 
     # Start web stream server (background thread)
@@ -1214,21 +1211,15 @@ def main():
     stream_thread.start()
     print(f"  Stream: http://0.0.0.0:5000/video_feed")
 
-    # Connect to ESP32 over USB serial
-    port = args.serial_port or _autodetect_serial_port()
-    if port is None:
-        print(f"  ERROR: No ESP32 serial port found.")
-        print(f"  Plug in USB cable and check `ls /dev/serial/by-id/`")
-        print(f"  Or pass --serial-port /dev/ttyUSB0")
-        return
-    print(f"  Connecting to ESP32 on {port} @ {SERIAL_BAUD} baud...")
-    esp32 = ESP32SerialLink(port=port)
-    time.sleep(0.5)  # let first JSON packet arrive
+    # Connect to ESP32 over BLE
+    print(f"  Connecting to ESP32 via BLE ('{BLE_DEVICE_NAME}')...")
+    esp32 = ESP32BLELink(address=args.ble_address)
+    time.sleep(1.0)  # let first JSON packet arrive over BLE
     us = esp32.ultrasonic
     if any(v < 999 for v in us.values()):
         print(f"  ESP32 connected! Ultrasonic: F={us['s1']}cm R={us['s2']}cm B={us['s3']}cm L={us['s4']}cm")
     else:
-        print(f"  WARNING: ESP32 not streaming sensor data yet — first packet may be delayed")
+        print(f"  WARNING: ESP32 not streaming sensor data yet — first BLE packet may be delayed")
 
     # Load YOLO models
     print(f"  Loading YOLO models...")

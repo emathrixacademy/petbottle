@@ -6,7 +6,7 @@ Autonomous PET bottle collection robot using dual processors:
 - **ESP32**: Motor control, sensors, WiFi AP, LCD — test firmware in `esp32_test/esp32_test.ino`
 - **Raspberry Pi 5 + Hailo-8 NPU**: YOLO vision + navigation brain — `camera.py`, `navigator.py`
 
-Communication: Pi <-> ESP32 is **USB serial** (115200 baud, line-based). The Pi auto-detects the port (`/dev/serial/by-id/usb-*ESP*`, falls back to `/dev/ttyUSB0`). The ESP32 still hosts a WiFi AP (`PetBottle_Robot` / `petbottle123` / `192.168.4.1`) for OTA flashing and the web test dashboard, but the navigator does NOT use it for control.
+Communication: Pi <-> ESP32 is **BLE UART** (Nordic UART Service). The Pi scans for the BLE device named `PetBottle_Robot` and connects automatically. ESP32 is powered independently (not via Pi USB). The ESP32 still hosts a WiFi AP (`PetBottle_Robot` / `petbottle123` / `192.168.4.1`) for OTA flashing and the web test dashboard, but the navigator does NOT use it for control.
 
 ## Build & Flash
 
@@ -99,15 +99,15 @@ Never assign channels out-of-order or across timer pairs for different motors.
 | `/cmdlog` | GET | JSON: recent Pi-ESP32 command log |
 | `/ota` | GET/POST | Firmware upload page |
 
-## ESP32 Serial Protocol (Pi <-> ESP32, primary control path)
+## ESP32 BLE UART Protocol (Pi <-> ESP32, primary control path)
 
-Line-based ASCII at 115200 baud. ESP32 accepts the same `PI*`-prefixed commands the HTTP API takes (one per line, terminated by `\n` or `\r`). After each command the ESP32 emits a single `OK <cmd>` or `ERR <cmd>` ACK line.
+Line-based ASCII over BLE UART (Nordic UART Service). ESP32 acts as BLE GATT server advertising as `PetBottle_Robot`. Pi connects as BLE client using `bleak`. ESP32 accepts the same `PI*`-prefixed commands (one per line, terminated by `\n`). After each command the ESP32 sends a `OK <cmd>` or `ERR <cmd>` ACK via BLE notify.
 
-Every 100 ms the ESP32 also pushes one JSON sensor packet on the same serial line — same schema as the HTTP `/sensor` endpoint:
+Every 200 ms the ESP32 pushes one JSON sensor packet via BLE notify — same schema as the HTTP `/sensor` endpoint:
 ```
 {"mode":"menu","ultrasonic":{"s1":120,...},"limits":{...},"pickup":"idle",...}
 ```
-The Pi's parser tolerates unrecognized lines (firmware `Serial.print` debug output is silently ignored) — only lines starting with `{`, `OK `, or `ERR ` are interpreted.
+The Pi's BLE parser tolerates unrecognized data (firmware debug output is silently ignored) — only lines starting with `{`, `OK `, or `ERR ` are interpreted. USB Serial is kept for Arduino IDE Serial Monitor debugging only.
 
 ### Pi Direct Commands (bypass test-UI mode system)
 
