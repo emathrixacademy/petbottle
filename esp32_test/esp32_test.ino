@@ -205,8 +205,8 @@ enum TestMode {
 };
 
 TestMode currentMode = MODE_MENU;
-int wheelSpeed = 40;     // default drive speed (max 80)
-int turnSpeed  = 40;     // default turn speed (max 80)
+const int wheelSpeed = 60; // fixed drive speed — not adjustable
+int turnSpeed  = 50;      // default turn speed, adjustable via +/-
 int armSpeed   = 20;     // default arm PWM
 int swingSpeed = 0;      // default swing PWM — 0 for safety
 
@@ -690,15 +690,13 @@ void executeCmd(String cmd) {
   if (currentMode == MODE_WHEELS) {
     switch (c0) {
       case 'F':
-        if (val > 0) wheelSpeed = constrain(val, 0, 80);
         setLeft(wheelSpeed);
         setRight(wheelSpeed);
-        Serial.printf("FORWARD at %d\n", wheelSpeed); break;
+        Serial.printf("FORWARD at %d (fixed)\n", wheelSpeed); break;
       case 'J': case 'B':
-        if (val > 0) wheelSpeed = constrain(val, 0, 80);
         setLeft(-wheelSpeed);
         setRight(-wheelSpeed);
-        Serial.printf("BACKWARD at %d\n", wheelSpeed); break;
+        Serial.printf("BACKWARD at %d (fixed)\n", wheelSpeed); break;
       case 'L':
         setLeft(-turnSpeed);
         setRight(turnSpeed);
@@ -710,13 +708,11 @@ void executeCmd(String cmd) {
       case 'X': case 'S':
         stopWheels(); Serial.println("STOPPED"); break;
       case '+':
-        wheelSpeed = constrain(wheelSpeed + 10, 0, 80);
         turnSpeed = constrain(turnSpeed + 10, 0, 80);
-        Serial.printf("Speed: drive=%d turn=%d\n", wheelSpeed, turnSpeed); break;
+        Serial.printf("Turn speed: %d (drive fixed at %d)\n", turnSpeed, wheelSpeed); break;
       case '-':
-        wheelSpeed = constrain(wheelSpeed - 10, 0, 80);
         turnSpeed = constrain(turnSpeed - 10, 0, 80);
-        Serial.printf("Speed: drive=%d turn=%d\n", wheelSpeed, turnSpeed); break;
+        Serial.printf("Turn speed: %d (drive fixed at %d)\n", turnSpeed, wheelSpeed); break;
     }
     return;
   }
