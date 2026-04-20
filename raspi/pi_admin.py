@@ -4,7 +4,7 @@ Pi Admin — Autonomous Robot Control Panel.
 Port 8080. All navigator calls proxied through here (no CORS issues).
 """
 
-import subprocess, socket, os, csv, time, threading, json
+import os, csv, time, threading, json
 import urllib.request
 from datetime import datetime
 from flask import Flask, jsonify, request, send_file, Response
@@ -17,18 +17,12 @@ os.makedirs(DATA_DIR, exist_ok=True)
 recording = {"active": False, "session": None, "file": None, "writer": None,
              "model": "", "start": 0, "rows": 0, "lock": threading.Lock()}
 
-def run(cmd, timeout=10):
+def get_ble_status():
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-        return r.stdout.strip()
-    except Exception as e:
-        return str(e)
-
-def get_wifi():
-    return run("nmcli -t -f active,ssid dev wifi | grep '^yes' | cut -d: -f2") or "Not connected"
-
-def get_ip():
-    return run("ip -4 addr show wlan0 | grep -oP 'inet \\K[\\d.]+'") or "--"
+        d = nav_get("/stats", timeout=3)
+        return d.get("bleConnected", False)
+    except Exception:
+        return False
 
 def nav_get(path, timeout=5):
     try:
@@ -83,6 +77,20 @@ def nav_start():
 def nav_stop():
     return jsonify(nav_get("/stop"))
 
+@app.route("/nav/cmdlog")
+def nav_cmdlog():
+    return jsonify(nav_get("/cmdlog"))
+
+@app.route("/nav/data_log")
+def nav_data_log():
+    try:
+        req = urllib.request.urlopen(f"{NAV}/data_log", timeout=10)
+        data = req.read()
+        return Response(data, mimetype="text/csv",
+                       headers={"Content-Disposition": "attachment; filename=navigation_log.csv"})
+    except Exception as e:
+        return Response(f"Navigator not available: {e}", status=502)
+
 @app.route("/nav/video_feed")
 def nav_video():
     try:
@@ -119,12 +127,6 @@ h1{color:#4fc3f7;font-size:1.4rem;text-align:center;font-weight:800;margin-botto
 .conn-dot.off{background:#e53935;box-shadow:0 0 8px rgba(229,57,53,.3)}
 .conn-label{flex:1;font-weight:600;font-size:.9rem;color:#e0e0e0}
 .conn-ip{color:#666;font-size:.75rem}
-.conn-btn{padding:8px 16px;border:none;border-radius:8px;font-size:.85rem;
-  font-weight:700;cursor:pointer;color:#fff;touch-action:manipulation;transition:transform .08s}
-.conn-btn:active{transform:scale(.94)}
-.conn-btn.connect{background:#1976d2}
-.conn-btn.disconnect{background:#e53935}
-#connStatus{font-size:.7rem;color:#888;text-align:center;margin-top:4px}
 .auto-section{text-align:center;margin:6px 0}
 .auto-btn{width:100%;padding:18px;border:none;border-radius:14px;
   font-size:1.2rem;font-weight:800;cursor:pointer;color:#fff;
@@ -193,15 +195,13 @@ h1{color:#4fc3f7;font-size:1.4rem;text-align:center;font-weight:800;margin-botto
 <div class="subtitle">Autonomous Collection System</div>
 
 <div class="card">
-  <h2>Robot Connection</h2>
+  <h2>Robot Connection (BLE)</h2>
   <div class="conn-row">
-    <div class="conn-dot $$CONN_DOT$$" id="connDot"></div>
-    <span class="conn-label" id="connName">$$CONN_LABEL$$</span>
-    <span class="conn-ip">$$IP$$</span>
-    <button class="conn-btn $$CONN_BTN_CLASS$$" id="connBtn"
-      onclick="toggleWifi()">$$CONN_BTN_TEXT$$</button>
+    <div class="conn-dot off" id="connDot"></div>
+    <span class="conn-label" id="connName">Checking...</span>
+    <span class="conn-ip" id="connDetail">BLE UART</span>
   </div>
-  <div id="connStatus"></div>
+  <div id="connStatus" style="font-size:.7rem;color:#888;text-align:center;margin-top:4px">Auto-connects on boot</div>
 </div>
 
 <div class="card">
@@ -223,11 +223,13 @@ h1{color:#4fc3f7;font-size:1.4rem;text-align:center;font-weight:800;margin-botto
 
 <div class="card">
   <h2>Detection</h2>
-  <div class="stats-grid">
+  <div class="stats-grid" style="grid-template-columns:repeat(6,1fr)">
     <div class="sg"><div class="v" id="sBot" style="color:#2e7d32">0</div><div class="l">Bottles</div></div>
     <div class="sg"><div class="v" id="sFps">--</div><div class="l">FPS</div></div>
     <div class="sg"><div class="v" id="sInf" style="color:#e65100">--</div><div class="l">Infer</div></div>
     <div class="sg"><div class="v" id="sMod" style="color:#7b1fa2;font-size:.7rem">--</div><div class="l">Model</div></div>
+    <div class="sg"><div class="v" id="sPick" style="color:#1565c0">0</div><div class="l">Pickups</div></div>
+    <div class="sg"><div class="v" id="sAvoid" style="color:#c62828">0</div><div class="l">Avoids</div></div>
   </div>
   <div class="us-grid">
     <div class="us-item clear" id="usF"><div class="v">--</div><div class="l">FRONT</div></div>
@@ -264,13 +266,27 @@ h1{color:#4fc3f7;font-size:1.4rem;text-align:center;font-weight:800;margin-botto
   <div class="sessions" id="sessions"></div>
 </div>
 
+<div class="card">
+  <h2>Pi &rarr; ESP32 Commands</h2>
+  <div id="cmdLog" style="max-height:120px;overflow-y:auto;font-family:monospace;font-size:.7rem;
+    background:#0d1117;border:1px solid #1e2d4a;border-radius:8px;padding:8px;color:#4fc3f7;
+    white-space:pre-wrap"></div>
+</div>
+
+<div class="card">
+  <h2>Navigation CSV</h2>
+  <a href="/nav/data_log" download="navigation_log.csv" class="rec-btn"
+    style="display:inline-block;background:#1976d2;text-decoration:none;padding:8px 14px;border-radius:8px;color:#fff;font-weight:700;font-size:.8rem">Download CSV</a>
+</div>
+
 <div class="footer">PET Bottle Robot &mdash; Autonomous Collection System</div>
 
 <script>
 var autoRunning=false;
 var stateColors={WAITING:'#90a4ae',SCANNING:'#1976d2',ROAMING:'#2e7d32',
   VERIFYING:'#e65100',APPROACHING:'#1565c0',ALIGNING:'#f57f17',
-  PICKING_UP:'#7b1fa2',AVOIDING:'#c62828',STOPPED:'#78909c'};
+  PICKING_UP:'#7b1fa2',AVOIDING:'#c62828',STOPPED:'#78909c',
+  MISSION_COMPLETE:'#43a047'};
 
 function poll(){
   fetch('/nav/stats').then(function(r){return r.json()}).then(function(d){
@@ -284,16 +300,22 @@ function poll(){
     document.getElementById('badge').style.background=sc;
     var sb=document.getElementById('stateBadge');
     sb.textContent=st;sb.style.background=sc;
+    var ble=d.bleConnected||false;
+    var dot=document.getElementById('connDot');
+    var cn=document.getElementById('connName');
+    dot.className='conn-dot '+(ble?'on':'off');
+    cn.textContent=ble?'ESP32 Connected (BLE)':'ESP32 Disconnected';
     var btn=document.getElementById('autoBtn');
-    var espWifi=document.getElementById('connName').textContent.indexOf('Connected')>=0;
     if(st==='WAITING'||st==='STOPPED'){
       autoRunning=false;btn.textContent='START AUTONOMOUS';btn.className='auto-btn start';
-      btn.disabled=!espWifi;
-      if(!espWifi)btn.textContent='CONNECT ESP32 FIRST';
+      btn.disabled=!ble;
+      if(!ble)btn.textContent='WAITING FOR BLE...';
     }else{
       autoRunning=true;btn.textContent='STOP AUTONOMOUS';btn.className='auto-btn stop';
       btn.disabled=false;
     }
+    document.getElementById('sPick').textContent=d.pickups||0;
+    document.getElementById('sAvoid').textContent=d.avoidances||0;
     if(d.ultrasonic){
       setUS('usF',d.ultrasonic.s1);setUS('usR',d.ultrasonic.s2);
       setUS('usB',d.ultrasonic.s3);setUS('usL',d.ultrasonic.s4);
@@ -301,6 +323,14 @@ function poll(){
     }
   }).catch(function(){});
 }
+function pollCmdLog(){
+  fetch('/nav/cmdlog').then(function(r){return r.json()}).then(function(d){
+    var el=document.getElementById('cmdLog');
+    if(d&&d.log){el.textContent=d.log.map(function(e){return e.time+' '+e.cmd}).join('\\n');
+      el.scrollTop=el.scrollHeight;}
+  }).catch(function(){});
+}
+setInterval(pollCmdLog,2000);pollCmdLog();
 function usClass(v){
   // Match navigator thresholds: STOP=60, SLOW=100, TURN=150 cm
   if(v>=999)return 'clear';
@@ -349,7 +379,6 @@ function toggleAuto(){
 
 function emergencyStop(){
   fetch('/nav/stop').then(function(){poll()});
-  try{fetch('http://192.168.4.1/cmd?c=M')}catch(e){}
 }
 
 function loadModels(){
@@ -376,26 +405,6 @@ function switchModel(key){
   }).catch(function(){});
 }
 
-function toggleWifi(){
-  var btn=document.getElementById('connBtn'),st=document.getElementById('connStatus'),
-      name=document.getElementById('connName'),dot=document.getElementById('connDot');
-  if(name.textContent.indexOf('Connected')>=0){
-    st.textContent='Disconnecting...';
-    fetch('/disconnect_esp32').then(function(r){return r.json()}).then(function(d){
-      st.textContent=d.status;name.textContent='Not Connected';
-      dot.className='conn-dot off';btn.textContent='Connect';btn.className='conn-btn connect';
-    }).catch(function(){st.textContent='Error'});
-  }else{
-    st.textContent='Connecting to ESP32...';
-    fetch('/connect_esp32').then(function(r){return r.json()}).then(function(d){
-      st.textContent=d.status;
-      if(d.wifi&&d.wifi.indexOf('PetBottle')>=0){
-        name.textContent='Connected to ESP32';dot.className='conn-dot on';
-        btn.textContent='Disconnect';btn.className='conn-btn disconnect';
-      }
-    }).catch(function(){st.textContent='Error'});
-  }
-}
 
 function toggleRec(){fetch('/toggle_recording').then(function(){pollRec();loadSessions()})}
 function pollRec(){
@@ -424,28 +433,7 @@ loadSessions();
 
 @app.route("/")
 def index():
-    wifi = get_wifi()
-    ip = get_ip()
-    esp = "PetBottle_Robot" in wifi
-    html = PAGE_HTML
-    html = html.replace("$$CONN_DOT$$", "on" if esp else "off")
-    html = html.replace("$$CONN_LABEL$$", "Connected to ESP32" if esp else "Not Connected")
-    html = html.replace("$$IP$$", ip)
-    html = html.replace("$$CONN_BTN_CLASS$$", "disconnect" if esp else "connect")
-    html = html.replace("$$CONN_BTN_TEXT$$", "Disconnect" if esp else "Connect")
-    return html
-
-# ── WiFi routes ──────────────────────────────────────────────
-
-@app.route("/connect_esp32")
-def connect_esp32():
-    out = run("sudo nmcli con up ESP32-Robot 2>&1", timeout=15)
-    return jsonify({"status": out, "wifi": get_wifi(), "ip": get_ip()})
-
-@app.route("/disconnect_esp32")
-def disconnect_esp32():
-    out = run("sudo nmcli con down ESP32-Robot 2>&1", timeout=10)
-    return jsonify({"status": out, "wifi": get_wifi(), "ip": get_ip()})
+    return PAGE_HTML
 
 @app.route("/toggle_recording")
 def toggle_recording():
@@ -509,7 +497,7 @@ def download(filename):
 
 @app.route("/status")
 def status():
-    return jsonify({"wifi": get_wifi(), "ip": get_ip()})
+    return jsonify({"ble": get_ble_status()})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, threaded=True)

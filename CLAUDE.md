@@ -36,6 +36,7 @@ Connect to PetBottle_Robot WiFi, open `http://192.168.4.1/ota`, upload `.bin` fi
 | `esp32_test/esp32_test.ino` | **Active ESP32 firmware** — combined test with WiFi AP, web UI, OTA, camera feed |
 | `camera.py` | YOLO v5/v7/v8 model support, detection, postprocessing (runs on Pi) |
 | `navigator.py` | Autonomous brain + Flask MJPEG video stream on port 5000 (runs on Pi) |
+| `pi_admin.py` | Admin dashboard on port 8080 — proxies navigator APIs, data recording, model switching (runs on Pi) |
 | `server.py` | OTA update server for remote deployment (runs on Pi) |
 | `flash_ota.bat` | One-click compile + OTA flash from Windows |
 | `petbottle/petbottle.ino` | **LEGACY — do not use.** Sensor-only sketch, pins conflict |
