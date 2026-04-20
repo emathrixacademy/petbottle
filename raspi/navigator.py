@@ -360,7 +360,7 @@ class ESP32BLELink:
         self._connected = threading.Event()
         self._ble_thread = threading.Thread(target=self._run_ble, daemon=True)
         self._ble_thread.start()
-        if not self._connected.wait(timeout=15):
+        if not self._connected.wait(timeout=30):
             raise RuntimeError(
                 f"Could not connect to BLE device '{BLE_DEVICE_NAME}'. "
                 f"Make sure ESP32 is powered and in range."
@@ -386,19 +386,28 @@ class ESP32BLELink:
                     self.address = device.address
                     print(f"  Found ESP32 at {self.address}")
 
-                async with BleakClient(self.address) as client:
-                    self._client = client
-                    self._connected.set()
-                    print(f"  BLE connected to {self.address}")
-                    await client.start_notify(BLE_TX_UUID, self._on_notify)
+                client = BleakClient(self.address, transport="le", timeout=20.0)
+                await client.connect()
+                if not client.is_connected:
+                    raise Exception("connect() returned but not connected")
+                self._client = client
+                self._connected.set()
+                print(f"  BLE connected to {self.address}")
+                await client.start_notify(BLE_TX_UUID, self._on_notify)
+                try:
                     while self._running and client.is_connected:
                         await asyncio.sleep(0.1)
-                    await client.stop_notify(BLE_TX_UUID)
+                finally:
+                    try:
+                        await client.stop_notify(BLE_TX_UUID)
+                    except Exception:
+                        pass
+                    await client.disconnect()
             except Exception as e:
                 print(f"  BLE connection error: {e}, reconnecting...")
                 self._client = None
                 self._connected.clear()
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
 
     def _on_notify(self, sender, data: bytearray):
         text = data.decode("utf-8", errors="replace")
