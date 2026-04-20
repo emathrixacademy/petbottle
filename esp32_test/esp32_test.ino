@@ -131,7 +131,7 @@ enum TestMode {
 TestMode currentMode = MODE_MENU;
 int wheelSpeed = 0;      // default drive speed — 0 for safety; nudge up via web UI
 int turnSpeed  = 0;      // default turn speed (max 80) — 0 for safety
-int armSpeed   = 30;     // default arm PWM
+int armSpeed   = 20;     // default arm PWM
 int swingSpeed = 0;      // default swing PWM — 0 for safety
 
 // --- Manual arm motion safety profile ---
@@ -142,7 +142,7 @@ int swingSpeed = 0;      // default swing PWM — 0 for safety
 #define MANUAL_DOWN_SPEED    80
 #define MANUAL_DOWN_ON_MS    200       // motor on per pulse
 #define MANUAL_DOWN_OFF_MS   300       // motor off between pulses
-#define MANUAL_UP_SPEED      180
+#define MANUAL_UP_SPEED      120
 bool armManualPulseActive = false;     // true while user-held DOWN is active
 bool armManualPulseOn     = false;     // current phase of the on/off pulse
 unsigned long armManualPulseTimer = 0; // millis() of last phase change
@@ -486,7 +486,7 @@ void pickupUpdate() {
       if (now - puTimer >= 500) {
         lcd.clear();
         lcd.setCursor(0, 0); lcd.print("Ready");
-        armSpeed = 30;
+        armSpeed = 20;
         puState = PU_IDLE;
         Serial.println("Pickup idle — ready for next bottle");
       }
@@ -1075,8 +1075,8 @@ button:active{transform:scale(.94)}
 </div>
 <div class="slider-row">
   <label>Speed</label>
-  <input type="range" id="aspd" min="25" max="180" value="30">
-  <span id="aspdV">30</span>
+  <input type="range" id="aspd" min="20" max="120" value="20">
+  <span id="aspdV">20</span>
 </div>
 <div class="grid g3">
   <button class="bu" onpointerdown="acmd('U')">Arm Up</button>
