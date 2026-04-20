@@ -142,7 +142,7 @@ int swingSpeed = 0;      // default swing PWM — 0 for safety
 #define MANUAL_DOWN_SPEED    80
 #define MANUAL_DOWN_ON_MS    200       // motor on per pulse
 #define MANUAL_DOWN_OFF_MS   300       // motor off between pulses
-#define MANUAL_UP_SPEED      120
+#define MANUAL_UP_SPEED      180
 bool armManualPulseActive = false;     // true while user-held DOWN is active
 bool armManualPulseOn     = false;     // current phase of the on/off pulse
 unsigned long armManualPulseTimer = 0; // millis() of last phase change
@@ -1075,7 +1075,7 @@ button:active{transform:scale(.94)}
 </div>
 <div class="slider-row">
   <label>Speed</label>
-  <input type="range" id="aspd" min="20" max="120" value="20">
+  <input type="range" id="aspd" min="20" max="180" value="20">
   <span id="aspdV">20</span>
 </div>
 <div class="grid g3">
