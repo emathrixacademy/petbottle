@@ -139,7 +139,7 @@ int swingSpeed = 0;      // default swing PWM — 0 for safety
 //       Bottom limit must be physically positioned ~5° above 0 to act as
 //       the "lowest allowable" stop.
 // UP:   continuous full force (180 PWM) until TOP limit (SW1) trips.
-#define MANUAL_DOWN_SPEED    127
+#define MANUAL_DOWN_SPEED    80
 #define MANUAL_DOWN_ON_MS    200       // motor on per pulse
 #define MANUAL_DOWN_OFF_MS   300       // motor off between pulses
 #define MANUAL_UP_SPEED      180
@@ -164,7 +164,7 @@ PickupState puState = PU_IDLE;
 unsigned long puTimer = 0;         // general purpose timer for pickup steps
 unsigned long puStartTime = 0;     // when pickup sequence began (for timeout)
 bool puArmOn = false;              // tracks arm pulse on/off during lowering
-#define PU_LOWER_SPEED    100
+#define PU_LOWER_SPEED    80
 #define PU_LOWER_ON_MS    200      // arm on duration during pulsed lowering
 #define PU_LOWER_OFF_MS   300      // arm off duration during pulsed lowering
 #define PU_SCOOP_CLOSE_MS 800      // time to wait after closing scoopers
