@@ -205,8 +205,8 @@ enum TestMode {
 };
 
 TestMode currentMode = MODE_MENU;
-int wheelSpeed = 0;      // default drive speed — 0 for safety; nudge up via web UI
-int turnSpeed  = 0;      // default turn speed (max 80) — 0 for safety
+int wheelSpeed = 40;     // default drive speed (max 80)
+int turnSpeed  = 40;     // default turn speed (max 80)
 int armSpeed   = 20;     // default arm PWM
 int swingSpeed = 0;      // default swing PWM — 0 for safety
 
