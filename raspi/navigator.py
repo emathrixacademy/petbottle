@@ -97,8 +97,18 @@ stream_lock = threading.Lock()
 stream_frame = None  # latest JPEG-encoded frame
 stream_stats = {"fps": 0, "bottles": 0, "persons": 0, "model": "", "inference_ms": 0, "state": "WAITING",
                 "ultrasonic": {"s1": 999, "s2": 999, "s3": 999, "s4": 999},
-                "binFull": False}
+                "binFull": False, "pickups": 0, "avoidances": 0, "bleConnected": False}
 _navigator_ref = None  # set by Navigator.__init__ so Flask routes can control it
+
+# Data logger — records events during navigation
+data_log = []
+data_log_lock = threading.Lock()
+
+def log_event(event_type, details):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    entry = {"time": ts, "event": event_type, **details}
+    with data_log_lock:
+        data_log.append(entry)
 
 def update_stream(frame_bgr, bottles, persons, model_name, inference_ms, state_name,
                   ultrasonic=None, bin_full=None):
@@ -116,6 +126,10 @@ def update_stream(frame_bgr, bottles, persons, model_name, inference_ms, state_n
             stream_stats["ultrasonic"] = ultrasonic
         if bin_full is not None:
             stream_stats["binFull"] = bool(bin_full)
+        if _navigator_ref:
+            stream_stats["pickups"] = _navigator_ref.pickup_success_count
+            stream_stats["avoidances"] = getattr(_navigator_ref, 'avoid_count', 0)
+            stream_stats["bleConnected"] = _navigator_ref.esp32._connected.is_set()
 
 def generate_mjpeg():
     while True:
@@ -141,8 +155,8 @@ def get_stats():
 @stream_app.route('/start')
 def nav_start():
     if _navigator_ref and _navigator_ref.state == State.WAITING:
-        # Fresh mission — reset counters so the bin backstop starts at 0
-        # and the IR-never-tripped warning isn't carried over.
+        if not _navigator_ref.esp32._connected.is_set():
+            return jsonify({"ok": False, "state": "WAITING", "msg": "ESP32 not connected via BLE yet"})
         _navigator_ref.pickup_success_count = 0
         _navigator_ref.ir_ever_tripped = False
         _navigator_ref.infer_fail_streak = 0
@@ -200,28 +214,43 @@ def stream_index():
 <title>PET Bottle Navigator</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:sans-serif;background:#111;color:#eee;padding:12px;
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a1a;color:#eee;padding:12px;
   -webkit-user-select:none;user-select:none}
-h1{text-align:center;font-size:1.3rem;margin-bottom:8px}
+h1{text-align:center;font-size:1.3rem;margin-bottom:8px;color:#4fc3f7}
 .video-wrap{position:relative;text-align:center;margin-bottom:10px}
 .video-wrap img{width:100%;max-width:640px;border-radius:12px;border:2px solid #333}
 .badge{position:absolute;top:10px;right:10px;padding:6px 14px;border-radius:8px;
   font-weight:700;font-size:.9rem;color:#111}
+.ble-dot{position:absolute;top:10px;left:10px;padding:6px 14px;border-radius:8px;
+  font-weight:700;font-size:.75rem}
+.section{max-width:640px;margin:10px auto}
 .controls{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin:12px 0}
-button{font-size:1.1rem;font-weight:700;border:none;border-radius:12px;
-  padding:14px 28px;cursor:pointer;transition:transform .08s;
-  touch-action:manipulation}
+button{font-size:1rem;font-weight:700;border:none;border-radius:12px;
+  padding:12px 24px;cursor:pointer;transition:all .15s;touch-action:manipulation}
 button:active{transform:scale(.94)}
 .go{background:#66bb6a;color:#111}
 .stop{background:#ef5350;color:#fff}
-.stats{background:#1a1a2e;border-radius:12px;padding:12px;margin:10px auto;
-  max-width:640px;display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px}
+.models{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin:8px 0}
+.mbtn{background:#1a1a3e;color:#888;border:2px solid #333;padding:10px 20px;border-radius:10px}
+.mbtn.active{color:#fff;border-color:#4fc3f7;background:#1a2a4e}
+.mbtn.v5{border-color:#ffeb3b}.mbtn.v5.active{color:#ffeb3b;background:#2a2a1e;border-color:#ffeb3b}
+.mbtn.v7{border-color:#e040fb}.mbtn.v7.active{color:#e040fb;background:#2a1a2e;border-color:#e040fb}
+.mbtn.v8{border-color:#4fc3f7}.mbtn.v8.active{color:#4fc3f7;background:#1a2a4e;border-color:#4fc3f7}
+.stats{background:#1a1a2e;border-radius:12px;padding:12px;
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(80px,1fr));gap:8px}
 .stat{text-align:center}
-.stat .val{font-size:1.4rem;font-weight:700;color:#4fc3f7}
-.stat .lbl{font-size:.7rem;color:#888;margin-top:2px}
-#log{background:#000;border-radius:8px;padding:8px;margin:10px auto;
-  max-width:640px;font-family:monospace;font-size:.75rem;color:#4fc3f7;
-  height:60px;overflow-y:auto;white-space:pre-wrap}
+.stat .val{font-size:1.3rem;font-weight:700;color:#4fc3f7}
+.stat .lbl{font-size:.65rem;color:#888;margin-top:2px}
+.us-bar{background:#1a1a2e;border-radius:12px;padding:12px;margin-top:8px;
+  display:grid;grid-template-columns:repeat(4,1fr);gap:8px;text-align:center}
+.us-bar .val{font-size:1.1rem;font-weight:700}
+.us-bar .lbl{font-size:.65rem;color:#888}
+#log{background:#000;border-radius:8px;padding:8px;margin-top:8px;
+  font-family:monospace;font-size:.7rem;color:#4fc3f7;
+  height:80px;overflow-y:auto;white-space:pre-wrap}
+.dl-btn{background:#1a1a3e;color:#4fc3f7;border:1px solid #333;padding:8px 16px;
+  border-radius:8px;font-size:.85rem;margin-top:8px;display:inline-block;text-decoration:none}
+.footer{text-align:center;color:#555;font-size:.65rem;margin-top:12px}
 </style>
 </head>
 <body>
@@ -230,23 +259,51 @@ button:active{transform:scale(.94)}
 <div class="video-wrap">
   <img src="/video_feed" alt="Live Feed">
   <div class="badge" id="badge" style="background:#ff9800">WAITING</div>
+  <div class="ble-dot" id="ble" style="background:#ef5350;color:#fff">BLE: --</div>
 </div>
 
-<div class="controls">
-  <button class="go" onclick="act('/start')">START</button>
-  <button class="stop" onclick="act('/stop')">STOP</button>
+<div class="section">
+  <div class="controls">
+    <button class="go" onclick="act('/start')">START</button>
+    <button class="stop" onclick="act('/stop')">STOP</button>
+  </div>
+
+  <div class="models">
+    <button class="mbtn v5" onclick="switchModel('yolov5')">YOLOv5</button>
+    <button class="mbtn v7" onclick="switchModel('yolov7')">YOLOv7</button>
+    <button class="mbtn v8 active" onclick="switchModel('yolov8')">YOLOv8</button>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="val" id="fps">-</div><div class="lbl">FPS</div></div>
+    <div class="stat"><div class="val" id="bottles">0</div><div class="lbl">Bottles</div></div>
+    <div class="stat"><div class="val" id="persons">0</div><div class="lbl">Persons</div></div>
+    <div class="stat"><div class="val" id="infer">-</div><div class="lbl">Infer ms</div></div>
+    <div class="stat"><div class="val" id="model">-</div><div class="lbl">Model</div></div>
+    <div class="stat"><div class="val" id="bin">-</div><div class="lbl">Bin</div></div>
+    <div class="stat"><div class="val" id="pickups">0</div><div class="lbl">Pickups</div></div>
+    <div class="stat"><div class="val" id="avoids">0</div><div class="lbl">Avoidances</div></div>
+  </div>
+
+  <div class="us-bar">
+    <div><div class="val" id="us-f" style="color:#4fc3f7">--</div><div class="lbl">Front</div></div>
+    <div><div class="val" id="us-r" style="color:#4fc3f7">--</div><div class="lbl">Right</div></div>
+    <div><div class="val" id="us-b" style="color:#4fc3f7">--</div><div class="lbl">Back</div></div>
+    <div><div class="val" id="us-l" style="color:#4fc3f7">--</div><div class="lbl">Left</div></div>
+  </div>
+
+  <div id="log">Ready.
+</div>
+  <div id="cmdlog" style="background:#0a0a2a;border-radius:8px;padding:8px;margin-top:8px;
+    font-family:monospace;font-size:.7rem;color:#66bb6a;height:60px;overflow-y:auto;white-space:pre-wrap">Pi -> ESP32 commands:
+</div>
+  <div style="margin-top:8px;display:flex;gap:8px">
+    <a class="dl-btn" href="/data_log" download="navigation_log.csv">Download CSV Log</a>
+    <button class="dl-btn" onclick="fetch('/clear_log').then(()=>{log.textContent='Log cleared.\\n'})">Clear Log</button>
+  </div>
 </div>
 
-<div class="stats">
-  <div class="stat"><div class="val" id="fps">-</div><div class="lbl">FPS</div></div>
-  <div class="stat"><div class="val" id="bottles">0</div><div class="lbl">Bottles</div></div>
-  <div class="stat"><div class="val" id="persons">0</div><div class="lbl">Persons</div></div>
-  <div class="stat"><div class="val" id="infer">-</div><div class="lbl">Infer ms</div></div>
-  <div class="stat"><div class="val" id="model">-</div><div class="lbl">Model</div></div>
-  <div class="stat"><div class="val" id="bin">-</div><div class="lbl">Bin</div></div>
-</div>
-
-<div id="log">Ready.\n</div>
+<div class="footer">PET Bottle Collector Robot &mdash; Emathrix Academy</div>
 
 <script>
 const stateColors={WAITING:'#ff9800',SCANNING:'#ffeb3b',ROAMING:'#66bb6a',
@@ -262,6 +319,24 @@ function act(url){
   }).catch(e=>{log.textContent+='ERR: '+e+'\n'});
 }
 
+function switchModel(m){
+  fetch('/switch_model?model='+m).then(r=>r.json()).then(d=>{
+    if(d.ok){
+      document.querySelectorAll('.mbtn').forEach(b=>b.classList.remove('active'));
+      document.querySelector('.mbtn.'+m.replace('yolo','')).classList.add('active');
+      log.textContent+='> Model: '+d.active+'\n';
+      log.scrollTop=log.scrollHeight;
+    }
+  });
+}
+
+function usColor(v){
+  if(v>=999) return '#555';
+  if(v<60) return '#ef5350';
+  if(v<100) return '#ff9800';
+  return '#66bb6a';
+}
+
 function poll(){
   fetch('/stats').then(r=>r.json()).then(d=>{
     document.getElementById('fps').textContent=d.fps||'-';
@@ -269,22 +344,90 @@ function poll(){
     document.getElementById('persons').textContent=d.persons||0;
     document.getElementById('infer').textContent=d.inference_ms||'-';
     document.getElementById('model').textContent=d.model||'-';
+    document.getElementById('pickups').textContent=d.pickups||0;
+    document.getElementById('avoids').textContent=d.avoidances||0;
     const binEl=document.getElementById('bin');
     binEl.textContent=d.binFull?'FULL':'OK';
     binEl.style.color=d.binFull?'#ffc107':'#4fc3f7';
     const b=document.getElementById('badge');
     b.textContent=d.state||'?';
     b.style.background=stateColors[d.state]||'#666';
-    if(d.state==='MISSION_COMPLETE'){
-      b.textContent='BIN FULL — press STOP, empty bin, START';
+    if(d.state==='MISSION_COMPLETE') b.textContent='BIN FULL';
+    const ble=document.getElementById('ble');
+    ble.textContent=d.bleConnected?'BLE: Connected':'BLE: Disconnected';
+    ble.style.background=d.bleConnected?'#66bb6a':'#ef5350';
+    if(d.ultrasonic){
+      var u=d.ultrasonic;
+      ['f','r','b','l'].forEach((k,i)=>{
+        var key='s'+(i+1);var v=u[key]||999;
+        var el=document.getElementById('us-'+k);
+        el.textContent=v>=999?'--':v+'cm';
+        el.style.color=usColor(v);
+      });
     }
   }).catch(()=>{});
 }
-setInterval(poll,1000);
+function pollCmd(){
+  fetch('/cmdlog').then(r=>r.json()).then(d=>{
+    if(d.ok&&d.log.length){
+      var cl=document.getElementById('cmdlog');
+      cl.textContent='Pi -> ESP32:\n';
+      d.log.slice(-10).forEach(e=>{
+        var c=e.resp.startsWith('OK')?'':'! ';
+        cl.textContent+=c+e.time+' '+e.cmd+' -> '+e.resp+'\n';
+      });
+      cl.scrollTop=cl.scrollHeight;
+    }
+  }).catch(()=>{});
+}
+setInterval(poll,500);
+setInterval(pollCmd,1000);
 poll();
 </script>
 </body>
 </html>"""
+
+@stream_app.route('/cmdlog')
+def get_cmdlog():
+    if _navigator_ref:
+        log = _navigator_ref.esp32.recent_log
+        return jsonify({"ok": True, "log": [{"time": t, "cmd": c, "resp": r} for t, c, r in log]})
+    return jsonify({"ok": False, "log": []})
+
+@stream_app.route('/data_log')
+def download_data_log():
+    import csv, io
+    si = io.StringIO()
+    writer = csv.writer(si)
+    writer.writerow(["time", "event", "model", "bottles_detected", "persons_detected",
+                     "inference_ms", "bottle_distance", "us_front", "us_right",
+                     "us_back", "us_left", "state", "detail"])
+    with data_log_lock:
+        for entry in data_log:
+            writer.writerow([
+                entry.get("time", ""),
+                entry.get("event", ""),
+                entry.get("model", ""),
+                entry.get("bottles", ""),
+                entry.get("persons", ""),
+                entry.get("inference_ms", ""),
+                entry.get("bottle_distance", ""),
+                entry.get("us_front", ""),
+                entry.get("us_right", ""),
+                entry.get("us_back", ""),
+                entry.get("us_left", ""),
+                entry.get("state", ""),
+                entry.get("detail", ""),
+            ])
+    output = si.getvalue()
+    return Response(output, mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment;filename=navigation_log.csv"})
+
+@stream_app.route('/clear_log')
+def clear_log():
+    with data_log_lock:
+        data_log.clear()
+    return jsonify({"ok": True, "msg": "log cleared"})
 
 def start_stream_server(port=5000):
     """Run Flask in a background thread."""
@@ -345,7 +488,7 @@ class ESP32BLELink:
 
     MAX_LOG = 20
 
-    def __init__(self, address=None):
+    def __init__(self, address=None, block=False):
         self.address = address
         self.sensor_data = {}
         self._sensor_data_ts = 0.0
@@ -360,11 +503,14 @@ class ESP32BLELink:
         self._connected = threading.Event()
         self._ble_thread = threading.Thread(target=self._run_ble, daemon=True)
         self._ble_thread.start()
-        if not self._connected.wait(timeout=30):
-            raise RuntimeError(
-                f"Could not connect to BLE device '{BLE_DEVICE_NAME}'. "
-                f"Make sure ESP32 is powered and in range."
-            )
+        if block:
+            if not self._connected.wait(timeout=30):
+                raise RuntimeError(
+                    f"Could not connect to BLE device '{BLE_DEVICE_NAME}'. "
+                    f"Make sure ESP32 is powered and in range."
+                )
+        else:
+            print(f"  BLE connecting in background — ESP32 control available when connected")
 
     def _run_ble(self):
         self._loop = asyncio.new_event_loop()
@@ -555,6 +701,7 @@ class Navigator:
         self.approach_lost_count = 0
         # Mission counters (drive bin-full backstop & sensor sanity check)
         self.pickup_success_count = 0   # successful pickups this mission
+        self.avoid_count          = 0   # obstacle avoidance events
         self.ir_ever_tripped      = False  # has irProx ever read True since boot?
         # Watchdog state (sensor freshness + YOLO inference health)
         self.infer_fail_streak    = 0
@@ -655,6 +802,24 @@ class Navigator:
                 self._navigate(smoothed, persons, orig_w, orig_h,
                                frame_area, us)
 
+                # ── Data logging (1 Hz) ──────────────────────
+                if frame_idx % 30 == 0 and self.state not in (State.WAITING, State.STOPPED):
+                    bottle_dist = ""
+                    if smoothed:
+                        best = max(smoothed, key=lambda b: (b[2]-b[0])*(b[3]-b[1]))
+                        b_fill = ((best[2]-best[0])*(best[3]-best[1])) / frame_area
+                        bottle_dist = f"{b_fill:.3f}"
+                    log_event("detection", {
+                        "model": self.manager.active_name,
+                        "bottles": len(smoothed),
+                        "persons": len(persons),
+                        "inference_ms": round(ms, 1),
+                        "bottle_distance": bottle_dist,
+                        "us_front": us["s1"], "us_right": us["s2"],
+                        "us_back": us["s3"], "us_left": us["s4"],
+                        "state": self.state.name,
+                    })
+
                 # ── Draw results ──────────────────────────────
                 result = draw_detections(frame.copy(), smoothed, persons)
                 self._draw_nav_overlay(result, smoothed, us, ms, frame_idx)
@@ -691,9 +856,12 @@ class Navigator:
                         break
                     elif key in (ord('g'), ord('G')):
                         if self.state == State.WAITING:
-                            self.state = State.SCANNING
-                            self.scan_start = time.time()
-                            print("\n  >>> MOTORS ENABLED — SCANNING (slow look-around)")
+                            if not self.esp32._connected.is_set():
+                                print("\n  >>> WAITING for ESP32 BLE connection...")
+                            else:
+                                self.state = State.SCANNING
+                                self.scan_start = time.time()
+                                print("\n  >>> MOTORS ENABLED — SCANNING (slow look-around)")
                     elif key in (ord('s'), ord('S')):
                         if self.state == State.STOPPED:
                             self.state = State.ROAMING
@@ -711,14 +879,18 @@ class Navigator:
                                 import msvcrt
                                 if msvcrt.kbhit():
                                     msvcrt.getch()
-                                    self.state = State.SCANNING
-                                    self.scan_start = time.time()
-                                    print("\n  >>> MOTORS ENABLED — SCANNING (slow look-around)")
+                                    if self.esp32._connected.is_set():
+                                        self.state = State.SCANNING
+                                        self.scan_start = time.time()
+                                        print("\n  >>> MOTORS ENABLED — SCANNING (slow look-around)")
+                                    else:
+                                        print("\n  >>> WAITING for ESP32 BLE connection...")
                             else:
                                 import select
                                 if select.select([sys.stdin], [], [], 0)[0]:
                                     sys.stdin.readline()
-                                    self.state = State.SCANNING
+                                    if self.esp32._connected.is_set():
+                                        self.state = State.SCANNING
                                     self.scan_start = time.time()
                                     print("\n  >>> MOTORS ENABLED — SCANNING (slow look-around)")
                         except Exception:
@@ -1035,6 +1207,11 @@ class Navigator:
                           f"and IR sensor has never read true — check E18-D80NK "
                           f"wiring/aim")
 
+            log_event("pickup", {
+                "detail": f"pickup #{self.pickup_success_count}" if pickup_ok else "pickup failed/timeout",
+                "state": "PICKING_UP",
+                "model": self.manager.active_name,
+            })
             print(f"\n  >>> PICKUP DONE ({self.pickup_success_count}) — "
                   f"scanning for next bottle")
             self.tracker = DetectionTracker()  # reset tracker
@@ -1054,6 +1231,14 @@ class Navigator:
         self.verify_lost = 0
         self.approach_lost_count = 0
         self.esp32.stop()
+        self.avoid_count += 1
+        us = self.esp32.ultrasonic
+        log_event("avoidance", {
+            "detail": reason, "state": "AVOIDING",
+            "model": self.manager.active_name,
+            "us_front": us["s1"], "us_right": us["s2"],
+            "us_back": us["s3"], "us_left": us["s4"],
+        })
         print(f"\n  >>> AVOIDING ({reason})")
 
     def _is_bin_full(self):
@@ -1220,15 +1405,9 @@ def main():
     stream_thread.start()
     print(f"  Stream: http://0.0.0.0:5000/video_feed")
 
-    # Connect to ESP32 over BLE
+    # Connect to ESP32 over BLE (non-blocking — connects in background)
     print(f"  Connecting to ESP32 via BLE ('{BLE_DEVICE_NAME}')...")
-    esp32 = ESP32BLELink(address=args.ble_address)
-    time.sleep(1.0)  # let first JSON packet arrive over BLE
-    us = esp32.ultrasonic
-    if any(v < 999 for v in us.values()):
-        print(f"  ESP32 connected! Ultrasonic: F={us['s1']}cm R={us['s2']}cm B={us['s3']}cm L={us['s4']}cm")
-    else:
-        print(f"  WARNING: ESP32 not streaming sensor data yet — first BLE packet may be delayed")
+    esp32 = ESP32BLELink(address=args.ble_address, block=False)
 
     # Load YOLO models
     print(f"  Loading YOLO models...")
