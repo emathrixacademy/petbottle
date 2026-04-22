@@ -95,7 +95,7 @@ stream_lock = threading.Lock()
 stream_frame = None  # latest JPEG-encoded frame
 stream_stats = {"fps": 0, "bottles": 0, "persons": 0, "model": "", "inference_ms": 0, "state": "WAITING",
                 "ultrasonic": {"s1": 999, "s2": 999, "s3": 999, "s4": 999},
-                "binFull": False, "pickups": 0, "avoidances": 0, "bleConnected": False}
+                "binFull": False, "pickups": 0, "avoidances": 0, "espConnected": False}
 _navigator_ref = None  # set by Navigator.__init__ so Flask routes can control it
 
 # Data logger — records events during navigation
@@ -127,7 +127,7 @@ def update_stream(frame_bgr, bottles, persons, model_name, inference_ms, state_n
         if _navigator_ref:
             stream_stats["pickups"] = _navigator_ref.pickup_success_count
             stream_stats["avoidances"] = getattr(_navigator_ref, 'avoid_count', 0)
-            stream_stats["bleConnected"] = _navigator_ref.esp32._connected.is_set()
+            stream_stats["espConnected"] = _navigator_ref.esp32._connected.is_set()
 
 def generate_mjpeg():
     while True:

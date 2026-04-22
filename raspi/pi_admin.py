@@ -21,7 +21,7 @@ recording = {"active": False, "session": None, "file": None, "writer": None,
 def get_ble_status():
     try:
         d = nav_get("/stats", timeout=3)
-        return d.get("bleConnected", False)
+        return d.get("espConnected", False)
     except Exception:
         return False
 
@@ -301,7 +301,7 @@ function poll(){
     document.getElementById('badge').style.background=sc;
     var sb=document.getElementById('stateBadge');
     sb.textContent=st;sb.style.background=sc;
-    var ble=d.bleConnected||false;
+    var ble=d.espConnected||false;
     var dot=document.getElementById('connDot');
     var cn=document.getElementById('connName');
     dot.className='conn-dot '+(ble?'on':'off');
