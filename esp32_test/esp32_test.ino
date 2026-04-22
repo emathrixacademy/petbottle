@@ -174,9 +174,9 @@ bool puArmOn = false;              // tracks arm pulse on/off during lowering
 #define PU_LOWER_SPEED    80
 #define PU_LOWER_ON_MS    200      // arm on duration during pulsed lowering
 #define PU_LOWER_OFF_MS   300      // arm off duration during pulsed lowering
-#define PU_SCOOP_CLOSE_MS 3000     // time to wait after closing scoopers
+#define PU_SCOOP_CLOSE_MS 1000     // time to wait after closing scoopers
 #define PU_LIFT_SPEED     255
-#define PU_DROP_OPEN_MS   3000     // time to wait after opening scoopers
+#define PU_DROP_OPEN_MS   10000    // time to wait after opening scoopers
 // Servos are MIRRORED — sweep inward to scoop, outward to release.
 // If scooper direction is backwards, swap OPEN/CLOSE for both.
 #define PU_SERVO_OPEN_L   0        // scooper open (spread apart)
