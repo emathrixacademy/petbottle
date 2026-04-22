@@ -24,7 +24,7 @@ Usage:
 import cv2
 import numpy as np
 import argparse
-import asyncio
+
 import time
 import threading
 import json
@@ -32,7 +32,7 @@ from pathlib import Path
 from enum import Enum, auto
 from flask import Flask, Response, jsonify, request
 
-from bleak import BleakClient, BleakScanner  # pip install bleak
+import urllib.request, urllib.error, urllib.parse
 
 # Import detection system from camera.py
 from camera import (
@@ -53,10 +53,8 @@ from hailo_platform import (
 # Configuration
 # ══════════════════════════════════════════════════════════════
 
-BLE_DEVICE_NAME = "PetBottle_Robot"
-BLE_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-BLE_RX_UUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # write to ESP32
-BLE_TX_UUID      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # notify from ESP32
+ESP32_IP = "192.168.4.1"
+ESP32_BASE_URL = f"http://{ESP32_IP}"
 
 # Obstacle avoidance thresholds (cm)
 # Robot is ~100cm long x 30cm wide — sensors are at the front
@@ -156,7 +154,7 @@ def get_stats():
 def nav_start():
     if _navigator_ref and _navigator_ref.state == State.WAITING:
         if not _navigator_ref.esp32._connected.is_set():
-            return jsonify({"ok": False, "state": "WAITING", "msg": "ESP32 not connected via BLE yet"})
+            return jsonify({"ok": False, "state": "WAITING", "msg": "ESP32 not connected via WiFi yet"})
         _navigator_ref.pickup_success_count = 0
         _navigator_ref.ir_ever_tripped = False
         _navigator_ref.infer_fail_streak = 0
@@ -259,7 +257,7 @@ button:active{transform:scale(.94)}
 <div class="video-wrap">
   <img src="/video_feed" alt="Live Feed">
   <div class="badge" id="badge" style="background:#ff9800">WAITING</div>
-  <div class="ble-dot" id="ble" style="background:#ef5350;color:#fff">BLE: --</div>
+  <div class="ble-dot" id="ble" style="background:#ef5350;color:#fff">WiFi: --</div>
 </div>
 
 <div class="section">
@@ -354,7 +352,7 @@ function poll(){
     b.style.background=stateColors[d.state]||'#666';
     if(d.state==='MISSION_COMPLETE') b.textContent='BIN FULL';
     const ble=document.getElementById('ble');
-    ble.textContent=d.bleConnected?'BLE: Connected':'BLE: Disconnected';
+    ble.textContent=d.bleConnected?'WiFi: Connected':'WiFi: Disconnected';
     ble.style.background=d.bleConnected?'#66bb6a':'#ef5350';
     if(d.ultrasonic){
       var u=d.ultrasonic;
@@ -474,108 +472,52 @@ INFER_FAIL_LIMIT = 3
 
 
 # ══════════════════════════════════════════════════════════════
-# ESP32 Communication — BLE UART transport
+# ESP32 Communication — WiFi HTTP transport
 # ══════════════════════════════════════════════════════════════
 
-class ESP32BLELink:
-    """Talks to the ESP32 over BLE UART (Nordic UART Service).
-    Same PI-prefixed command set — only the transport changed from USB serial.
-    ESP32 pushes JSON sensor packets via BLE notify; we parse those
-    in the notification callback.
-
-    The parser ignores any line that doesn't start with '{', 'OK ', or
-    'ERR ' — firmware debug output is silently dropped."""
+class ESP32WiFiLink:
+    """Talks to the ESP32 over WiFi HTTP.
+    Sends commands via GET /cmd?c=<CMD> and polls sensor data
+    via GET /sensor every 200ms in a background thread."""
 
     MAX_LOG = 20
 
-    def __init__(self, address=None, block=False):
-        self.address = address
+    def __init__(self, ip=ESP32_IP, block=False):
+        self.base_url = f"http://{ip}"
         self.sensor_data = {}
         self._sensor_data_ts = 0.0
         self.cmd_log = []
         self._last_cmd = None
         self._lock = threading.Lock()
-        self._write_lock = threading.Lock()
         self._running = True
-        self._client = None
-        self._loop = None
-        self._rx_buffer = ""
         self._connected = threading.Event()
-        self._ble_thread = threading.Thread(target=self._run_ble, daemon=True)
-        self._ble_thread.start()
+        self._poll_thread = threading.Thread(target=self._poll_sensors, daemon=True)
+        self._poll_thread.start()
         if block:
-            if not self._connected.wait(timeout=30):
-                raise RuntimeError(
-                    f"Could not connect to BLE device '{BLE_DEVICE_NAME}'. "
-                    f"Make sure ESP32 is powered and in range."
-                )
+            if not self._connected.wait(timeout=15):
+                print(f"  WARNING: ESP32 not responding at {ip} — running camera-only mode")
         else:
-            print(f"  BLE connecting in background — ESP32 control available when connected")
+            print(f"  WiFi connecting in background — polling {self.base_url}/sensor")
 
-    def _run_ble(self):
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._ble_main())
-
-    async def _ble_main(self):
+    def _poll_sensors(self):
         while self._running:
             try:
-                if self.address is None:
-                    print(f"  Scanning for BLE device '{BLE_DEVICE_NAME}'...")
-                    device = await BleakScanner.find_device_by_name(
-                        BLE_DEVICE_NAME, timeout=10.0
-                    )
-                    if device is None:
-                        print(f"  BLE device not found, retrying...")
-                        await asyncio.sleep(2)
-                        continue
-                    self.address = device.address
-                    print(f"  Found ESP32 at {self.address}")
-
-                client = BleakClient(self.address, transport="le", timeout=20.0)
-                await client.connect()
-                if not client.is_connected:
-                    raise Exception("connect() returned but not connected")
-                self._client = client
-                self._connected.set()
-                print(f"  BLE connected to {self.address}")
-                await client.start_notify(BLE_TX_UUID, self._on_notify)
-                try:
-                    while self._running and client.is_connected:
-                        await asyncio.sleep(0.1)
-                finally:
-                    try:
-                        await client.stop_notify(BLE_TX_UUID)
-                    except Exception:
-                        pass
-                    await client.disconnect()
-            except Exception as e:
-                print(f"  BLE connection error: {e}, reconnecting...")
-                self._client = None
-                self._connected.clear()
-                await asyncio.sleep(3)
-
-    def _on_notify(self, sender, data: bytearray):
-        text = data.decode("utf-8", errors="replace")
-        self._rx_buffer += text
-        while "\n" in self._rx_buffer:
-            line, self._rx_buffer = self._rx_buffer.split("\n", 1)
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("{"):
-                try:
-                    parsed = json.loads(line)
-                    with self._lock:
-                        self.sensor_data = parsed
-                        self._sensor_data_ts = time.time()
-                except json.JSONDecodeError:
-                    pass
-            elif line.startswith("OK ") or line.startswith("ERR "):
+                req = urllib.request.urlopen(f"{self.base_url}/sensor", timeout=2)
+                raw = req.read().decode("utf-8", errors="replace")
+                parsed = json.loads(raw)
                 with self._lock:
-                    if self.cmd_log:
-                        ts, cmd, _ = self.cmd_log[-1]
-                        self.cmd_log[-1] = (ts, cmd, line.split(" ", 1)[0])
+                    self.sensor_data = parsed
+                    self._sensor_data_ts = time.time()
+                if not self._connected.is_set():
+                    self._connected.set()
+                    print(f"  WiFi connected to ESP32 at {self.base_url}")
+            except Exception:
+                with self._lock:
+                    self._sensor_data_ts = 0.0
+                if self._connected.is_set():
+                    self._connected.clear()
+                    print(f"  WiFi lost connection to ESP32")
+            time.sleep(0.2)
 
     def _log(self, command, response):
         if command == self._last_cmd and command not in ("PIX", "PISTOP", "P", "PA"):
@@ -627,15 +569,10 @@ class ESP32BLELink:
     def cmd(self, command):
         self._log(command, "...")
         try:
-            with self._write_lock:
-                if self._client and self._loop:
-                    future = asyncio.run_coroutine_threadsafe(
-                        self._client.write_gatt_char(
-                            BLE_RX_UUID, (command + "\n").encode("ascii")
-                        ),
-                        self._loop
-                    )
-                    future.result(timeout=2.0)
+            url = f"{self.base_url}/cmd?c={urllib.parse.quote(command)}"
+            req = urllib.request.urlopen(url, timeout=2)
+            resp = req.read().decode("utf-8", errors="replace").strip()
+            self._log(command, resp[:20] if resp else "OK")
         except Exception as e:
             self._log(command, f"ERR: {e}")
 
@@ -734,7 +671,7 @@ class Navigator:
         print(f"\n{'='*60}")
         print(f"  PET Bottle Robot — AUTONOMOUS NAVIGATOR")
         print(f"  Camera + Ultrasonic Fusion")
-        print(f"  ESP32: BLE ({BLE_DEVICE_NAME})")
+        print(f"  ESP32: WiFi ({ESP32_BASE_URL})")
         print(f"  SAFETY MODE: Motors DISABLED")
         print(f"  Press G to GO (enable motors) | Q to quit")
         print(f"{'='*60}\n")
@@ -857,7 +794,7 @@ class Navigator:
                     elif key in (ord('g'), ord('G')):
                         if self.state == State.WAITING:
                             if not self.esp32._connected.is_set():
-                                print("\n  >>> WAITING for ESP32 BLE connection...")
+                                print("\n  >>> WAITING for ESP32 WiFi connection...")
                             else:
                                 self.state = State.SCANNING
                                 self.scan_start = time.time()
@@ -884,7 +821,7 @@ class Navigator:
                                         self.scan_start = time.time()
                                         print("\n  >>> MOTORS ENABLED — SCANNING (slow look-around)")
                                     else:
-                                        print("\n  >>> WAITING for ESP32 BLE connection...")
+                                        print("\n  >>> WAITING for ESP32 WiFi connection...")
                             else:
                                 import select
                                 if select.select([sys.stdin], [], [], 0)[0]:
@@ -1380,9 +1317,8 @@ def main():
     parser.add_argument("--model", default="yolov8",
                         choices=["yolov5", "yolov7", "yolov8"],
                         help="YOLO model (default: yolov8)")
-    parser.add_argument("--ble-address", default=None,
-                        help=f"ESP32 BLE MAC address (default: auto-scan for "
-                             f"'{BLE_DEVICE_NAME}')")
+    parser.add_argument("--esp32-ip", default=ESP32_IP,
+                        help=f"ESP32 WiFi IP address (default: {ESP32_IP})")
     parser.add_argument("--conf", type=float, default=CONF_THRESHOLD,
                         help=f"Confidence threshold (default: {CONF_THRESHOLD})")
     parser.add_argument("--no-show", action="store_true",
@@ -1396,7 +1332,7 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"  PET Bottle Robot — Autonomous Navigator")
-    print(f"  Camera + Ultrasonic Fusion (BLE transport)")
+    print(f"  Camera + Ultrasonic Fusion (WiFi transport)")
     print(f"{'='*60}")
 
     # Start web stream server (background thread)
@@ -1405,9 +1341,9 @@ def main():
     stream_thread.start()
     print(f"  Stream: http://0.0.0.0:5000/video_feed")
 
-    # Connect to ESP32 over BLE (non-blocking — connects in background)
-    print(f"  Connecting to ESP32 via BLE ('{BLE_DEVICE_NAME}')...")
-    esp32 = ESP32BLELink(address=args.ble_address, block=False)
+    # Connect to ESP32 over WiFi (non-blocking — connects in background)
+    print(f"  Connecting to ESP32 via WiFi ({args.esp32_ip})...")
+    esp32 = ESP32WiFiLink(ip=args.esp32_ip, block=False)
 
     # Load YOLO models
     print(f"  Loading YOLO models...")

@@ -4,10 +4,11 @@ Pi Admin — Autonomous Robot Control Panel.
 Port 8080. All navigator calls proxied through here (no CORS issues).
 """
 
-import os, csv, time, threading, json
+import os, csv, time, threading, json, subprocess, shutil
 import urllib.request
 from datetime import datetime
 from flask import Flask, jsonify, request, send_file, Response
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 NAV = "http://127.0.0.1:5000"
@@ -195,11 +196,11 @@ h1{color:#4fc3f7;font-size:1.4rem;text-align:center;font-weight:800;margin-botto
 <div class="subtitle">Autonomous Collection System</div>
 
 <div class="card">
-  <h2>Robot Connection (BLE)</h2>
+  <h2>Robot Connection (WiFi)</h2>
   <div class="conn-row">
     <div class="conn-dot off" id="connDot"></div>
     <span class="conn-label" id="connName">Checking...</span>
-    <span class="conn-ip" id="connDetail">BLE UART</span>
+    <span class="conn-ip" id="connDetail">WiFi HTTP</span>
   </div>
   <div id="connStatus" style="font-size:.7rem;color:#888;text-align:center;margin-top:4px">Auto-connects on boot</div>
 </div>
@@ -304,7 +305,7 @@ function poll(){
     var dot=document.getElementById('connDot');
     var cn=document.getElementById('connName');
     dot.className='conn-dot '+(ble?'on':'off');
-    cn.textContent=ble?'ESP32 Connected (BLE)':'ESP32 Disconnected';
+    cn.textContent=ble?'ESP32 Connected (WiFi)':'ESP32 Disconnected';
     var btn=document.getElementById('autoBtn');
     if(st==='WAITING'||st==='STOPPED'){
       autoRunning=false;btn.textContent='START AUTONOMOUS';btn.className='auto-btn start';
@@ -498,6 +499,140 @@ def download(filename):
 @app.route("/status")
 def status():
     return jsonify({"ble": get_ble_status()})
+
+# ── Pi OTA File Upload ─────────────────────────────────────────
+RASPI_DIR = os.path.dirname(os.path.abspath(__file__))
+ALLOWED_FILES = {"navigator.py", "camera.py", "pi_admin.py", "server.py"}
+
+@app.route("/upload", methods=["GET"])
+def upload_page():
+    return UPLOAD_HTML
+
+@app.route("/upload", methods=["POST"])
+def upload_file():
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "No file selected"}), 400
+    f = request.files["file"]
+    fname = secure_filename(f.filename)
+    if fname not in ALLOWED_FILES:
+        return jsonify({"ok": False, "error": f"Not allowed. Valid files: {', '.join(sorted(ALLOWED_FILES))}"}), 400
+    dest = os.path.join(RASPI_DIR, fname)
+    backup = dest + ".bak"
+    if os.path.exists(dest):
+        shutil.copy2(dest, backup)
+    f.save(dest)
+    restart_msg = ""
+    if fname == "navigator.py" or fname == "camera.py":
+        try:
+            subprocess.run(["sudo", "systemctl", "restart", "petbottle-navigator"],
+                           timeout=10, check=True)
+            restart_msg = "Navigator service restarted."
+        except Exception as e:
+            restart_msg = f"Upload OK but restart failed: {e}"
+    elif fname == "pi_admin.py":
+        restart_msg = "Admin uploaded. Restarting in 2 seconds..."
+        threading.Timer(2.0, lambda: os.execv(
+            "/usr/bin/python3", ["python3", os.path.abspath(__file__)]
+        )).start()
+    return jsonify({"ok": True, "file": fname, "message": restart_msg})
+
+UPLOAD_HTML = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Pi OTA Update</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0f0f0f;color:#e0e0e0;font-family:'Segoe UI',system-ui,sans-serif;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  min-height:100vh;padding:24px;-webkit-tap-highlight-color:transparent}
+.card{background:#1a1a2e;border-radius:20px;padding:40px 32px;max-width:480px;
+  width:100%;text-align:center;box-shadow:0 8px 40px rgba(0,0,0,.5)}
+h1{font-size:1.5rem;color:#4fc3f7;margin-bottom:4px}
+.sub{color:#888;font-size:.85rem;margin-bottom:24px}
+.allowed{background:#111;border-radius:10px;padding:12px;margin-bottom:20px;
+  font-size:.8rem;color:#aaa;font-family:monospace}
+label.pick{display:inline-block;background:#1976d2;color:#fff;font-size:1.1rem;
+  font-weight:700;border-radius:14px;padding:16px 36px;cursor:pointer;margin:8px;
+  box-shadow:0 2px 8px rgba(25,118,210,.25)}
+label.pick:active{transform:scale(.96)}
+input[type=file]{display:none}
+button{font-size:1.1rem;font-weight:700;border:none;border-radius:14px;
+  padding:16px 36px;cursor:pointer;background:#43a047;color:#fff;margin:8px;
+  box-shadow:0 2px 8px rgba(67,160,71,.2)}
+button:disabled{opacity:.4;cursor:not-allowed}
+button:active{transform:scale(.96)}
+.fname{margin:12px 0;font-size:.9rem;color:#4fc3f7;font-weight:600}
+.bar{height:6px;background:#333;border-radius:3px;margin:16px 0;overflow:hidden}
+.bar-fill{height:100%;background:#4fc3f7;width:0%;transition:width .3s}
+#status{font-size:.95rem;margin-top:16px;font-weight:600}
+.back{display:inline-block;margin-top:20px;color:#666;font-size:.85rem;text-decoration:none}
+.back:hover{color:#aaa}
+</style></head><body>
+<div class="card">
+<h1>Pi Software Update</h1>
+<p class="sub">Upload Python files to update the robot brain</p>
+<div class="allowed">Allowed: navigator.py, camera.py, pi_admin.py, server.py</div>
+<label class="pick">Choose .py File<input type="file" id="fileIn" accept=".py" onchange="fileSelected(this)"></label>
+<div class="fname" id="fname"></div>
+<button id="uploadBtn" onclick="doUpload()" disabled>Upload &amp; Apply</button>
+<div class="bar"><div class="bar-fill" id="bar"></div></div>
+<div id="status"></div>
+<a class="back" href="/">&larr; Back to Dashboard</a>
+</div>
+<script>
+var selFile=null;
+function fileSelected(inp){
+  selFile=inp.files[0];
+  document.getElementById('fname').textContent=selFile?selFile.name:'';
+  document.getElementById('uploadBtn').disabled=!selFile;
+  document.getElementById('status').textContent='';
+  document.getElementById('bar').style.width='0%';
+}
+function doUpload(){
+  if(!selFile)return;
+  var btn=document.getElementById('uploadBtn');
+  btn.disabled=true;btn.textContent='Uploading...';
+  document.getElementById('status').textContent='';
+  document.getElementById('status').style.color='#4fc3f7';
+  document.getElementById('bar').style.width='30%';
+  var fd=new FormData();
+  fd.append('file',selFile);
+  var xhr=new XMLHttpRequest();
+  xhr.open('POST','/upload',true);
+  xhr.upload.onprogress=function(e){
+    if(e.lengthComputable){
+      var pct=Math.round(e.loaded/e.total*90);
+      document.getElementById('bar').style.width=pct+'%';
+    }
+  };
+  xhr.onload=function(){
+    document.getElementById('bar').style.width='100%';
+    try{
+      var d=JSON.parse(xhr.responseText);
+      if(d.ok){
+        document.getElementById('status').textContent='OK: '+d.file+' uploaded. '+(d.message||'');
+        document.getElementById('status').style.color='#66bb6a';
+        btn.textContent='Upload & Apply';
+      }else{
+        document.getElementById('status').textContent='Error: '+(d.error||'Unknown');
+        document.getElementById('status').style.color='#ef5350';
+        document.getElementById('bar').style.background='#e53935';
+        btn.textContent='Upload & Apply';btn.disabled=false;
+      }
+    }catch(e){
+      document.getElementById('status').textContent='Error: bad response';
+      document.getElementById('status').style.color='#ef5350';
+      btn.textContent='Upload & Apply';btn.disabled=false;
+    }
+  };
+  xhr.onerror=function(){
+    document.getElementById('status').textContent='Network error';
+    document.getElementById('status').style.color='#ef5350';
+    btn.textContent='Upload & Apply';btn.disabled=false;
+  };
+  xhr.send(fd);
+}
+</script>
+</body></html>"""
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, threaded=True)
