@@ -168,7 +168,7 @@ def nav_start():
 @stream_app.route('/stop')
 def nav_stop():
     if _navigator_ref:
-        _navigator_ref.esp32.stop()
+        _navigator_ref.esp32.emergency_stop()
         _navigator_ref.state = State.WAITING
         return jsonify({"ok": True, "state": "WAITING"})
     return jsonify({"ok": False, "msg": "navigator not ready"})

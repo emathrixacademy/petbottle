@@ -550,6 +550,7 @@ void executeCmd(String cmd) {
       stopWheels();
       Serial.println("PI: WHEELS STOPPED");
     } else if (pi == "STOP") {
+      if (puState != PU_IDLE) pickupAbort();
       stopAll();
       Serial.println("PI: EMERGENCY STOP ALL");
     } else {
