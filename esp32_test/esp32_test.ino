@@ -85,10 +85,10 @@ const int NUM_SENSORS = 4;
 
 // --- Limit Switches ---
 #define LIMIT_1  36
-#define LIMIT_2  39
+#define LIMIT_2  15
 
 // --- IR Proximity (E18-D80NK, NPN open-collector, idle HIGH, LOW on detect) ---
-#define IR_PROX  15
+#define IR_PROX  39
 
 // --- Servos ---
 #define SERVO_L     13
@@ -215,7 +215,7 @@ int swingSpeed = 0;      // default swing PWM — 0 for safety
 //       Bottom limit must be physically positioned ~5° above 0 to act as
 //       the "lowest allowable" stop.
 // UP:   continuous full force (180 PWM) until TOP limit (SW1) trips.
-#define MANUAL_DOWN_SPEED    80
+#define MANUAL_DOWN_SPEED    60
 #define MANUAL_DOWN_ON_MS    200       // motor on per pulse
 #define MANUAL_DOWN_OFF_MS   300       // motor off between pulses
 #define MANUAL_UP_SPEED      180
@@ -243,9 +243,9 @@ bool puArmOn = false;              // tracks arm pulse on/off during lowering
 #define PU_LOWER_SPEED    80
 #define PU_LOWER_ON_MS    200      // arm on duration during pulsed lowering
 #define PU_LOWER_OFF_MS   300      // arm off duration during pulsed lowering
-#define PU_SCOOP_CLOSE_MS 800      // time to wait after closing scoopers
+#define PU_SCOOP_CLOSE_MS 1000     // time to wait after closing scoopers
 #define PU_LIFT_SPEED     255
-#define PU_DROP_OPEN_MS   800      // time to wait after opening scoopers
+#define PU_DROP_OPEN_MS   1000     // time to wait after opening scoopers
 // Servos are MIRRORED — sweep inward to scoop, outward to release.
 // If scooper direction is backwards, swap OPEN/CLOSE for both.
 #define PU_SERVO_OPEN_L   0        // scooper open (spread apart)
@@ -1617,11 +1617,11 @@ void setup() {
   for (int i = 0; i < NUM_SENSORS; i++) {
     pinMode(echoPins[i], INPUT);
   }
-  // Limit switches (input-only, need external 10k pull-up to 3.3V)
+  // Limit switches — LIMIT_1 (GPIO 36) needs external 10k pull-up; LIMIT_2 (GPIO 15) uses internal pull-up
   pinMode(LIMIT_1, INPUT);
-  pinMode(LIMIT_2, INPUT);
-  // E18-D80NK IR proximity sensor (open-collector, internal pull-up needed)
-  pinMode(IR_PROX, INPUT_PULLUP);
+  pinMode(LIMIT_2, INPUT_PULLUP);
+  // E18-D80NK IR proximity sensor (GPIO 39, needs external 10k pull-up — no internal pull-up available)
+  pinMode(IR_PROX, INPUT);
   // Buzzer
   pinMode(BUZZER, OUTPUT);
   digitalWrite(BUZZER, LOW);
