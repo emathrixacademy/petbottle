@@ -6,7 +6,7 @@ Autonomous PET bottle collection robot using dual processors:
 - **ESP32**: Motor control, sensors, WiFi AP, LCD — test firmware in `esp32_test/esp32_test.ino`
 - **Raspberry Pi 5 + Hailo-8 NPU**: YOLO vision + navigation brain — `camera.py`, `navigator.py`
 
-Communication: Pi <-> ESP32 is **WiFi HTTP**. Both devices connect to a mobile hotspot (`PetBottle_Robot` / `petbottle123`) as STA clients on the same local network. ESP32 uses static IP `192.168.43.100`. The Pi sends commands via `GET /cmd?c=<CMD>` and polls sensor data via `GET /sensor` every 200ms.
+Communication: Pi <-> ESP32 is **WiFi HTTP**. Both devices connect to a mobile hotspot (`petbottle_hotspot` / `petbottle123`) as STA clients on the same local network. ESP32 uses static IP `192.168.43.100`. The Pi sends commands via `GET /cmd?c=<CMD>` and polls sensor data via `GET /sensor` every 200ms.
 
 ## Build & Flash
 
