@@ -33,11 +33,12 @@ Connect to the same mobile hotspot, open `http://<esp32-ip>/ota` (check ESP32 LC
 
 | File | Purpose |
 |------|---------|
-| `esp32_test/esp32_test.ino` | **Active ESP32 firmware** — combined test with WiFi STA (hotspot), web UI, OTA, camera feed |
-| `camera.py` | YOLO v5/v7/v8 model support, detection, postprocessing (runs on Pi) |
-| `navigator.py` | Autonomous brain + Flask MJPEG video stream on port 5000 (runs on Pi) |
-| `pi_admin.py` | Admin dashboard on port 8080 — proxies navigator APIs, data recording, model switching (runs on Pi) |
-| `server.py` | OTA update server for remote deployment (runs on Pi) |
+| `esp32_test/esp32_test.ino` | **Active ESP32 firmware** — WiFi STA (hotspot), web UI, OTA, all motor/sensor controls |
+| `raspi/camera.py` | YOLO v5/v7/v8 model support, detection, postprocessing (runs on Pi) |
+| `raspi/navigator.py` | Autonomous brain + Flask MJPEG video stream on port 5000 (runs on Pi) |
+| `raspi/vision_ai.py` | AI vision verification — confirms YOLO detections, scene analysis, obstacle ID (runs on Pi) |
+| `raspi/pi_admin.py` | Web dashboard on port 8080 — manual controls (3 tabs), autonomous mode, data recording (runs on Pi) |
+| `raspi/server.py` | OTA update server for remote deployment (runs on Pi) |
 | `flash_ota.bat` | One-click compile + OTA flash from Windows |
 | `petbottle/petbottle.ino` | **LEGACY — do not use.** Sensor-only sketch, pins conflict |
 
@@ -127,6 +128,30 @@ The navigator sends these `PI`-prefixed commands so it always has motor control 
 | `PIBZL` | Buzzer long beep |
 | `P` | Start pickup sequence (also works from any mode) |
 | `PA` | Abort pickup sequence |
+
+## AI Vision Verification
+
+The navigator uses a secondary AI vision layer on top of YOLO for intelligent verification:
+
+- **Target verification**: After YOLO detects a bottle for N frames, AI analyzes the cropped image to confirm it's actually a PET bottle (not a cup, can, shoe, etc.)
+- **Scene analysis**: Every 8 seconds during SCANNING, AI analyzes the full camera frame and suggests navigation direction, can spot bottles YOLO missed
+- **Obstacle assessment**: When avoiding obstacles, AI identifies the obstacle type and suggests the safest avoidance direction
+
+All AI calls run in background threads (non-blocking). If the API is unavailable, the system falls back gracefully to YOLO-only detection.
+
+Requires `ANTHROPIC_API_KEY` environment variable set on the Pi.
+
+## Pi Dashboard (port 8080)
+
+Accessible from any device on the hotspot at `http://<pi-ip>:8080`
+
+| Tab | Features |
+|-----|----------|
+| Autonomous | Start/stop autonomous mode, live camera, YOLO stats, ultrasonic display, model switching |
+| Manual Control | D-pad wheels (speed slider), arm up/down, swing left/right, servo open/close, pickup sequence, buzzer, live sensors |
+| Data | Data recording, command log, CSV download, Pi OTA upload |
+
+All manual commands route through Pi → ESP32 via HTTP (never direct to ESP32).
 
 ## Navigator State Machine
 
