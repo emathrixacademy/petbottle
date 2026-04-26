@@ -1569,6 +1569,7 @@ void setup() {
 
   // --- WiFi STA (connect to mobile hotspot) ---
   WiFi.mode(WIFI_STA);
+  WiFi.setHostname("esp32_petbottle");
   WiFi.config(staticIP, gateway, subnet);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.printf("Connecting to WiFi '%s'...", WIFI_SSID);
