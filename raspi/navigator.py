@@ -11,13 +11,13 @@ The robot continuously:
   4. Triggers the pickup sequence on the ESP32
   5. Resumes roaming
 
-Transport: Pi <-> ESP32 is BLE UART (Nordic UART Service). ESP32's WiFi AP
-is still up for OTA / web debug, but the navigator does NOT use it.
+Transport: Pi <-> ESP32 is WiFi HTTP. Both devices connect to the same
+mobile hotspot. ESP32 has static IP 192.168.43.100.
 
 Usage:
-  python3 navigator.py                    # default (YOLOv8, auto-scan BLE)
+  python3 navigator.py                    # default (YOLOv8)
   python3 navigator.py --model yolov8     # default model
-  python3 navigator.py --ble-address AA:BB:CC:DD:EE:FF
+  python3 navigator.py --esp32-ip 192.168.43.100
   python3 navigator.py --no-show          # headless
 """
 
@@ -53,7 +53,7 @@ from hailo_platform import (
 # Configuration
 # ══════════════════════════════════════════════════════════════
 
-ESP32_IP = "192.168.4.1"
+ESP32_IP = "192.168.43.100"
 ESP32_BASE_URL = f"http://{ESP32_IP}"
 
 # Obstacle avoidance thresholds (cm)
@@ -219,7 +219,7 @@ h1{text-align:center;font-size:1.3rem;margin-bottom:8px;color:#4fc3f7}
 .video-wrap img{width:100%;max-width:640px;border-radius:12px;border:2px solid #333}
 .badge{position:absolute;top:10px;right:10px;padding:6px 14px;border-radius:8px;
   font-weight:700;font-size:.9rem;color:#111}
-.ble-dot{position:absolute;top:10px;left:10px;padding:6px 14px;border-radius:8px;
+.wifi-dot{position:absolute;top:10px;left:10px;padding:6px 14px;border-radius:8px;
   font-weight:700;font-size:.75rem}
 .section{max-width:640px;margin:10px auto}
 .controls{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin:12px 0}
@@ -257,7 +257,7 @@ button:active{transform:scale(.94)}
 <div class="video-wrap">
   <img src="/video_feed" alt="Live Feed">
   <div class="badge" id="badge" style="background:#ff9800">WAITING</div>
-  <div class="ble-dot" id="ble" style="background:#ef5350;color:#fff">WiFi: --</div>
+  <div class="wifi-dot" id="wifi" style="background:#ef5350;color:#fff">WiFi: --</div>
 </div>
 
 <div class="section">
@@ -351,9 +351,9 @@ function poll(){
     b.textContent=d.state||'?';
     b.style.background=stateColors[d.state]||'#666';
     if(d.state==='MISSION_COMPLETE') b.textContent='BIN FULL';
-    const ble=document.getElementById('ble');
-    ble.textContent=d.bleConnected?'WiFi: Connected':'WiFi: Disconnected';
-    ble.style.background=d.bleConnected?'#66bb6a':'#ef5350';
+    const wifi=document.getElementById('wifi');
+    wifi.textContent=d.espConnected?'WiFi: Connected':'WiFi: Disconnected';
+    wifi.style.background=d.espConnected?'#66bb6a':'#ef5350';
     if(d.ultrasonic){
       var u=d.ultrasonic;
       ['f','r','b','l'].forEach((k,i)=>{
@@ -924,13 +924,17 @@ class Navigator:
                 return
 
         # ── Emergency stop: front ultrasonic too close ────
-        if us_front < STOP_DIST:
+        # Skip obstacle avoidance when actively pursuing a bottle —
+        # the bottle itself triggers the ultrasonic.
+        _pursuing = self.state in (State.VERIFYING, State.APPROACHING,
+                                   State.ALIGNING)
+        if us_front < STOP_DIST and not _pursuing:
             self.esp32.stop()
             self._enter_avoiding(f"FRONT < {STOP_DIST}cm")
             return
 
         # ── Ultrasonic: slow zone → steer away gently ────
-        if us_min_forward < TURN_DIST:
+        if us_min_forward < TURN_DIST and not _pursuing:
             if us_left < us_right:
                 self.esp32.turn_right(SCAN_SPEED)
             else:

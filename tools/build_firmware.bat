@@ -23,8 +23,8 @@ echo === BUILD OK ===
 echo Binary: %cd%\robotic_arm\robotic_arm.bin
 echo.
 echo Next steps:
-echo   1. Connect to WiFi:  PetBottle_Robot  (password: petbottle123)
-echo   2. Open browser:     http://192.168.4.1/ota
+echo   1. Connect to hotspot:  PetBottle_Robot  (password: petbottle123)
+echo   2. Open browser:     http://192.168.43.100/ota
 echo   3. Choose file:      robotic_arm\robotic_arm.bin
 echo   4. Click Upload ^& Flash
 echo.

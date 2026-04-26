@@ -260,12 +260,12 @@
     │  │ YOLO v8  │    │             │      │
     │  └──────────┘    └─────────────┘      │
     │                                       │
-    │  WiFi ──► ESP32 AP (PetBottle_Robot)  │
-    │           IP: 192.168.4.4             │
+    │  WiFi ──► Mobile Hotspot (STA mode)   │
+    │           ESP32: 192.168.43.100       │
     │                                       │
     │  Communication: WiFi HTTP             │
-    │    Commands: GET 192.168.4.1/cmd?c=X  │
-    │    Sensors:  GET 192.168.4.1/sensor   │
+    │    Commands: GET 192.168.43.100/cmd?c=X│
+    │    Sensors:  GET 192.168.43.100/sensor│
     │                                       │
     │  Services:                            │
     │    navigator.py  → port 5000 (MJPEG)  │

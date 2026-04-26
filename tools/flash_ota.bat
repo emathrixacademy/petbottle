@@ -8,8 +8,8 @@ set FQBN=esp32:esp32:esp32:PartitionScheme=min_spiffs
 set SKETCH=robotic_arm\robotic_arm.ino
 set BIN=build_robotic\robotic_arm.ino.bin
 set COPY_TO=robotic_arm\robotic_arm.bin
-set ESP_SSID=PetBottle_Robot
-set ESP_IP=192.168.4.1
+set HOTSPOT_SSID=PetBottle_Robot
+set ESP_IP=192.168.43.100
 set OTA_URL=http://%ESP_IP%/ota
 set TIMEOUT=10
 
@@ -33,59 +33,29 @@ copy /Y "%BIN%" "%COPY_TO%" >nul 2>&1
 echo.
 echo [OK] Compiled successfully: %BIN%
 
-:: ===================== STEP 2: REMEMBER HOME WIFI =====================
+:: ===================== STEP 2: CHECK HOTSPOT CONNECTION =====================
 echo.
 echo ============================================
-echo   STEP 2: Saving current WiFi...
+echo   STEP 2: Checking hotspot connection...
 echo ============================================
 echo.
-
-for /f "tokens=2 delims=:" %%a in ('netsh wlan show interfaces ^| findstr /C:"SSID" ^| findstr /V "BSSID"') do (
-    set "HOME_SSID=%%a"
-    goto :got_ssid
-)
-:got_ssid
-:: Trim leading space
-set HOME_SSID=%HOME_SSID:~1%
-echo [OK] Home WiFi: %HOME_SSID%
-
-:: ===================== STEP 3: SWITCH TO ESP32 WIFI =====================
-echo.
-echo ============================================
-echo   STEP 3: Connecting to %ESP_SSID%...
-echo ============================================
+echo Make sure your PC is connected to the %HOTSPOT_SSID% hotspot.
+echo ESP32 should be reachable at %ESP_IP%.
 echo.
 
-netsh wlan connect name="%ESP_SSID%" >nul 2>&1
-
-:: Wait for connection (up to 15 seconds)
-set CONNECTED=0
-for /L %%i in (1,1,15) do (
-    if !CONNECTED! == 0 (
-        timeout /t 1 /nobreak >nul
-        for /f "tokens=2 delims=:" %%a in ('netsh wlan show interfaces ^| findstr /C:"SSID" ^| findstr /V "BSSID"') do (
-            echo %%a | findstr /C:"%ESP_SSID%" >nul && set CONNECTED=1
-        )
-    )
+:: Quick ping check
+ping -n 1 -w 2000 %ESP_IP% >nul 2>&1
+if errorlevel 1 (
+    echo [WARNING] Cannot reach ESP32 at %ESP_IP%.
+    echo           Make sure hotspot is on and ESP32 is connected.
+    echo           Press any key to try OTA anyway, or Ctrl+C to abort.
+    pause >nul
 )
 
-if %CONNECTED% == 0 (
-    echo [ERROR] Could not connect to %ESP_SSID%.
-    echo         Make sure the robot is powered on and in range.
-    echo         Reconnecting to %HOME_SSID%...
-    netsh wlan connect name="%HOME_SSID%" >nul 2>&1
-    pause
-    exit /b 1
-)
-echo [OK] Connected to %ESP_SSID%
-
-:: Wait a moment for IP assignment
-timeout /t 2 /nobreak >nul
-
-:: ===================== STEP 4: UPLOAD VIA OTA =====================
+:: ===================== STEP 3: UPLOAD VIA OTA =====================
 echo.
 echo ============================================
-echo   STEP 4: Uploading firmware via OTA...
+echo   STEP 3: Uploading firmware via OTA...
 echo ============================================
 echo.
 echo Uploading %BIN% to %OTA_URL% ...
@@ -110,24 +80,12 @@ if "%HTTP_STATUS%" == "200" (
 :: Cleanup temp files
 del /q ota_response.tmp ota_status.tmp 2>nul
 
-:: ===================== STEP 5: SWITCH BACK TO HOME WIFI =====================
-echo.
-echo ============================================
-echo   STEP 5: Reconnecting to %HOME_SSID%...
-echo ============================================
-echo.
-
-netsh wlan connect name="%HOME_SSID%" >nul 2>&1
-timeout /t 3 /nobreak >nul
-echo [OK] Back on %HOME_SSID%
-
 :: ===================== DONE =====================
 echo.
 echo ============================================
 echo   DONE! Firmware flashed via OTA.
 echo ============================================
 echo.
-echo   To verify: connect phone to %ESP_SSID%
-echo   and open http://%ESP_IP%/
+echo   To verify: open http://%ESP_IP%/
 echo.
 pause

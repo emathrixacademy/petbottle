@@ -6,7 +6,7 @@ Autonomous PET bottle collection robot using dual processors:
 - **ESP32**: Motor control, sensors, WiFi AP, LCD — test firmware in `esp32_test/esp32_test.ino`
 - **Raspberry Pi 5 + Hailo-8 NPU**: YOLO vision + navigation brain — `camera.py`, `navigator.py`
 
-Communication: Pi <-> ESP32 is **BLE UART** (Nordic UART Service). The Pi scans for the BLE device named `PetBottle_Robot` and connects automatically. ESP32 is powered independently (not via Pi USB). The ESP32 still hosts a WiFi AP (`PetBottle_Robot` / `petbottle123` / `192.168.4.1`) for OTA flashing and the web test dashboard, but the navigator does NOT use it for control.
+Communication: Pi <-> ESP32 is **WiFi HTTP**. Both devices connect to a mobile hotspot (`PetBottle_Robot` / `petbottle123`) as STA clients on the same local network. ESP32 uses static IP `192.168.43.100`. The Pi sends commands via `GET /cmd?c=<CMD>` and polls sensor data via `GET /sensor` every 200ms.
 
 ## Build & Flash
 
@@ -22,7 +22,7 @@ arduino-cli upload -p COM3 --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs -
 Hold BOOT button on ESP32 during upload if it fails to connect.
 
 ### Flash via OTA
-Connect to PetBottle_Robot WiFi, open `http://192.168.4.1/ota`, upload `.bin` file.
+Connect to the same mobile hotspot, open `http://192.168.43.100/ota`, upload `.bin` file.
 
 ### ESP32 Arduino core
 - arduino-cli has v2.0.17 installed — code uses v2 API: `ledcSetup()` + `ledcAttachPin()` + `ledcWrite(channel, duty)`
@@ -33,7 +33,7 @@ Connect to PetBottle_Robot WiFi, open `http://192.168.4.1/ota`, upload `.bin` fi
 
 | File | Purpose |
 |------|---------|
-| `esp32_test/esp32_test.ino` | **Active ESP32 firmware** — combined test with WiFi AP, web UI, OTA, camera feed |
+| `esp32_test/esp32_test.ino` | **Active ESP32 firmware** — combined test with WiFi STA (hotspot), web UI, OTA, camera feed |
 | `camera.py` | YOLO v5/v7/v8 model support, detection, postprocessing (runs on Pi) |
 | `navigator.py` | Autonomous brain + Flask MJPEG video stream on port 5000 (runs on Pi) |
 | `pi_admin.py` | Admin dashboard on port 8080 — proxies navigator APIs, data recording, model switching (runs on Pi) |
@@ -90,25 +90,17 @@ ESP32 LEDC channels share hardware timers in pairs: ch0/1, ch2/3, ch4/5, ch6/7. 
 
 Never assign channels out-of-order or across timer pairs for different motors.
 
-## ESP32 HTTP API (debug / OTA only — navigator does NOT use this)
+## ESP32 HTTP API (used by both navigator and web debug UI)
+
+Base URL: `http://192.168.43.100` (ESP32 static IP on hotspot)
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/` | GET | Web control dashboard (tabbed test UI) |
-| `/cmd?c=<CMD>` | GET | Execute command |
-| `/sensor` | GET | JSON: ultrasonic, limits, speeds |
+| `/cmd?c=<CMD>` | GET | Execute command (Pi navigator + web UI) |
+| `/sensor` | GET | JSON: ultrasonic, limits, speeds (polled every 200ms by Pi) |
 | `/cmdlog` | GET | JSON: recent Pi-ESP32 command log |
 | `/ota` | GET/POST | Firmware upload page |
-
-## ESP32 BLE UART Protocol (Pi <-> ESP32, primary control path)
-
-Line-based ASCII over BLE UART (Nordic UART Service). ESP32 acts as BLE GATT server advertising as `PetBottle_Robot`. Pi connects as BLE client using `bleak`. ESP32 accepts the same `PI*`-prefixed commands (one per line, terminated by `\n`). After each command the ESP32 sends a `OK <cmd>` or `ERR <cmd>` ACK via BLE notify.
-
-Every 200 ms the ESP32 pushes one JSON sensor packet via BLE notify — same schema as the HTTP `/sensor` endpoint:
-```
-{"mode":"menu","ultrasonic":{"s1":120,...},"limits":{...},"pickup":"idle",...}
-```
-The Pi's BLE parser tolerates unrecognized data (firmware debug output is silently ignored) — only lines starting with `{`, `OK `, or `ERR ` are interpreted. USB Serial is kept for Arduino IDE Serial Monitor debugging only.
 
 ### Pi Direct Commands (bypass test-UI mode system)
 
@@ -139,8 +131,10 @@ At any point: ultrasonic < 60 cm → `AVOIDING` (back up + turn) → `SCANNING`
 ## Navigator Video Stream (Pi)
 
 navigator.py serves a Flask MJPEG stream on port 5000:
-- `http://192.168.4.4:5000/video_feed` — live MJPEG stream with YOLO detections
-- `http://192.168.4.4:5000/stats` — JSON detection stats (fps, bottles, model, state)
+- `http://<pi-ip>:5000/video_feed` — live MJPEG stream with YOLO detections
+- `http://<pi-ip>:5000/stats` — JSON detection stats (fps, bottles, model, state)
+
+Pi IP is assigned by the phone hotspot DHCP (check `hostname -I` on the Pi).
 
 Auto-starts on boot via systemd service `petbottle-navigator`.
 
@@ -166,5 +160,5 @@ Auto-starts on boot via systemd service `petbottle-navigator`.
 - HEF models compiled for Hailo8L show warnings on Hailo8 (lower performance)
 - `petbottle/petbottle.ino` has conflicting GPIO assignments — never flash it on the robot's ESP32
 - **Motor isolation issue (WIP)**: Arm/swing/servo commands were also moving wheels — fix applied (safe boot sequence + per-command EN management) but needs testing after recompile
-- **No OTA/API authentication** — anyone on the ESP32 WiFi can upload firmware or send commands. Add token auth before deploying in public
+- **No OTA/API authentication** — anyone on the hotspot network can upload firmware or send commands. Add token auth before deploying in public
 - Pickup sequence has a **30-second timeout** — if limit switch doesn't trigger, arm motor stops automatically to prevent burnout

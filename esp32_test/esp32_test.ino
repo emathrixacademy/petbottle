@@ -1,10 +1,11 @@
 /*
   PET Bottle Robot — Combined Component Test
   ============================================
-  WiFi AP: PetBottle_Robot / petbottle123
-  Web UI:  http://192.168.4.1
-  OTA:     http://192.168.4.1/ota
-  Sensor:  http://192.168.4.1/sensor
+  WiFi STA: connects to mobile hotspot (SSID/pass below)
+  Static IP: 192.168.43.100
+  Web UI:  http://192.168.43.100
+  OTA:     http://192.168.43.100/ota
+  Sensor:  http://192.168.43.100/sensor
   Serial:  115200 baud
 
   Select a test mode from the menu (Serial or Web), then use that mode's commands.
@@ -29,10 +30,15 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-// ==================== WiFi AP ====================
+// ==================== WiFi STA (mobile hotspot) ====================
 
-const char* AP_SSID = "PetBottle_Robot";
-const char* AP_PASS = "petbottle123";
+const char* WIFI_SSID = "PetBottle_Robot";
+const char* WIFI_PASS = "petbottle123";
+
+IPAddress staticIP(192, 168, 43, 100);
+IPAddress gateway(192, 168, 43, 1);
+IPAddress subnet(255, 255, 255, 0);
+
 WebServer server(80);
 
 // ==================== PIN DEFINITIONS ====================
@@ -95,12 +101,8 @@ const int NUM_SENSORS = 4;
 // --- Buzzer ---
 #define BUZZER  3
 
-// Forward declarations for BLE callbacks
 void executeCmd(String cmd);
 volatile unsigned long lastPiCmdMs = 0;
-
-// ==================== BLE UART (Nordic UART Service) ====================
-
 
 // ==================== CONSTANTS ====================
 
@@ -792,8 +794,8 @@ void printMenu() {
   Serial.println();
   Serial.println("=========================================");
   Serial.println("  PET Bottle Robot - Component Test Menu");
-  Serial.println("  WiFi: PetBottle_Robot / petbottle123");
-  Serial.printf("  Web:  http://%s\n", WiFi.softAPIP().toString().c_str());
+  Serial.printf("  WiFi: %s\n", WIFI_SSID);
+  Serial.printf("  Web:  http://%s\n", WiFi.localIP().toString().c_str());
   Serial.println("=========================================");
   Serial.println("  1 = Ultrasonic Sensors (x4)");
   Serial.println("  2 = Drive Wheels (BTS7960 x2)");
@@ -957,8 +959,8 @@ button:active{transform:scale(.94)}
 <h2>Component Test Dashboard</h2>
 
 <div class="ip-box">
-  <span>ESP32</span><code>192.168.4.1</code>
-  <span style="margin-left:8px">Pi</span><code>192.168.4.4</code>
+  <span>ESP32</span><code>192.168.43.100</code>
+  <span style="margin-left:8px">Pi</span><code>192.168.43.101</code>
 </div>
 
 <div id="sensors">Sensors: loading...</div>
@@ -980,7 +982,7 @@ button:active{transform:scale(.94)}
 <div style="text-align:center;margin-bottom:8px">
   <div class="slider-row" style="justify-content:center">
     <label style="width:auto">Pi IP:</label>
-    <input type="text" id="piIp" value="192.168.4.4" style="background:#f5f7fa;color:#1565c0;
+    <input type="text" id="piIp" value="192.168.43.101" style="background:#f5f7fa;color:#1565c0;
       border:1px solid #bbdefb;border-radius:8px;padding:8px 12px;font-family:monospace;
       font-size:.9rem;width:140px;text-align:center">
     <button class="bg" onclick="connectCam()" id="camBtn" style="padding:8px 16px;font-size:.85rem">Connect</button>
@@ -1565,19 +1567,29 @@ void setup() {
   lcd.setCursor(0, 0);
   lcd.print("Component Test");
 
-  // --- WiFi AP (permanent static IP) ---
-  IPAddress apIP(192, 168, 4, 1);
-  IPAddress gateway(192, 168, 4, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  WiFi.softAPConfig(apIP, gateway, subnet);
-  WiFi.softAP(AP_SSID, AP_PASS);
-  Serial.print("WiFi AP: ");
-  Serial.print(AP_SSID);
-  Serial.print(" @ ");
-  Serial.println(WiFi.softAPIP());
-
+  // --- WiFi STA (connect to mobile hotspot) ---
+  WiFi.mode(WIFI_STA);
+  WiFi.config(staticIP, gateway, subnet);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("Connecting to WiFi '%s'...", WIFI_SSID);
   lcd.setCursor(0, 1);
-  lcd.print(WiFi.softAPIP().toString());
+  lcd.print("WiFi...");
+
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nWiFi connected: %s\n", WiFi.localIP().toString().c_str());
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP().toString());
+  } else {
+    Serial.println("\nWiFi FAILED — check hotspot");
+    lcd.setCursor(0, 1);
+    lcd.print("WiFi FAILED!");
+  }
 
   // --- Web server ---
   server.on("/", handleWebRoot);
@@ -1604,9 +1616,9 @@ void setup() {
   beep(50);
   Serial.println("=========================================");
   Serial.println("  PET Bottle Robot - Component Test");
-  Serial.printf("  WiFi: %s / %s\n", AP_SSID, AP_PASS);
-  Serial.printf("  Web:  http://%s\n", WiFi.softAPIP().toString().c_str());
-  Serial.printf("  OTA:  http://%s/ota\n", WiFi.softAPIP().toString().c_str());
+  Serial.printf("  WiFi: %s / %s\n", WIFI_SSID, WIFI_PASS);
+  Serial.printf("  Web:  http://%s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("  OTA:  http://%s/ota\n", WiFi.localIP().toString().c_str());
   Serial.println("=========================================");
   printMenu();
 }
@@ -1691,7 +1703,6 @@ void loop() {
   }
 
   // Serial input — debug only (Arduino IDE Serial Monitor).
-  // Pi commands now come via BLE UART, not USB serial.
   static String serialBuf;
   while (Serial.available()) {
     char c = Serial.read();
@@ -1709,7 +1720,7 @@ void loop() {
   }
 
   // ── Wheel watchdog ───────────────────────────────────────
-  // If the Pi stops sending BLE commands (disconnect, navigator crash),
+  // If the Pi stops sending commands (disconnect, navigator crash),
   // force wheels to zero after WHEEL_WATCHDOG_MS of silence.
   #define WHEEL_WATCHDOG_MS 1000
   static bool watchdogTripped = false;
