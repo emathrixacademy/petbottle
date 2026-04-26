@@ -551,6 +551,45 @@ void executeCmd(String cmd) {
       if (puState != PU_IDLE) pickupAbort();
       stopAll();
       Serial.println("PI: EMERGENCY STOP ALL");
+    } else if (pi == "AU") {
+      armManualPulseActive = false;
+      armSpeed = MANUAL_UP_SPEED;
+      setArm(1);
+      Serial.printf("PI: ARM UP at %d\n", armSpeed);
+    } else if (pi == "AD") {
+      armSpeed = MANUAL_DOWN_SPEED;
+      setArm(-1);
+      armManualPulseActive = true;
+      armManualPulseOn = true;
+      armManualPulseTimer = millis();
+      Serial.printf("PI: ARM DOWN pulsed at %d\n", armSpeed);
+    } else if (pi == "AS") {
+      armManualPulseActive = false;
+      stopArm();
+      Serial.println("PI: ARM STOPPED");
+    } else if (pi == "SWL") {
+      setSwing(-1);
+      Serial.printf("PI: SWING LEFT at %d\n", swingSpeed);
+    } else if (pi == "SWR") {
+      setSwing(1);
+      Serial.printf("PI: SWING RIGHT at %d\n", swingSpeed);
+    } else if (pi == "SWS") {
+      stopSwing();
+      Serial.println("PI: SWING STOPPED");
+    } else if (pi == "SO") {
+      setServo(SERVO_L_CH, PU_SERVO_OPEN_L);
+      setServo(SERVO_R_CH, PU_SERVO_OPEN_R);
+      Serial.println("PI: SERVOS OPEN");
+    } else if (pi == "SC") {
+      setServo(SERVO_L_CH, PU_SERVO_CLOSE_L);
+      setServo(SERVO_R_CH, PU_SERVO_CLOSE_R);
+      Serial.println("PI: SERVOS CLOSE");
+    } else if (pi == "BZ") {
+      beep(100);
+      Serial.println("PI: BUZZER BEEP");
+    } else if (pi == "BZL") {
+      beep(500);
+      Serial.println("PI: BUZZER LONG");
     } else {
       Serial.printf("PI: unknown command '%s'\n", pi.c_str());
     }

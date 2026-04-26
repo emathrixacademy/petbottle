@@ -5,7 +5,7 @@ Port 8080. All navigator calls proxied through here (no CORS issues).
 """
 
 import os, csv, time, threading, json, subprocess, shutil
-import urllib.request
+import urllib.request, urllib.parse
 from datetime import datetime
 from flask import Flask, jsonify, request, send_file, Response
 from werkzeug.utils import secure_filename
@@ -14,6 +14,67 @@ app = Flask(__name__)
 NAV = "http://127.0.0.1:5000"
 DATA_DIR = "/home/set-admin/testing/test_data"
 os.makedirs(DATA_DIR, exist_ok=True)
+
+ESP32_IP = None
+ESP32_BASE = None
+
+def find_esp32():
+    global ESP32_IP, ESP32_BASE
+    if ESP32_IP:
+        return ESP32_IP
+    try:
+        d = nav_get("/stats", timeout=3)
+        ip = d.get("esp32_ip")
+        if ip:
+            ESP32_IP = ip
+            ESP32_BASE = f"http://{ip}"
+            return ip
+    except Exception:
+        pass
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        my_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        return None
+    prefix = my_ip.rsplit(".", 1)[0]
+    for i in range(1, 255):
+        ip = f"{prefix}.{i}"
+        try:
+            req = urllib.request.urlopen(f"http://{ip}/sensor", timeout=0.3)
+            if b"ultrasonic" in req.read():
+                ESP32_IP = ip
+                ESP32_BASE = f"http://{ip}"
+                return ip
+        except Exception:
+            pass
+    return None
+
+def esp32_cmd(command):
+    if not ESP32_BASE:
+        find_esp32()
+    if not ESP32_BASE:
+        return {"ok": False, "error": "ESP32 not found"}
+    try:
+        url = f"{ESP32_BASE}/cmd?c={urllib.parse.quote(command)}"
+        req = urllib.request.urlopen(url, timeout=2)
+        resp = req.read().decode("utf-8", errors="replace").strip()
+        return {"ok": True, "cmd": command, "resp": resp[:80]}
+    except Exception as e:
+        return {"ok": False, "cmd": command, "error": str(e)}
+
+def esp32_sensor():
+    if not ESP32_BASE:
+        find_esp32()
+    if not ESP32_BASE:
+        return {"ok": False, "error": "ESP32 not found"}
+    try:
+        req = urllib.request.urlopen(f"{ESP32_BASE}/sensor", timeout=2)
+        return json.loads(req.read())
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 recording = {"active": False, "session": None, "file": None, "writer": None,
              "model": "", "start": 0, "rows": 0, "lock": threading.Lock()}
@@ -106,6 +167,29 @@ def nav_video():
     except Exception as e:
         return Response(f"Navigator not available: {e}", status=502)
 
+# ── Manual control routes ────────────────────────────────────
+
+@app.route("/manual/cmd")
+def manual_cmd():
+    c = request.args.get("c", "")
+    if not c:
+        return jsonify({"ok": False, "error": "no command"})
+    return jsonify(esp32_cmd(c))
+
+@app.route("/manual/sensor")
+def manual_sensor():
+    return jsonify(esp32_sensor())
+
+@app.route("/manual/discover")
+def manual_discover():
+    global ESP32_IP, ESP32_BASE
+    ESP32_IP = None
+    ESP32_BASE = None
+    ip = find_esp32()
+    if ip:
+        return jsonify({"ok": True, "ip": ip})
+    return jsonify({"ok": False, "error": "ESP32 not found on network"})
+
 # ── Main page ────────────────────────────────────────────────
 
 PAGE_HTML = r"""<!DOCTYPE html>
@@ -118,6 +202,14 @@ body{background:#1a1a2e;color:#e0e0e0;font-family:'Segoe UI',system-ui,sans-seri
   -webkit-tap-highlight-color:transparent}
 h1{color:#4fc3f7;font-size:1.4rem;text-align:center;font-weight:800;margin-bottom:2px}
 .subtitle{text-align:center;font-size:.8rem;color:#888;margin-bottom:10px}
+.tabs{display:flex;gap:4px;margin-bottom:10px}
+.tab{flex:1;padding:10px 0;border:2px solid #333;border-radius:10px;
+  background:#0d1117;color:#888;font-weight:700;font-size:.85rem;
+  cursor:pointer;text-align:center;transition:all .15s}
+.tab.active{border-color:#4fc3f7;color:#fff;background:#1565c0}
+.tab:active{transform:scale(.96)}
+.panel{display:none}
+.panel.active{display:block}
 .card{background:#16213e;border-radius:14px;padding:14px;margin:10px 0;
   box-shadow:0 2px 12px rgba(0,0,0,.2);border:1px solid #1e2d4a}
 .card h2{font-size:.75rem;color:#888;font-weight:600;text-transform:uppercase;
@@ -190,10 +282,60 @@ h1{color:#4fc3f7;font-size:1.4rem;text-align:center;font-weight:800;margin-botto
 .sess .name{color:#4fc3f7;font-weight:600}
 .dl{color:#2e7d32;text-decoration:none;font-weight:700;font-size:.75rem}
 .footer{text-align:center;margin-top:12px;font-size:.65rem;color:#555}
+
+/* Manual controls */
+.ctrl-group{margin:8px 0}
+.ctrl-group h3{font-size:.7rem;color:#4fc3f7;font-weight:700;text-transform:uppercase;
+  letter-spacing:.5px;margin-bottom:6px}
+.dpad{display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr 1fr;
+  gap:4px;max-width:220px;margin:0 auto}
+.dpad .cbtn{width:100%;aspect-ratio:1;border:none;border-radius:10px;
+  font-size:.7rem;font-weight:800;cursor:pointer;color:#fff;
+  transition:transform .06s;touch-action:manipulation}
+.dpad .cbtn:active{transform:scale(.92)}
+.dpad .empty{background:transparent}
+.cbtn-fwd{background:linear-gradient(135deg,#1976d2,#1565c0)}
+.cbtn-bwd{background:linear-gradient(135deg,#1976d2,#1565c0)}
+.cbtn-left{background:linear-gradient(135deg,#e65100,#bf360c)}
+.cbtn-right{background:linear-gradient(135deg,#e65100,#bf360c)}
+.cbtn-stop{background:linear-gradient(135deg,#e53935,#c62828);font-size:.65rem!important}
+.motor-row{display:flex;gap:6px;justify-content:center;flex-wrap:wrap}
+.motor-btn{flex:1;min-width:60px;padding:12px 6px;border:none;border-radius:10px;
+  font-size:.75rem;font-weight:700;cursor:pointer;color:#fff;
+  transition:transform .06s;touch-action:manipulation;text-align:center}
+.motor-btn:active{transform:scale(.92)}
+.motor-btn.up{background:linear-gradient(135deg,#43a047,#2e7d32)}
+.motor-btn.down{background:linear-gradient(135deg,#e65100,#bf360c)}
+.motor-btn.stp{background:linear-gradient(135deg,#78909c,#546e7a)}
+.motor-btn.open{background:linear-gradient(135deg,#1976d2,#1565c0)}
+.motor-btn.close{background:linear-gradient(135deg,#7b1fa2,#6a1b9a)}
+.motor-btn.buzz{background:linear-gradient(135deg,#fbc02d,#f9a825);color:#333}
+.motor-btn.pickup{background:linear-gradient(135deg,#43a047,#2e7d32);padding:14px 6px}
+.motor-btn.abort{background:linear-gradient(135deg,#e53935,#c62828);padding:14px 6px}
+.speed-row{display:flex;align-items:center;gap:8px;margin:6px 0;justify-content:center}
+.speed-row label{font-size:.7rem;color:#888;font-weight:600}
+.speed-row input[type=range]{flex:1;max-width:160px;accent-color:#4fc3f7}
+.speed-row .speed-val{font-size:.85rem;font-weight:800;color:#4fc3f7;min-width:30px;text-align:center}
+#manualLog{max-height:80px;overflow-y:auto;font-family:monospace;font-size:.65rem;
+  background:#0d1117;border:1px solid #1e2d4a;border-radius:8px;padding:6px;color:#43a047;
+  white-space:pre-wrap;margin-top:6px}
+.sensor-live{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:6px}
+.slv{background:#0d1117;border:1px solid #1e2d4a;border-radius:8px;padding:6px 8px}
+.slv .sl{font-size:.6rem;color:#666;font-weight:600}
+.slv .sv{font-size:.85rem;font-weight:700;color:#4fc3f7;font-family:monospace}
 </style></head><body>
 
 <h1>PET Bottle Robot</h1>
 <div class="subtitle">Autonomous Collection System</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="showTab('autonomous')">Autonomous</div>
+  <div class="tab" onclick="showTab('manual')">Manual Control</div>
+  <div class="tab" onclick="showTab('data')">Data</div>
+</div>
+
+<!-- ═══ AUTONOMOUS TAB ═══ -->
+<div class="panel active" id="panel-autonomous">
 
 <div class="card">
   <h2>Robot Connection (WiFi)</h2>
@@ -254,9 +396,95 @@ h1{color:#4fc3f7;font-size:1.4rem;text-align:center;font-weight:800;margin-botto
   <div id="mStatus"></div>
 </div>
 
-<div style="margin:12px 0">
-  <button class="emergency" onclick="emergencyStop()">EMERGENCY STOP</button>
+</div><!-- end autonomous panel -->
+
+<!-- ═══ MANUAL CONTROL TAB ═══ -->
+<div class="panel" id="panel-manual">
+
+<div class="card">
+  <h2>Wheels</h2>
+  <div class="speed-row">
+    <label>Speed</label>
+    <input type="range" id="wheelSpd" min="10" max="80" value="40" oninput="document.getElementById('wheelSpdVal').textContent=this.value">
+    <span class="speed-val" id="wheelSpdVal">40</span>
+  </div>
+  <div class="dpad">
+    <div class="cbtn empty"></div>
+    <button class="cbtn cbtn-fwd" ontouchstart="mc('PIFW'+gs())" onmousedown="mc('PIFW'+gs())">FWD</button>
+    <div class="cbtn empty"></div>
+    <button class="cbtn cbtn-left" ontouchstart="mc('PITL'+gs())" onmousedown="mc('PITL'+gs())">LEFT</button>
+    <button class="cbtn cbtn-stop" ontouchstart="mc('PIX')" onmousedown="mc('PIX')">STOP</button>
+    <button class="cbtn cbtn-right" ontouchstart="mc('PITR'+gs())" onmousedown="mc('PITR'+gs())">RIGHT</button>
+    <div class="cbtn empty"></div>
+    <button class="cbtn cbtn-bwd" ontouchstart="mc('PIBW'+gs())" onmousedown="mc('PIBW'+gs())">BWD</button>
+    <div class="cbtn empty"></div>
+  </div>
 </div>
+
+<div class="card">
+  <h2>Arm Lift</h2>
+  <div class="motor-row">
+    <button class="motor-btn up" ontouchstart="mc('PIAU')" onmousedown="mc('PIAU')">ARM UP</button>
+    <button class="motor-btn stp" ontouchstart="mc('PIAS')" onmousedown="mc('PIAS')">STOP</button>
+    <button class="motor-btn down" ontouchstart="mc('PIAD')" onmousedown="mc('PIAD')">ARM DOWN</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Swing Platform</h2>
+  <div class="motor-row">
+    <button class="motor-btn open" ontouchstart="mc('PISWL')" onmousedown="mc('PISWL')">SWING L</button>
+    <button class="motor-btn stp" ontouchstart="mc('PISWS')" onmousedown="mc('PISWS')">STOP</button>
+    <button class="motor-btn open" ontouchstart="mc('PISWR')" onmousedown="mc('PISWR')">SWING R</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Scoopers (Servos)</h2>
+  <div class="motor-row">
+    <button class="motor-btn open" ontouchstart="mc('PISO')" onmousedown="mc('PISO')">OPEN</button>
+    <button class="motor-btn close" ontouchstart="mc('PISC')" onmousedown="mc('PISC')">CLOSE</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Pickup Sequence</h2>
+  <div class="motor-row">
+    <button class="motor-btn pickup" ontouchstart="mc('P')" onmousedown="mc('P')">START PICKUP</button>
+    <button class="motor-btn abort" ontouchstart="mc('PA')" onmousedown="mc('PA')">ABORT</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Buzzer</h2>
+  <div class="motor-row">
+    <button class="motor-btn buzz" ontouchstart="mc('PIBZ')" onmousedown="mc('PIBZ')">BEEP</button>
+    <button class="motor-btn buzz" ontouchstart="mc('PIBZL')" onmousedown="mc('PIBZL')">LONG BEEP</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Sensors (Live)</h2>
+  <div class="us-grid">
+    <div class="us-item clear" id="musF"><div class="v">--</div><div class="l">FRONT</div></div>
+    <div class="us-item clear" id="musL"><div class="v">--</div><div class="l">LEFT</div></div>
+    <div class="us-item clear" id="musR"><div class="v">--</div><div class="l">RIGHT</div></div>
+    <div class="us-item clear" id="musB"><div class="v">--</div><div class="l">BACK</div></div>
+  </div>
+  <div class="sensor-live">
+    <div class="slv"><div class="sl">LIMIT SW1 (BOTTOM)</div><div class="sv" id="mLim1">--</div></div>
+    <div class="slv"><div class="sl">LIMIT SW2 (TOP)</div><div class="sv" id="mLim2">--</div></div>
+    <div class="slv"><div class="sl">IR PROX (BIN)</div><div class="sv" id="mIR">--</div></div>
+    <div class="slv"><div class="sl">PICKUP STATE</div><div class="sv" id="mPU">--</div></div>
+  </div>
+</div>
+
+<div id="manualLog"></div>
+
+</div><!-- end manual panel -->
+
+<!-- ═══ DATA TAB ═══ -->
+<div class="panel" id="panel-data">
 
 <div class="card">
   <h2>Data Recording</h2>
@@ -280,6 +508,18 @@ h1{color:#4fc3f7;font-size:1.4rem;text-align:center;font-weight:800;margin-botto
     style="display:inline-block;background:#1976d2;text-decoration:none;padding:8px 14px;border-radius:8px;color:#fff;font-weight:700;font-size:.8rem">Download CSV</a>
 </div>
 
+<div class="card">
+  <h2>Software Update</h2>
+  <a href="/upload" class="rec-btn"
+    style="display:inline-block;background:#7b1fa2;text-decoration:none;padding:8px 14px;border-radius:8px;color:#fff;font-weight:700;font-size:.8rem">Pi OTA Upload</a>
+</div>
+
+</div><!-- end data panel -->
+
+<div style="margin:12px 0">
+  <button class="emergency" onclick="emergencyStop()">EMERGENCY STOP</button>
+</div>
+
 <div class="footer">PET Bottle Robot &mdash; Autonomous Collection System</div>
 
 <script>
@@ -288,6 +528,63 @@ var stateColors={WAITING:'#90a4ae',SCANNING:'#1976d2',ROAMING:'#2e7d32',
   VERIFYING:'#e65100',APPROACHING:'#1565c0',ALIGNING:'#f57f17',
   PICKING_UP:'#7b1fa2',AVOIDING:'#c62828',STOPPED:'#78909c',
   MISSION_COMPLETE:'#43a047'};
+
+function showTab(name){
+  document.querySelectorAll('.tab').forEach(function(t,i){
+    var tabs=['autonomous','manual','data'];
+    t.classList.toggle('active',tabs[i]===name);
+  });
+  document.querySelectorAll('.panel').forEach(function(p){
+    p.classList.toggle('active',p.id==='panel-'+name);
+  });
+}
+
+function gs(){return document.getElementById('wheelSpd').value}
+
+var manualLines=[];
+function mlog(msg){
+  manualLines.push(new Date().toLocaleTimeString()+' '+msg);
+  if(manualLines.length>20)manualLines.shift();
+  var el=document.getElementById('manualLog');
+  if(el){el.textContent=manualLines.join('\n');el.scrollTop=el.scrollHeight;}
+}
+
+function mc(cmd){
+  mlog('> '+cmd);
+  fetch('/manual/cmd?c='+encodeURIComponent(cmd)).then(function(r){return r.json()}).then(function(d){
+    if(d.ok)mlog('  '+d.resp);
+    else mlog('  ERR: '+(d.error||'failed'));
+  }).catch(function(e){mlog('  ERR: '+e)});
+}
+
+function pollManualSensors(){
+  fetch('/manual/sensor').then(function(r){return r.json()}).then(function(d){
+    if(d.ultrasonic){
+      setUSm('musF',d.ultrasonic.s1);setUSm('musR',d.ultrasonic.s2);
+      setUSm('musB',d.ultrasonic.s3);setUSm('musL',d.ultrasonic.s4);
+    }
+    if(d.limits!==undefined){
+      document.getElementById('mLim1').textContent=d.limit1?'PRESSED':'open';
+      document.getElementById('mLim1').style.color=d.limit1?'#e53935':'#43a047';
+      document.getElementById('mLim2').textContent=d.limit2?'PRESSED':'open';
+      document.getElementById('mLim2').style.color=d.limit2?'#e53935':'#43a047';
+    }
+    if(d.irProx!==undefined){
+      document.getElementById('mIR').textContent=d.irProx?'FULL':'empty';
+      document.getElementById('mIR').style.color=d.irProx?'#e53935':'#43a047';
+    }
+    if(d.pickup!==undefined){
+      document.getElementById('mPU').textContent=d.pickup||'idle';
+    }
+  }).catch(function(){});
+}
+
+function setUSm(id,val){
+  var el=document.getElementById(id);if(!el)return;
+  var v=val||999;
+  el.querySelector('.v').textContent=v>=999?'--':v+'cm';
+  el.className='us-item '+usClass(v);
+}
 
 function poll(){
   fetch('/nav/stats').then(function(r){return r.json()}).then(function(d){
@@ -301,16 +598,16 @@ function poll(){
     document.getElementById('badge').style.background=sc;
     var sb=document.getElementById('stateBadge');
     sb.textContent=st;sb.style.background=sc;
-    var ble=d.espConnected||false;
+    var esp=d.espConnected||false;
     var dot=document.getElementById('connDot');
     var cn=document.getElementById('connName');
-    dot.className='conn-dot '+(ble?'on':'off');
-    cn.textContent=ble?'ESP32 Connected (WiFi)':'ESP32 Disconnected';
+    dot.className='conn-dot '+(esp?'on':'off');
+    cn.textContent=esp?'ESP32 Connected (WiFi)':'ESP32 Disconnected';
     var btn=document.getElementById('autoBtn');
     if(st==='WAITING'||st==='STOPPED'){
       autoRunning=false;btn.textContent='START AUTONOMOUS';btn.className='auto-btn start';
-      btn.disabled=!ble;
-      if(!ble)btn.textContent='WAITING FOR BLE...';
+      btn.disabled=!esp;
+      if(!esp)btn.textContent='WAITING FOR ESP32...';
     }else{
       autoRunning=true;btn.textContent='STOP AUTONOMOUS';btn.className='auto-btn stop';
       btn.disabled=false;
@@ -333,7 +630,6 @@ function pollCmdLog(){
 }
 setInterval(pollCmdLog,2000);pollCmdLog();
 function usClass(v){
-  // Match navigator thresholds: STOP=60, SLOW=100, TURN=150 cm
   if(v>=999)return 'clear';
   if(v<60)return 'stop';
   if(v<100)return 'slow';
@@ -365,6 +661,7 @@ function updateObstacle(us){
   document.getElementById('obsVal').innerHTML=msg;
 }
 setInterval(poll,1000);poll();
+setInterval(pollManualSensors,1000);
 
 function toggleAuto(){
   var btn=document.getElementById('autoBtn');btn.disabled=true;
@@ -379,7 +676,9 @@ function toggleAuto(){
 }
 
 function emergencyStop(){
-  fetch('/nav/stop').then(function(){poll()});
+  fetch('/manual/cmd?c=PISTOP').then(function(){
+    fetch('/nav/stop').then(function(){poll()});
+  });
 }
 
 function loadModels(){
@@ -405,7 +704,6 @@ function switchModel(key){
       document.getElementById('mStatus').style.color='#c62828';}
   }).catch(function(){});
 }
-
 
 function toggleRec(){fetch('/toggle_recording').then(function(){pollRec();loadSessions()})}
 function pollRec(){

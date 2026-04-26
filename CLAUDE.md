@@ -115,6 +115,16 @@ The navigator sends these `PI`-prefixed commands so it always has motor control 
 | `PIDW<l>,<r>` | Differential wheel (left_spd, right_spd, range -80..80) |
 | `PIX` | Stop wheels |
 | `PISTOP` | Emergency stop all motors/servos/buzzer |
+| `PIAU` | Arm up (full speed, until top limit) |
+| `PIAD` | Arm down (pulsed, until bottom limit) |
+| `PIAS` | Arm stop |
+| `PISWL` | Swing platform left |
+| `PISWR` | Swing platform right |
+| `PISWS` | Swing stop |
+| `PISO` | Servos open (scoopers spread) |
+| `PISC` | Servos close (scoopers scoop) |
+| `PIBZ` | Buzzer short beep |
+| `PIBZL` | Buzzer long beep |
 | `P` | Start pickup sequence (also works from any mode) |
 | `PA` | Abort pickup sequence |
 
