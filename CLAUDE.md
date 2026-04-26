@@ -3,10 +3,10 @@
 ## Project Overview
 
 Autonomous PET bottle collection robot using dual processors:
-- **ESP32**: Motor control, sensors, WiFi AP, LCD — test firmware in `esp32_test/esp32_test.ino`
+- **ESP32**: Motor control, sensors, WiFi STA, LCD — test firmware in `esp32_test/esp32_test.ino`
 - **Raspberry Pi 5 + Hailo-8 NPU**: YOLO vision + navigation brain — `camera.py`, `navigator.py`
 
-Communication: Pi <-> ESP32 is **WiFi HTTP**. Both devices connect to a mobile hotspot (`petbottle_hotspot` / `petbottle123`) as STA clients on the same local network. ESP32 uses static IP `192.168.43.100`. The Pi sends commands via `GET /cmd?c=<CMD>` and polls sensor data via `GET /sensor` every 200ms.
+Communication: Pi <-> ESP32 is **WiFi HTTP**. Both devices connect to a mobile hotspot (`petbottle_hotspot` / `petbottle123`, 2.4GHz) as STA clients on the same local network. ESP32 gets its IP via DHCP (no static IP — works on any phone). The navigator auto-discovers the ESP32 at startup by scanning the network for `/sensor`. The Pi sends commands via `GET /cmd?c=<CMD>` and polls sensor data via `GET /sensor` every 200ms.
 
 ## Build & Flash
 
@@ -22,7 +22,7 @@ arduino-cli upload -p COM3 --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs -
 Hold BOOT button on ESP32 during upload if it fails to connect.
 
 ### Flash via OTA
-Connect to the same mobile hotspot, open `http://192.168.43.100/ota`, upload `.bin` file.
+Connect to the same mobile hotspot, open `http://<esp32-ip>/ota` (check ESP32 LCD for IP), upload `.bin` file.
 
 ### ESP32 Arduino core
 - arduino-cli has v2.0.17 installed — code uses v2 API: `ledcSetup()` + `ledcAttachPin()` + `ledcWrite(channel, duty)`
@@ -92,7 +92,7 @@ Never assign channels out-of-order or across timer pairs for different motors.
 
 ## ESP32 HTTP API (used by both navigator and web debug UI)
 
-Base URL: `http://192.168.43.100` (ESP32 static IP on hotspot)
+Base URL: `http://<esp32-ip>` (DHCP-assigned, auto-discovered by navigator, shown on ESP32 LCD)
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
