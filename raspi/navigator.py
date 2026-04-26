@@ -34,6 +34,12 @@ from flask import Flask, Response, jsonify, request
 
 import urllib.request, urllib.error, urllib.parse
 
+try:
+    from vision_ai import verify_target, analyze_scene, assess_obstacle
+    AI_AVAILABLE = True
+except ImportError:
+    AI_AVAILABLE = False
+
 # Import detection system from camera.py
 from camera import (
     ModelManager, MODEL_CONFIGS, MODEL_RANGE,
@@ -687,6 +693,11 @@ class Navigator:
         self.ir_ever_tripped      = False  # has irProx ever read True since boot?
         # Watchdog state (sensor freshness + YOLO inference health)
         self.infer_fail_streak    = 0
+        # AI vision state
+        self._current_frame       = None
+        self._ai_verified         = False
+        self._ai_scene_time       = 0.0
+        self._ai_scene_interval   = 8.0
 
     def run(self):
         """Main loop — camera + sensors + navigation."""
@@ -779,6 +790,9 @@ class Navigator:
                     print(f"\n  >>> SENSOR STALE ({age:.1f}s) — forcing STOPPED")
                     self.esp32.emergency_stop()
                     self.state = State.STOPPED
+
+                # ── Store frame for AI vision ─────────────────
+                self._current_frame = frame.copy()
 
                 # ── Navigation decision ───────────────────────
                 self._navigate(smoothed, persons, orig_w, orig_h,
@@ -1006,11 +1020,41 @@ class Navigator:
                 else:
                     self.esp32.turn_left(SCAN_SPEED)
             else:
-                # Scan complete, nothing found — move forward slowly then scan again
-                self.esp32.stop()
-                self.state = State.ROAMING
-                self.turn_timer = time.time()
-                self.turn_dir *= -1  # alternate scan direction next time
+                # Scan complete, nothing found — ask AI for advice
+                if AI_AVAILABLE and (time.time() - self._ai_scene_time) > self._ai_scene_interval:
+                    self._ai_scene_time = time.time()
+                    sensor = self.esp32.sensors
+                    import threading
+                    def _ai_scan():
+                        result = analyze_scene(self._current_frame, sensor)
+                        action = result.get("action", "go_forward")
+                        reason = result.get("reason", "")
+                        spotted = result.get("bottles_spotted", 0)
+                        print(f"\n  >>> [AI] {action}: {reason} (bottles_spotted={spotted})")
+                        if spotted > 0:
+                            self.state = State.SCANNING
+                            self.scan_start = time.time()
+                        elif action == "turn_left":
+                            self.esp32.turn_left(SCAN_SPEED)
+                            time.sleep(1.5)
+                            self.esp32.stop()
+                            self.state = State.SCANNING
+                            self.scan_start = time.time()
+                        elif action == "turn_right":
+                            self.esp32.turn_right(SCAN_SPEED)
+                            time.sleep(1.5)
+                            self.esp32.stop()
+                            self.state = State.SCANNING
+                            self.scan_start = time.time()
+                        else:
+                            self.state = State.ROAMING
+                            self.turn_timer = time.time()
+                    threading.Thread(target=_ai_scan, daemon=True).start()
+                else:
+                    self.esp32.stop()
+                    self.state = State.ROAMING
+                    self.turn_timer = time.time()
+                self.turn_dir *= -1
             return
 
         # ── VERIFYING: stay still or creep closer to confirm bottle ──
@@ -1026,7 +1070,26 @@ class Navigator:
                 b_fill = (bw * bh) / frame_area
 
                 if self.verify_count >= VERIFY_FRAMES:
-                    # Confirmed! Now approach
+                    if AI_AVAILABLE and not self._ai_verified:
+                        self.esp32.stop()
+                        print(f"\n  >>> YOLO confident ({self.verify_count} frames) — asking AI to confirm...")
+                        import threading
+                        def _ai_check():
+                            is_pet, reason = verify_target(self._current_frame, best[:4])
+                            if is_pet:
+                                print(f"\n  >>> AI CONFIRMED: {reason}")
+                                self._ai_verified = True
+                                self.state = State.APPROACHING
+                                self.approach_lost_count = 0
+                            else:
+                                print(f"\n  >>> AI REJECTED: {reason} — resuming scan")
+                                self._ai_verified = False
+                                self.verify_count = 0
+                                self.state = State.SCANNING
+                                self.scan_start = time.time()
+                        threading.Thread(target=_ai_check, daemon=True).start()
+                        return
+                    self._ai_verified = False
                     print(f"\n  >>> Bottle CONFIRMED ({self.verify_count} frames) — approaching slowly")
                     self.state = State.APPROACHING
                     self.approach_lost_count = 0
@@ -1226,6 +1289,16 @@ class Navigator:
             "us_back": us["s3"], "us_left": us["s4"],
         })
         print(f"\n  >>> AVOIDING ({reason})")
+        if AI_AVAILABLE and self._current_frame is not None:
+            sensor = self.esp32.sensors
+            import threading
+            def _ai_assess():
+                result = assess_obstacle(self._current_frame, sensor)
+                obstacle = result.get("obstacle", "unknown")
+                direction = result.get("avoid_direction", "right")
+                ai_reason = result.get("reason", "")
+                print(f"\n  >>> [AI] obstacle={obstacle}, avoid={direction}: {ai_reason}")
+            threading.Thread(target=_ai_assess, daemon=True).start()
 
     def _is_bin_full(self):
         """Sample the E18-D80NK IR proximity reading after a settling delay.
