@@ -53,8 +53,53 @@ from hailo_platform import (
 # Configuration
 # ══════════════════════════════════════════════════════════════
 
-ESP32_IP = "192.168.43.100"
-ESP32_BASE_URL = f"http://{ESP32_IP}"
+ESP32_IP = None  # auto-discovered at startup
+ESP32_BASE_URL = None
+
+
+def discover_esp32(timeout=30):
+    """Scan the local network for the ESP32 by probing /sensor on each host."""
+    import socket
+    import struct
+
+    # Get our own IP and subnet
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        my_ip = s.getsockname()[0]
+    except Exception:
+        my_ip = "10.0.0.1"
+    finally:
+        s.close()
+
+    # Derive network prefix (scan last octet 1-254)
+    prefix = my_ip.rsplit(".", 1)[0]
+    print(f"  Scanning {prefix}.1-254 for ESP32...")
+
+    def probe(ip):
+        try:
+            req = urllib.request.urlopen(f"http://{ip}/sensor", timeout=0.5)
+            data = req.read().decode("utf-8", errors="replace")
+            if "ultrasonic" in data:
+                return ip
+        except Exception:
+            pass
+        return None
+
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as pool:
+        futures = {pool.submit(probe, f"{prefix}.{i}"): i for i in range(1, 255)}
+        deadline = time.time() + timeout
+        for future in concurrent.futures.as_completed(futures):
+            if time.time() > deadline:
+                break
+            result = future.result()
+            if result:
+                print(f"  ESP32 found at {result}")
+                return result
+
+    print("  WARNING: ESP32 not found on network")
+    return None
 
 # Obstacle avoidance thresholds (cm)
 # Robot is ~100cm long x 30cm wide — sensors are at the front
@@ -1321,8 +1366,8 @@ def main():
     parser.add_argument("--model", default="yolov8",
                         choices=["yolov5", "yolov7", "yolov8"],
                         help="YOLO model (default: yolov8)")
-    parser.add_argument("--esp32-ip", default=ESP32_IP,
-                        help=f"ESP32 WiFi IP address (default: {ESP32_IP})")
+    parser.add_argument("--esp32-ip", default=None,
+                        help="ESP32 WiFi IP address (default: auto-discover)")
     parser.add_argument("--conf", type=float, default=CONF_THRESHOLD,
                         help=f"Confidence threshold (default: {CONF_THRESHOLD})")
     parser.add_argument("--no-show", action="store_true",
@@ -1345,9 +1390,16 @@ def main():
     stream_thread.start()
     print(f"  Stream: http://0.0.0.0:5000/video_feed")
 
-    # Connect to ESP32 over WiFi (non-blocking — connects in background)
-    print(f"  Connecting to ESP32 via WiFi ({args.esp32_ip})...")
-    esp32 = ESP32WiFiLink(ip=args.esp32_ip, block=False)
+    # Discover or use provided ESP32 IP
+    esp32_ip = args.esp32_ip
+    if not esp32_ip:
+        esp32_ip = discover_esp32()
+        if not esp32_ip:
+            print("  ERROR: Cannot find ESP32 — check hotspot and ESP32 power")
+            return
+
+    print(f"  Connecting to ESP32 via WiFi ({esp32_ip})...")
+    esp32 = ESP32WiFiLink(ip=esp32_ip, block=False)
 
     # Load YOLO models
     print(f"  Loading YOLO models...")

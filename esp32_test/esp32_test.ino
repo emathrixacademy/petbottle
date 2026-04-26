@@ -35,10 +35,6 @@
 const char* WIFI_SSID = "petbottle_hotspot";
 const char* WIFI_PASS = "petbottle123";
 
-IPAddress staticIP(192, 168, 43, 100);
-IPAddress gateway(192, 168, 43, 1);
-IPAddress subnet(255, 255, 255, 0);
-
 WebServer server(80);
 
 // ==================== PIN DEFINITIONS ====================
@@ -1570,7 +1566,6 @@ void setup() {
   // --- WiFi STA (connect to mobile hotspot) ---
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("esp32_petbottle");
-  WiFi.config(staticIP, gateway, subnet);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.printf("Connecting to WiFi '%s'...", WIFI_SSID);
   lcd.setCursor(0, 1);
