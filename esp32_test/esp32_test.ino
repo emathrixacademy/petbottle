@@ -32,7 +32,7 @@
 
 // ==================== WiFi STA (mobile hotspot) ====================
 
-const char* WIFI_SSID = "PetBottle_Robot";
+const char* WIFI_SSID = "petbottle_hotspot";
 const char* WIFI_PASS = "petbottle123";
 
 IPAddress staticIP(192, 168, 43, 100);
