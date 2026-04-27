@@ -47,7 +47,7 @@ WebServer server(80);
 #define ECHO_1    33
 #define ECHO_2    35
 #define ECHO_3    32
-#define ECHO_4    34
+#define ECHO_4    0
 const int echoPins[] = {ECHO_1, ECHO_2, ECHO_3, ECHO_4};
 const char* echoLabels[] = {"S1(33)", "S2(35)", "S3(32)", "S4(34)"};
 const int NUM_SENSORS = 4;
@@ -146,7 +146,7 @@ int swingSpeed = 0;      // default swing PWM — 0 for safety
 #define MANUAL_DOWN_SPEED    35
 #define MANUAL_DOWN_ON_MS    200       // motor on per pulse
 #define MANUAL_DOWN_OFF_MS   300       // motor off between pulses
-#define MANUAL_UP_SPEED      180
+#define MANUAL_UP_SPEED      80
 bool armManualPulseActive = false;     // true while manual arm motion is active
 bool armManualPulseOn     = false;     // current phase of the on/off pulse
 int  armManualPulseDir    = 0;         // +1 = up, -1 = down
