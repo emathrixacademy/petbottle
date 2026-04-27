@@ -2,10 +2,9 @@
   PET Bottle Robot — Combined Component Test
   ============================================
   WiFi STA: connects to mobile hotspot (SSID/pass below)
-  Static IP: 192.168.43.100
-  Web UI:  http://192.168.43.100
-  OTA:     http://192.168.43.100/ota
-  Sensor:  http://192.168.43.100/sensor
+  Web UI:  http://<dhcp-ip>
+  OTA:     http://<dhcp-ip>/ota
+  Sensor:  http://<dhcp-ip>/sensor
   Serial:  115200 baud
 
   Select a test mode from the menu (Serial or Web), then use that mode's commands.
@@ -18,7 +17,7 @@
     BTS7960 R:   RPWM=16(ch2), LPWM=17(ch3), EN=27
     Hybrid 2R0:  PWM=14(ch4), DIR=19  (arm lift — replaces L298N #1)
     L298N #2:    EN=2(ch5), IN1=25, IN2=23  (swing drive)
-    Limit SW:    36, 39 (need external 10k pull-up to 3.3V)
+    Limit SW:    36, 15
     Servo L:     13(ch6)
     Servo R:     18(ch7)
     Buzzer:      3
@@ -148,8 +147,9 @@ int swingSpeed = 0;      // default swing PWM — 0 for safety
 #define MANUAL_DOWN_ON_MS    200       // motor on per pulse
 #define MANUAL_DOWN_OFF_MS   300       // motor off between pulses
 #define MANUAL_UP_SPEED      180
-bool armManualPulseActive = false;     // true while user-held DOWN is active
+bool armManualPulseActive = false;     // true while manual arm motion is active
 bool armManualPulseOn     = false;     // current phase of the on/off pulse
+int  armManualPulseDir    = 0;         // +1 = up, -1 = down
 unsigned long armManualPulseTimer = 0; // millis() of last phase change
 
 // ==================== PICKUP STATE MACHINE ====================
@@ -169,19 +169,22 @@ PickupState puState = PU_IDLE;
 unsigned long puTimer = 0;         // general purpose timer for pickup steps
 unsigned long puStartTime = 0;     // when pickup sequence began (for timeout)
 bool puArmOn = false;              // tracks arm pulse on/off during lowering
+bool puLiftOn = false;             // tracks arm pulse on/off during lifting
 #define PU_LOWER_SPEED    80
-#define PU_LOWER_ON_MS    200      // arm on duration during pulsed lowering
-#define PU_LOWER_OFF_MS   300      // arm off duration during pulsed lowering
-#define PU_SCOOP_CLOSE_MS 1000     // time to wait after closing scoopers
+#define PU_LOWER_ON_MS    150      // arm on duration during pulsed lowering
+#define PU_LOWER_OFF_MS   400      // arm off duration during pulsed lowering
+#define PU_SCOOP_CLOSE_MS 1500     // time to wait after closing scoopers
 #define PU_LIFT_SPEED     255
-#define PU_DROP_OPEN_MS   10000    // time to wait after opening scoopers
+#define PU_LIFT_ON_MS     200      // arm on duration during pulsed lifting
+#define PU_LIFT_OFF_MS    400      // arm off duration during pulsed lifting
+#define PU_DROP_OPEN_MS   12000    // time to wait after opening scoopers
 // Servos are MIRRORED — sweep inward to scoop, outward to release.
 // If scooper direction is backwards, swap OPEN/CLOSE for both.
 #define PU_SERVO_OPEN_L   0        // scooper open (spread apart)
 #define PU_SERVO_OPEN_R   180
 #define PU_SERVO_CLOSE_L  180      // scooper closed (swept inward to scoop)
 #define PU_SERVO_CLOSE_R  0
-#define PU_TIMEOUT_MS     30000    // abort pickup if stuck for 30 seconds
+#define PU_TIMEOUT_MS     45000    // abort pickup if stuck for 45 seconds (slower sequence)
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
@@ -292,6 +295,13 @@ void setArm(int dir) {
     Serial.printf("ARM: DIR pin (GPIO19) = %s  | armSpeed=%d  | physical pin readback=%d\n",
                   dir > 0 ? "HIGH (UP)" : "LOW (DOWN)", armSpeed, digitalRead(ARM_DIR));
   }
+  // Soft ramp-up when going UP to avoid current spike tripping the PSU
+  if (dir > 0 && armSpeed > 20) {
+    for (int s = 20; s < armSpeed; s += 5) {
+      ledcWrite(ARM_CH, s);
+      delay(30);
+    }
+  }
   ledcWrite(ARM_CH, armSpeed);
 }
 
@@ -367,12 +377,10 @@ void pickupStart() {
   lcd.setCursor(0, 0); lcd.print("PICKUP: Lower");
   beep(100);
   puState = PU_LOWERING;
-  puArmOn = true;
   puTimer = millis();
-  // Start lowering arm slowly
   armSpeed = PU_LOWER_SPEED;
   setArm(-1);  // down
-  Serial.println("Lowering arm (pulsed)...");
+  Serial.println("Lowering arm...");
 }
 
 void pickupAbort() {
@@ -406,63 +414,41 @@ void pickupUpdate() {
   switch (puState) {
 
     case PU_LOWERING:
-      // Check if arm reached bottom
       if (limBottom) {
         stopArm();
         Serial.println("Bottom limit hit — scooping!");
         lcd.clear();
         lcd.setCursor(0, 0); lcd.print("PICKUP: Scoop");
-        // Close scoopers to grab bottle
         setServo(SERVO_L_CH, PU_SERVO_CLOSE_L);
         setServo(SERVO_R_CH, PU_SERVO_CLOSE_R);
         puTimer = now;
         puState = PU_SCOOPING;
         beep(50);
-        break;
-      }
-      // Pulse arm on/off for slow controlled lowering
-      if (puArmOn && (now - puTimer >= PU_LOWER_ON_MS)) {
-        // Turn arm off
-        stopArm();
-        puArmOn = false;
-        puTimer = now;
-      } else if (!puArmOn && (now - puTimer >= PU_LOWER_OFF_MS)) {
-        // Turn arm on again
-        armSpeed = PU_LOWER_SPEED;
-        setArm(-1);  // down
-        puArmOn = true;
-        puTimer = now;
       }
       break;
 
     case PU_SCOOPING:
-      // Wait for scoopers to fully close
       if (now - puTimer >= PU_SCOOP_CLOSE_MS) {
-        Serial.println("Scooped! Lifting full speed...");
+        Serial.println("Scooped! Lifting...");
         lcd.clear();
         lcd.setCursor(0, 0); lcd.print("PICKUP: Lift");
-        // Lift arm at full speed
         armSpeed = PU_LIFT_SPEED;
         setArm(1);  // up
         puState = PU_LIFTING;
-        break;
       }
       break;
 
     case PU_LIFTING:
-      // Check if arm reached top (90° upright)
       if (limTop) {
         stopArm();
         Serial.println("Top limit hit — dropping bottle!");
         lcd.clear();
         lcd.setCursor(0, 0); lcd.print("PICKUP: Drop");
-        // Open scoopers to drop bottle into bin
         setServo(SERVO_L_CH, PU_SERVO_OPEN_L);
         setServo(SERVO_R_CH, PU_SERVO_OPEN_R);
         puTimer = now;
         puState = PU_DROPPING;
         beep(50);
-        break;
       }
       break;
 
@@ -548,48 +534,8 @@ void executeCmd(String cmd) {
       stopWheels();
       Serial.println("PI: WHEELS STOPPED");
     } else if (pi == "STOP") {
-      if (puState != PU_IDLE) pickupAbort();
       stopAll();
       Serial.println("PI: EMERGENCY STOP ALL");
-    } else if (pi == "AU") {
-      armManualPulseActive = false;
-      armSpeed = MANUAL_UP_SPEED;
-      setArm(1);
-      Serial.printf("PI: ARM UP at %d\n", armSpeed);
-    } else if (pi == "AD") {
-      armSpeed = MANUAL_DOWN_SPEED;
-      setArm(-1);
-      armManualPulseActive = true;
-      armManualPulseOn = true;
-      armManualPulseTimer = millis();
-      Serial.printf("PI: ARM DOWN pulsed at %d\n", armSpeed);
-    } else if (pi == "AS") {
-      armManualPulseActive = false;
-      stopArm();
-      Serial.println("PI: ARM STOPPED");
-    } else if (pi == "SWL") {
-      setSwing(-1);
-      Serial.printf("PI: SWING LEFT at %d\n", swingSpeed);
-    } else if (pi == "SWR") {
-      setSwing(1);
-      Serial.printf("PI: SWING RIGHT at %d\n", swingSpeed);
-    } else if (pi == "SWS") {
-      stopSwing();
-      Serial.println("PI: SWING STOPPED");
-    } else if (pi == "SO") {
-      setServo(SERVO_L_CH, PU_SERVO_OPEN_L);
-      setServo(SERVO_R_CH, PU_SERVO_OPEN_R);
-      Serial.println("PI: SERVOS OPEN");
-    } else if (pi == "SC") {
-      setServo(SERVO_L_CH, PU_SERVO_CLOSE_L);
-      setServo(SERVO_R_CH, PU_SERVO_CLOSE_R);
-      Serial.println("PI: SERVOS CLOSE");
-    } else if (pi == "BZ") {
-      beep(100);
-      Serial.println("PI: BUZZER BEEP");
-    } else if (pi == "BZL") {
-      beep(500);
-      Serial.println("PI: BUZZER LONG");
     } else {
       Serial.printf("PI: unknown command '%s'\n", pi.c_str());
     }
@@ -690,20 +636,16 @@ void executeCmd(String cmd) {
   if (currentMode == MODE_ARM) {
     switch (c0) {
       case 'U':
-        // Force full-speed continuous lift; slider value ignored for safety.
         armManualPulseActive = false;
         armSpeed = MANUAL_UP_SPEED;
         setArm(1);
-        Serial.printf("ARM UP at %d (full force, until TOP limit)\n", armSpeed);
+        Serial.printf("ARM UP at %d (until TOP limit)\n", armSpeed);
         break;
       case 'D':
-        // Start pulsed (stop-and-go) descent at 50% PWM until BOTTOM limit.
+        armManualPulseActive = false;
         armSpeed = MANUAL_DOWN_SPEED;
         setArm(-1);
-        armManualPulseActive = true;
-        armManualPulseOn = true;
-        armManualPulseTimer = millis();
-        Serial.printf("ARM DOWN pulsed at %d (until BOTTOM limit ~5deg above 0)\n", armSpeed);
+        Serial.printf("ARM DOWN at %d (until BOTTOM limit)\n", armSpeed);
         break;
       case 'S':
         armManualPulseActive = false;
@@ -1136,8 +1078,8 @@ button:active{transform:scale(.94)}
 <!-- SERVOS -->
 <div id="p-servos" class="panel">
 <div class="grid g2">
-  <button class="bo" onpointerdown="scmd('O')">Both Open</button>
-  <button class="bc" onpointerdown="scmd('C')">Both Close</button>
+  <button class="bo" onpointerdown="scmd('O')">Both Close</button>
+  <button class="bc" onpointerdown="scmd('C')">Both Open</button>
 </div>
 <div class="grid g3" style="margin-top:8px">
   <button class="bg" onpointerdown="scmd('H')">Half (90)</button>
@@ -1574,11 +1516,12 @@ void setup() {
   ledcAttachPin(SERVO_L, SERVO_L_CH);
   ledcAttachPin(SERVO_R, SERVO_R_CH);
 
-  // ─── STEP 4: Zero ALL PWM channels ───
+  // ─── STEP 4: Zero ALL PWM channels, servos open ───
   ledcWrite(L_FWD_CH, 0); ledcWrite(L_REV_CH, 0);
   ledcWrite(R_FWD_CH, 0); ledcWrite(R_REV_CH, 0);
   ledcWrite(ARM_CH, 0);   ledcWrite(SWING_CH, 0);
-  ledcWrite(SERVO_L_CH, 0); ledcWrite(SERVO_R_CH, 0);
+  setServo(SERVO_L_CH, PU_SERVO_OPEN_L);
+  setServo(SERVO_R_CH, PU_SERVO_OPEN_R);
 
   // ─── STEP 5: Other peripherals ───
   // Ultrasonic
@@ -1721,17 +1664,20 @@ void loop() {
     }
   }
 
-  // Manual ARM DOWN pulse loop — runs only outside the pickup state machine.
-  // Toggles motor on/off so arm descends in small controlled steps.
+  // Manual ARM pulse loop (UP and DOWN) — runs only outside the pickup state machine.
+  // Toggles motor on/off so arm moves in small controlled steps.
   if (armManualPulseActive && puState == PU_IDLE) {
     unsigned long now = millis();
-    if (armManualPulseOn && (now - armManualPulseTimer >= MANUAL_DOWN_ON_MS)) {
+    int onMs  = (armManualPulseDir > 0) ? MANUAL_DOWN_ON_MS  : MANUAL_DOWN_ON_MS;
+    int offMs = (armManualPulseDir > 0) ? MANUAL_DOWN_OFF_MS : MANUAL_DOWN_OFF_MS;
+    int spd   = (armManualPulseDir > 0) ? MANUAL_UP_SPEED    : MANUAL_DOWN_SPEED;
+    if (armManualPulseOn && (now - armManualPulseTimer >= onMs)) {
       stopArm();
       armManualPulseOn = false;
       armManualPulseTimer = now;
-    } else if (!armManualPulseOn && (now - armManualPulseTimer >= MANUAL_DOWN_OFF_MS)) {
-      armSpeed = MANUAL_DOWN_SPEED;
-      setArm(-1);
+    } else if (!armManualPulseOn && (now - armManualPulseTimer >= offMs)) {
+      armSpeed = spd;
+      setArm(armManualPulseDir);
       armManualPulseOn = true;
       armManualPulseTimer = now;
     }

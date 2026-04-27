@@ -5,11 +5,11 @@ color 0A
 
 :: ===================== CONFIG =====================
 set FQBN=esp32:esp32:esp32:PartitionScheme=min_spiffs
-set SKETCH=robotic_arm\robotic_arm.ino
-set BIN=build_robotic\robotic_arm.ino.bin
-set COPY_TO=robotic_arm\robotic_arm.bin
-set HOTSPOT_SSID=PetBottle_Robot
-set ESP_IP=192.168.43.100
+set SKETCH=esp32_test\esp32_test.ino
+set BIN=build_test\esp32_test.ino.bin
+set COPY_TO=esp32_test\esp32_test.bin
+set HOTSPOT_SSID=petbottle_hotspot
+set ESP_IP=
 set OTA_URL=http://%ESP_IP%/ota
 set TIMEOUT=10
 
