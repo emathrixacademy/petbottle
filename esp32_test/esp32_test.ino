@@ -143,7 +143,7 @@ int swingSpeed = 0;      // default swing PWM — 0 for safety
 //       Bottom limit must be physically positioned ~5° above 0 to act as
 //       the "lowest allowable" stop.
 // UP:   continuous full force (180 PWM) until TOP limit (SW1) trips.
-#define MANUAL_DOWN_SPEED    60
+#define MANUAL_DOWN_SPEED    35
 #define MANUAL_DOWN_ON_MS    200       // motor on per pulse
 #define MANUAL_DOWN_OFF_MS   300       // motor off between pulses
 #define MANUAL_UP_SPEED      180
