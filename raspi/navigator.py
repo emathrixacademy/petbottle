@@ -108,10 +108,9 @@ def discover_esp32(timeout=30):
     return None
 
 # Obstacle avoidance thresholds (cm)
-# Robot is ~100cm long x 30cm wide — sensors are at the front
-STOP_DIST       = 60            # emergency stop — back up immediately
-SLOW_DIST       = 100           # reduce speed
-TURN_DIST       = 150           # start steering away (1.5m clearance)
+STOP_DIST       = 25            # emergency stop — back up immediately
+SLOW_DIST       = 40            # reduce speed
+TURN_DIST       = 60            # start steering away
 
 # Driving speeds — SLOW AND SAFE (people nearby!)
 # Track drive (tank-style): forward/backward = 40%, turning = 60%
@@ -146,7 +145,8 @@ stream_lock = threading.Lock()
 stream_frame = None  # latest JPEG-encoded frame
 stream_stats = {"fps": 0, "bottles": 0, "persons": 0, "model": "", "inference_ms": 0, "state": "WAITING",
                 "ultrasonic": {"s1": 999, "s2": 999, "s3": 999, "s4": 999},
-                "binFull": False, "pickups": 0, "avoidances": 0, "espConnected": False}
+                "binFull": False, "pickups": 0, "avoidances": 0, "espConnected": False,
+                "esp32_ip": None}
 _navigator_ref = None  # set by Navigator.__init__ so Flask routes can control it
 
 # Data logger — records events during navigation
@@ -220,10 +220,25 @@ def nav_start():
 @stream_app.route('/stop')
 def nav_stop():
     if _navigator_ref:
-        _navigator_ref.esp32.emergency_stop()
         _navigator_ref.state = State.WAITING
+        _navigator_ref._stop_sent_time = 0
+        _navigator_ref.esp32._last_cmd = None
+        _navigator_ref.esp32._last_swing_cmd = None
+        _navigator_ref.esp32.emergency_stop()
+        _navigator_ref.esp32.cmd("PISWS")
+        _navigator_ref.esp32.emergency_stop()
         return jsonify({"ok": True, "state": "WAITING"})
     return jsonify({"ok": False, "msg": "navigator not ready"})
+
+@stream_app.route('/esp32_cmd')
+def esp32_proxy_cmd():
+    c = request.args.get("c", "")
+    if not c:
+        return jsonify({"ok": False, "error": "no command"})
+    if _navigator_ref and _navigator_ref.esp32._connected.is_set():
+        _navigator_ref.esp32.cmd(c)
+        return jsonify({"ok": True, "resp": "OK"})
+    return jsonify({"ok": False, "error": "ESP32 not connected"})
 
 @stream_app.route('/resume')
 def nav_resume():
@@ -516,7 +531,7 @@ MAX_PICKUPS_BACKSTOP = 20   # absolute cap regardless of IR sensor
 # If we haven't seen one for this long, assume the link is dead (USB
 # unplug, reader thread crash) and force a stop — otherwise the
 # navigator would keep deciding based on frozen sensor values.
-SENSOR_STALE_S = 5.0
+SENSOR_STALE_S = 10.0
 
 # YOLO inference watchdog: if the model errors N times in a row,
 # stop driving — we have no eyes.
@@ -623,13 +638,17 @@ class ESP32WiFiLink:
 
     def cmd(self, command):
         now = time.time()
-        if command == self._last_cmd:
-            return
-        if now - getattr(self, '_last_cmd_time', 0) < 0.15:
+        no_dedup = command in ("PIX", "PISTOP", "PA", "PISWS")
+        is_swing = command in ("PISWL", "PISWR")
+        if is_swing:
+            if command == getattr(self, '_last_swing_cmd', None) and now - getattr(self, '_last_swing_time', 0) < 2.0:
+                return
+            self._last_swing_cmd = command
+            self._last_swing_time = now
+        elif not no_dedup and command == self._last_cmd and now - getattr(self, '_last_cmd_time', 0) < 0.5:
             return
         self._last_cmd = command
         self._last_cmd_time = now
-        self._log(command, "...")
         try:
             url = f"{self.base_url}/cmd?c={urllib.parse.quote(command)}"
             req = urllib.request.urlopen(url, timeout=2)
@@ -658,6 +677,15 @@ class ESP32WiFiLink:
 
     def emergency_stop(self):
         self.cmd("PISTOP")
+
+    def swing_left(self):
+        self.cmd("PISWL")
+
+    def swing_right(self):
+        self.cmd("PISWR")
+
+    def swing_stop(self):
+        self.cmd("PISWS")
 
     def pickup(self):
         self.cmd("P")
@@ -775,15 +803,8 @@ class Navigator:
                 except Exception as e:
                     bottles, persons = [], []
                     self.infer_fail_streak += 1
-                    print(f"\n  >>> INFER ERROR ({self.infer_fail_streak}/"
-                          f"{INFER_FAIL_LIMIT}): {e}")
-                    if self.infer_fail_streak >= INFER_FAIL_LIMIT and \
-                       self.state not in (State.WAITING, State.STOPPED,
-                                          State.MISSION_COMPLETE,
-                                          State.PICKING_UP):
-                        print("  >>> blind — forcing STOPPED")
-                        self.esp32.emergency_stop()
-                        self.state = State.STOPPED
+                    if self.infer_fail_streak % 50 == 1:
+                        print(f"\n  >>> INFER ERROR ({self.infer_fail_streak}): {e}")
                 ms = (time.time() - t0) * 1000
 
                 smoothed = self.tracker.update(bottles)
@@ -791,16 +812,10 @@ class Navigator:
                 # ── Get ultrasonic data ───────────────────────
                 us = self.esp32.ultrasonic  # {s1:front, s2:right, s3:back, s4:left}
 
-                # ── Sensor freshness watchdog ─────────────────
-                # If the ESP32 stops streaming JSON (USB unplug, reader
-                # thread hang) we'd be navigating on frozen sensor
-                # values. Force a stop until packets resume.
+                # ── Sensor freshness (log only, no stop) ──────
                 age = self.esp32.sensor_age()
-                if age > SENSOR_STALE_S and self.state not in (
-                        State.WAITING, State.STOPPED, State.MISSION_COMPLETE):
-                    print(f"\n  >>> SENSOR STALE ({age:.1f}s) — forcing STOPPED")
-                    self.esp32.emergency_stop()
-                    self.state = State.STOPPED
+                if age > SENSOR_STALE_S and frame_idx % 100 == 0:
+                    print(f"\n  >>> SENSOR DATA AGE: {age:.1f}s (ESP32 may be slow)")
 
                 # ── Store frame for AI vision ─────────────────
                 self._current_frame = frame.copy()
@@ -878,30 +893,11 @@ class Navigator:
                             self.state = State.STOPPED
                             print("\n  >>> MANUAL STOP")
                 else:
-                    # Headless mode: check for Enter key on stdin (cross-platform)
-                    if self.state == State.WAITING:
-                        try:
-                            import sys
-                            if sys.platform == "win32":
-                                import msvcrt
-                                if msvcrt.kbhit():
-                                    msvcrt.getch()
-                                    if self.esp32._connected.is_set():
-                                        self.state = State.SCANNING
-                                        self.scan_start = time.time()
-                                        print("\n  >>> MOTORS ENABLED — SCANNING (slow look-around)")
-                                    else:
-                                        print("\n  >>> WAITING for ESP32 WiFi connection...")
-                            else:
-                                import select
-                                if select.select([sys.stdin], [], [], 0)[0]:
-                                    sys.stdin.readline()
-                                    if self.esp32._connected.is_set():
-                                        self.state = State.SCANNING
-                                    self.scan_start = time.time()
-                                    print("\n  >>> MOTORS ENABLED — SCANNING (slow look-around)")
-                        except Exception:
-                            pass  # stdin not available (e.g., systemd service)
+                    # Headless mode: autonomous start is controlled ONLY
+                    # via the /start Flask route (pi_admin dashboard button).
+                    # No stdin auto-start — prevents accidental motor activation
+                    # when running as a systemd service (/dev/null stdin).
+                    pass
 
                 frame_idx += 1
 
@@ -921,12 +917,24 @@ class Navigator:
         """State machine: slow, careful navigation. Safety is #1 priority.
         us = dict with keys s1(front), s2(right), s3(back), s4(left) in cm."""
 
-        # ── Safety hold: no motor commands until user confirms ──
+        # ── Safety hold: force stop all motors (repeat every 2s as safety net) ──
         if self.state == State.WAITING:
+            now = time.time()
+            if now - getattr(self, '_stop_sent_time', 0) > 2.0:
+                self._stop_sent_time = now
+                self.esp32._last_cmd = None
+                self.esp32.emergency_stop()
+                self.esp32.swing_stop()
             return
 
-        # ── Stopped state: do nothing ─────────────────────
+        # ── Stopped state: force stop all motors (repeat every 2s as safety net) ──
         if self.state == State.STOPPED:
+            now = time.time()
+            if now - getattr(self, '_stop_sent_time', 0) > 2.0:
+                self._stop_sent_time = now
+                self.esp32._last_cmd = None
+                self.esp32.emergency_stop()
+                self.esp32.swing_stop()
             return
 
         # ── Mission complete (bin full): terminal state ───
@@ -954,7 +962,11 @@ class Navigator:
                 if us_back > STOP_DIST:
                     self.esp32.backward(SLOW_SPEED)
                 else:
-                    self.esp32.stop()  # blocked front AND back
+                    # Blocked behind too — skip to turning
+                    if us_left < us_right:
+                        self.esp32.turn_right(SCAN_SPEED)
+                    else:
+                        self.esp32.turn_left(SCAN_SPEED)
             elif elapsed < 3.0:
                 # Turn away from the closer side
                 if us_left < us_right:
@@ -972,7 +984,7 @@ class Navigator:
                 # is still too close (the obstacle moved with us, or a
                 # new one entered the path during the turn), restart the
                 # avoid cycle instead of charging into it.
-                if us_front < STOP_DIST or us_min_forward < SLOW_DIST:
+                if us_front < STOP_DIST:
                     print(f"\n  >>> AVOIDING re-check failed "
                           f"(F={us_front} min_fwd={us_min_forward}) "
                           f"— restarting avoid")
@@ -983,12 +995,12 @@ class Navigator:
                     self.scan_start = time.time()
             return
 
-        # ── PERSON DETECTED → immediate stop (safety first!) ──
+        # ── PERSON DETECTED → steer away (but don't kill autonomous) ──
         for p in persons:
             pw = p[2] - p[0]
             ph = p[3] - p[1]
             p_fill = (pw * ph) / frame_area
-            if p_fill > 0.10:  # person visible → stop immediately
+            if p_fill > 0.25:  # person very close → avoid
                 self.esp32.stop()
                 self._enter_avoiding("PERSON DETECTED")
                 return
@@ -1003,8 +1015,8 @@ class Navigator:
             self._enter_avoiding(f"FRONT < {STOP_DIST}cm")
             return
 
-        # ── Ultrasonic: slow zone → steer away gently ────
-        if us_min_forward < TURN_DIST and not _pursuing:
+        # ── Ultrasonic: slow zone → steer away gently (only while ROAMING) ──
+        if us_min_forward < TURN_DIST and not _pursuing and self.state == State.ROAMING:
             if us_left < us_right:
                 self.esp32.turn_right(SCAN_SPEED)
             else:
@@ -1016,8 +1028,9 @@ class Navigator:
             elapsed = time.time() - self.scan_start
 
             if bottles:
-                # Saw something during scan — stop and verify
+                # Saw something during scan — stop wheels and swing
                 self.esp32.stop()
+                self.esp32.swing_stop()
                 self.state = State.VERIFYING
                 self.verify_count = 1
                 self.verify_lost = 0
@@ -1025,35 +1038,52 @@ class Navigator:
                 return
 
             if elapsed < SCAN_DURATION:
-                # Keep rotating slowly
+                # Turn wheels to rotate the robot body
                 if self.turn_dir > 0:
                     self.esp32.turn_right(SCAN_SPEED)
                 else:
                     self.esp32.turn_left(SCAN_SPEED)
+                # Swing camera platform: left for first half, right for second half
+                swing_phase = int(elapsed / (SCAN_DURATION / 2))
+                new_swing = -1 if swing_phase == 0 else 1
+                if new_swing < 0:
+                    self.esp32.swing_left()
+                else:
+                    self.esp32.swing_right()
             else:
-                # Scan complete, nothing found — ask AI for advice
+                # Scan complete — stop swing, then decide next move
+                self.esp32.swing_stop()
+                # Ask AI for advice if available
                 if AI_AVAILABLE and (time.time() - self._ai_scene_time) > self._ai_scene_interval:
                     self._ai_scene_time = time.time()
                     sensor = self.esp32.sensors
                     import threading
                     def _ai_scan():
                         result = analyze_scene(self._current_frame, sensor)
+                        if self.state == State.WAITING:
+                            return
                         action = result.get("action", "go_forward")
                         reason = result.get("reason", "")
                         spotted = result.get("bottles_spotted", 0)
                         print(f"\n  >>> [AI] {action}: {reason} (bottles_spotted={spotted})")
+                        if self.state == State.WAITING:
+                            return
                         if spotted > 0:
                             self.state = State.SCANNING
                             self.scan_start = time.time()
                         elif action == "turn_left":
                             self.esp32.turn_left(SCAN_SPEED)
                             time.sleep(1.5)
+                            if self.state == State.WAITING:
+                                return
                             self.esp32.stop()
                             self.state = State.SCANNING
                             self.scan_start = time.time()
                         elif action == "turn_right":
                             self.esp32.turn_right(SCAN_SPEED)
                             time.sleep(1.5)
+                            if self.state == State.WAITING:
+                                return
                             self.esp32.stop()
                             self.state = State.SCANNING
                             self.scan_start = time.time()
@@ -1087,6 +1117,8 @@ class Navigator:
                         import threading
                         def _ai_check():
                             is_pet, reason = verify_target(self._current_frame, best[:4])
+                            if self.state == State.WAITING:
+                                return
                             if is_pet:
                                 print(f"\n  >>> AI CONFIRMED: {reason}")
                                 self._ai_verified = True
@@ -1212,17 +1244,19 @@ class Navigator:
         """Stop, run pickup sequence in a thread, then resume scanning."""
         self.state = State.PICKING_UP
         self.esp32.stop()
+        self.esp32.swing_stop()
         time.sleep(0.3)
 
         def _do_pickup():
             print("\n  >>> PICKUP SEQUENCE STARTED")
             self.esp32.pickup()
-            # Wait for the ESP32 pickup state machine to actually finish.
-            # `pickup()` returns immediately — arm is still moving.
-            # Poll the JSON sensor stream until pickup field is "idle"/"done".
-            timeout = time.time() + 35  # 30s ESP32 timeout + 5s margin
+            timeout = time.time() + 35
             pickup_ok = False
             while time.time() < timeout:
+                if self.state == State.WAITING:
+                    print("\n  >>> PICKUP ABORTED — user pressed STOP")
+                    self.esp32.cmd("PA")
+                    return
                 sensor = self.esp32.sensors
                 pu_state = sensor.get("pickup", "idle")
                 if pu_state in ("idle", "done"):
@@ -1231,17 +1265,16 @@ class Navigator:
                 time.sleep(0.5)
             else:
                 print("\n  >>> PICKUP TIMEOUT waiting for ESP32 — aborting")
-                self.esp32.cmd("PA")  # send abort
+                self.esp32.cmd("PA")
                 time.sleep(1)
 
-            # Only check the bin-full sensor on a successful drop. A timeout
-            # or aborted pickup means no bottle was actually deposited.
+            if self.state == State.WAITING:
+                print("\n  >>> PICKUP thread respecting STOP — not resuming")
+                return
+
             if pickup_ok:
                 self.pickup_success_count += 1
 
-                # Hard backstop: even if the IR sensor is broken/unplugged
-                # and the bin is genuinely overflowing, stop the mission
-                # rather than let the robot loop forever.
                 if self.pickup_success_count >= MAX_PICKUPS_BACKSTOP:
                     print(f"\n  >>> BACKSTOP HIT ({MAX_PICKUPS_BACKSTOP} pickups) — "
                           f"MISSION COMPLETE (IR sensor may be faulty: "
@@ -1255,13 +1288,11 @@ class Navigator:
                 if self._is_bin_full():
                     print("\n  >>> BIN FULL (IR proximity tripped) — MISSION COMPLETE")
                     self.esp32.stop()
-                    self.esp32.cmd("PISTOP")  # belt-and-braces
+                    self.esp32.cmd("PISTOP")
                     self.tracker = DetectionTracker()
                     self.state = State.MISSION_COMPLETE
                     return
 
-                # Suspicious: many pickups in and the IR sensor has never
-                # fired even once. Likely unplugged or pointed wrong.
                 if self.pickup_success_count >= 5 and not self.ir_ever_tripped:
                     print(f"\n  >>> WARNING: {self.pickup_success_count} pickups "
                           f"and IR sensor has never read true — check E18-D80NK "
@@ -1272,9 +1303,14 @@ class Navigator:
                 "state": "PICKING_UP",
                 "model": self.manager.active_name,
             })
+
+            if self.state == State.WAITING:
+                print("\n  >>> PICKUP thread respecting STOP — not resuming")
+                return
+
             print(f"\n  >>> PICKUP DONE ({self.pickup_success_count}) — "
                   f"scanning for next bottle")
-            self.tracker = DetectionTracker()  # reset tracker
+            self.tracker = DetectionTracker()
             self.state = State.SCANNING
             self.scan_start = time.time()
 
@@ -1291,6 +1327,7 @@ class Navigator:
         self.verify_lost = 0
         self.approach_lost_count = 0
         self.esp32.stop()
+        self.esp32.swing_stop()
         self.avoid_count += 1
         us = self.esp32.ultrasonic
         log_event("avoidance", {
@@ -1485,6 +1522,8 @@ def main():
             time.sleep(10)
 
     print(f"  Connecting to ESP32 via WiFi ({esp32_ip})...")
+    with stream_lock:
+        stream_stats["esp32_ip"] = esp32_ip
     esp32 = ESP32WiFiLink(ip=esp32_ip, block=False)
 
     # Load YOLO models

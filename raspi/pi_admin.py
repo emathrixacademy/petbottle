@@ -21,7 +21,14 @@ ESP32_BASE = None
 def find_esp32():
     global ESP32_IP, ESP32_BASE
     if ESP32_IP:
-        return ESP32_IP
+        # Verify it's still reachable
+        try:
+            urllib.request.urlopen(f"http://{ESP32_IP}/sensor", timeout=1)
+            return ESP32_IP
+        except Exception:
+            ESP32_IP = None
+            ESP32_BASE = None
+    # Ask navigator for the ESP32 IP (fastest path)
     try:
         d = nav_get("/stats", timeout=3)
         ip = d.get("esp32_ip")
@@ -31,7 +38,8 @@ def find_esp32():
             return ip
     except Exception:
         pass
-    import socket
+    # Parallel network scan as fallback
+    import socket, concurrent.futures
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -40,41 +48,61 @@ def find_esp32():
     except Exception:
         return None
     prefix = my_ip.rsplit(".", 1)[0]
-    for i in range(1, 255):
-        ip = f"{prefix}.{i}"
+    def probe(ip):
         try:
-            req = urllib.request.urlopen(f"http://{ip}/sensor", timeout=0.3)
+            req = urllib.request.urlopen(f"http://{ip}/sensor", timeout=0.5)
             if b"ultrasonic" in req.read():
-                ESP32_IP = ip
-                ESP32_BASE = f"http://{ip}"
                 return ip
         except Exception:
             pass
+        return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as pool:
+        futures = {pool.submit(probe, f"{prefix}.{i}"): i for i in range(1, 255)}
+        for future in concurrent.futures.as_completed(futures, timeout=15):
+            result = future.result()
+            if result:
+                ESP32_IP = result
+                ESP32_BASE = f"http://{result}"
+                return result
     return None
 
 def esp32_cmd(command):
     if not ESP32_BASE:
         find_esp32()
-    if not ESP32_BASE:
-        return {"ok": False, "error": "ESP32 not found"}
+    if ESP32_BASE:
+        try:
+            url = f"{ESP32_BASE}/cmd?c={urllib.parse.quote(command)}"
+            req = urllib.request.urlopen(url, timeout=2)
+            resp = req.read().decode("utf-8", errors="replace").strip()
+            return {"ok": True, "cmd": command, "resp": resp[:80]}
+        except Exception:
+            pass
+    # Fallback: route through navigator (which has its own ESP32 connection)
     try:
-        url = f"{ESP32_BASE}/cmd?c={urllib.parse.quote(command)}"
-        req = urllib.request.urlopen(url, timeout=2)
-        resp = req.read().decode("utf-8", errors="replace").strip()
-        return {"ok": True, "cmd": command, "resp": resp[:80]}
-    except Exception as e:
-        return {"ok": False, "cmd": command, "error": str(e)}
+        result = nav_get(f"/esp32_cmd?c={urllib.parse.quote(command)}", timeout=3)
+        if result.get("ok"):
+            return {"ok": True, "cmd": command, "resp": result.get("resp", "OK"), "via": "navigator"}
+    except Exception:
+        pass
+    return {"ok": False, "cmd": command, "error": "ESP32 not reachable (direct or via navigator)"}
 
 def esp32_sensor():
     if not ESP32_BASE:
         find_esp32()
-    if not ESP32_BASE:
-        return {"ok": False, "error": "ESP32 not found"}
+    if ESP32_BASE:
+        try:
+            req = urllib.request.urlopen(f"{ESP32_BASE}/sensor", timeout=2)
+            return json.loads(req.read())
+        except Exception:
+            pass
+    # Fallback: get sensor data from navigator's cached copy
     try:
-        req = urllib.request.urlopen(f"{ESP32_BASE}/sensor", timeout=2)
-        return json.loads(req.read())
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+        d = nav_get("/stats", timeout=3)
+        if d.get("ultrasonic"):
+            return {"ultrasonic": d["ultrasonic"], "ok": True, "via": "navigator"}
+    except Exception:
+        pass
+    return {"ok": False, "error": "ESP32 not reachable"}
 
 recording = {"active": False, "session": None, "file": None, "writer": None,
              "model": "", "start": 0, "rows": 0, "lock": threading.Lock()}
@@ -676,9 +704,8 @@ function toggleAuto(){
 }
 
 function emergencyStop(){
-  fetch('/manual/cmd?c=PISTOP').then(function(){
-    fetch('/nav/stop').then(function(){poll()});
-  });
+  fetch('/nav/stop').then(function(){poll()});
+  fetch('/manual/cmd?c=PISTOP').catch(function(){});
 }
 
 function loadModels(){
@@ -933,4 +960,13 @@ function doUpload(){
 </body></html>"""
 
 if __name__ == "__main__":
+    def _bg_discover():
+        import time as _t
+        _t.sleep(3)
+        ip = find_esp32()
+        if ip:
+            print(f"  [pi_admin] ESP32 found at {ip}")
+        else:
+            print(f"  [pi_admin] ESP32 not found yet — will retry on first command")
+    threading.Thread(target=_bg_discover, daemon=True).start()
     app.run(host="0.0.0.0", port=8080, threaded=True)

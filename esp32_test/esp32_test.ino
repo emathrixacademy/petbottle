@@ -97,7 +97,6 @@ const int NUM_SENSORS = 4;
 #define BUZZER  3
 
 void executeCmd(String cmd);
-volatile unsigned long lastPiCmdMs = 0;
 
 // ==================== CONSTANTS ====================
 
@@ -143,10 +142,10 @@ int swingSpeed = 0;      // default swing PWM — 0 for safety
 //       Bottom limit must be physically positioned ~5° above 0 to act as
 //       the "lowest allowable" stop.
 // UP:   continuous full force (180 PWM) until TOP limit (SW1) trips.
-#define MANUAL_DOWN_SPEED    35
+#define MANUAL_DOWN_SPEED    40
 #define MANUAL_DOWN_ON_MS    200       // motor on per pulse
 #define MANUAL_DOWN_OFF_MS   300       // motor off between pulses
-#define MANUAL_UP_SPEED      80
+#define MANUAL_UP_SPEED      153
 bool armManualPulseActive = false;     // true while manual arm motion is active
 bool armManualPulseOn     = false;     // current phase of the on/off pulse
 int  armManualPulseDir    = 0;         // +1 = up, -1 = down
@@ -180,10 +179,10 @@ bool puLiftOn = false;             // tracks arm pulse on/off during lifting
 #define PU_DROP_OPEN_MS   12000    // time to wait after opening scoopers
 // Servos are MIRRORED — sweep inward to scoop, outward to release.
 // If scooper direction is backwards, swap OPEN/CLOSE for both.
-#define PU_SERVO_OPEN_L   180      // scooper open (spread apart)
-#define PU_SERVO_OPEN_R   0
-#define PU_SERVO_CLOSE_L  0        // scooper closed (swept inward to scoop)
-#define PU_SERVO_CLOSE_R  180
+#define PU_SERVO_OPEN_L   0        // scooper open (spread apart)
+#define PU_SERVO_OPEN_R   180
+#define PU_SERVO_CLOSE_L  180      // scooper closed (swept inward to scoop)
+#define PU_SERVO_CLOSE_R  0
 #define PU_TIMEOUT_MS     45000    // abort pickup if stuck for 45 seconds (slower sequence)
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -503,8 +502,6 @@ void executeCmd(String cmd) {
     String pi = cmd.substring(2);
     pi.toUpperCase();
     pi.trim();
-    lastPiCmdMs = millis();
-
     if (pi.startsWith("FW")) {
       int spd = constrain(pi.substring(2).toInt(), 0, 80);
       setLeft(spd); setRight(spd);
@@ -537,6 +534,42 @@ void executeCmd(String cmd) {
     } else if (pi == "STOP") {
       stopAll();
       Serial.println("PI: EMERGENCY STOP ALL");
+    } else if (pi == "AU") {
+      armSpeed = MANUAL_UP_SPEED;
+      setArm(1);
+      Serial.println("PI: ARM UP");
+    } else if (pi == "AD") {
+      armSpeed = MANUAL_DOWN_SPEED;
+      setArm(-1);
+      Serial.println("PI: ARM DOWN");
+    } else if (pi == "AS") {
+      stopArm();
+      Serial.println("PI: ARM STOP");
+    } else if (pi == "SWL") {
+      swingSpeed = 35;
+      setSwing(-1);
+      Serial.println("PI: SWING LEFT");
+    } else if (pi == "SWR") {
+      swingSpeed = 35;
+      setSwing(1);
+      Serial.println("PI: SWING RIGHT");
+    } else if (pi == "SWS") {
+      stopSwing();
+      Serial.println("PI: SWING STOP");
+    } else if (pi == "SO") {
+      setServo(SERVO_L_CH, PU_SERVO_OPEN_L);
+      setServo(SERVO_R_CH, PU_SERVO_OPEN_R);
+      Serial.println("PI: SERVOS OPEN");
+    } else if (pi == "SC") {
+      setServo(SERVO_L_CH, PU_SERVO_CLOSE_L);
+      setServo(SERVO_R_CH, PU_SERVO_CLOSE_R);
+      Serial.println("PI: SERVOS CLOSE");
+    } else if (pi == "BZ") {
+      beep(200);
+      Serial.println("PI: BUZZER SHORT");
+    } else if (pi == "BZL") {
+      beep(1000);
+      Serial.println("PI: BUZZER LONG");
     } else {
       Serial.printf("PI: unknown command '%s'\n", pi.c_str());
     }
@@ -787,30 +820,11 @@ void printMenu() {
 
 // ==================== WEB HANDLERS ====================
 
-// While the Pi is actively driving over USB serial, lock the web /cmd
-// endpoint so a browser tab on the dashboard can't override the
-// navigator's commands. PISTOP and PIX are always allowed through as
-// emergency overrides — operator must always have a kill switch.
-#define AUTO_LOCK_MS 5000
-
 void handleWebCmd() {
   if (server.hasArg("c")) {
     String cmd = server.arg("c");
     String source = server.client().remoteIP().toString();
     String srcLabel = "Web(" + source + ")";
-
-    bool piActive = (lastPiCmdMs > 0) &&
-                    (millis() - lastPiCmdMs < AUTO_LOCK_MS);
-    bool isEmergency = (cmd == "PISTOP" || cmd == "PIX" || cmd == "PA");
-    if (piActive && !isEmergency) {
-      Serial.printf("Web CMD [%s] LOCKED (Pi active): %s\n",
-                    srcLabel.c_str(), cmd.c_str());
-      logCmd(srcLabel, cmd, "LOCKED");
-      server.send(423, "text/plain",
-                  "LOCKED: Pi navigator is driving. Use /stop on the "
-                  "navigator UI (port 5000), or send PISTOP/PIX/PA.");
-      return;
-    }
 
     Serial.printf("Web CMD [%s]: %s\n", srcLabel.c_str(), cmd.c_str());
     executeCmd(cmd);
@@ -1701,19 +1715,5 @@ void loop() {
     }
   }
 
-  // ── Wheel watchdog ───────────────────────────────────────
-  // If the Pi stops sending commands (disconnect, navigator crash),
-  // force wheels to zero after WHEEL_WATCHDOG_MS of silence.
-  #define WHEEL_WATCHDOG_MS 1000
-  static bool watchdogTripped = false;
-  if (lastPiCmdMs > 0 && (millis() - lastPiCmdMs) > WHEEL_WATCHDOG_MS) {
-    if (!watchdogTripped) {
-      stopWheels();
-      Serial.println("WATCHDOG: no Pi command for >1s — wheels stopped");
-      watchdogTripped = true;
-    }
-  } else if (lastPiCmdMs > 0) {
-    watchdogTripped = false;  // re-armed when commands resume
-  }
 
 }
