@@ -618,6 +618,9 @@ class ESP32WiFiLink:
             return time.time() - self._sensor_data_ts
 
     def cmd(self, command):
+        if command == self._last_cmd and command not in ("PIX", "PISTOP", "P", "PA"):
+            return
+        self._last_cmd = command
         self._log(command, "...")
         try:
             url = f"{self.base_url}/cmd?c={urllib.parse.quote(command)}"
