@@ -12,6 +12,7 @@ Restart=on-failure
 RestartSec=5
 Environment=DISPLAY=
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/home/set-admin/.env
 
 [Install]
 WantedBy=multi-user.target
