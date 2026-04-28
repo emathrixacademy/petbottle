@@ -503,6 +503,7 @@ void executeCmd(String cmd) {
     String pi = cmd.substring(2);
     pi.toUpperCase();
     pi.trim();
+    lastPiCmdMs = millis();
 
     if (pi.startsWith("FW")) {
       int spd = constrain(pi.substring(2).toInt(), 0, 80);
