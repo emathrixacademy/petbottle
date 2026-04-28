@@ -1463,13 +1463,15 @@ def main():
     stream_thread.start()
     print(f"  Stream: http://0.0.0.0:5000/video_feed")
 
-    # Discover or use provided ESP32 IP
+    # Discover or use provided ESP32 IP (retry forever until found)
     esp32_ip = args.esp32_ip
     if not esp32_ip:
-        esp32_ip = discover_esp32()
-        if not esp32_ip:
-            print("  ERROR: Cannot find ESP32 — check hotspot and ESP32 power")
-            return
+        while True:
+            esp32_ip = discover_esp32()
+            if esp32_ip:
+                break
+            print("  ESP32 not found — retrying in 10s (waiting for it to join hotspot)...")
+            time.sleep(10)
 
     print(f"  Connecting to ESP32 via WiFi ({esp32_ip})...")
     esp32 = ESP32WiFiLink(ip=esp32_ip, block=False)
