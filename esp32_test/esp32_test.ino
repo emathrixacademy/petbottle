@@ -180,10 +180,10 @@ bool puLiftOn = false;             // tracks arm pulse on/off during lifting
 #define PU_DROP_OPEN_MS   12000    // time to wait after opening scoopers
 // Servos are MIRRORED — sweep inward to scoop, outward to release.
 // If scooper direction is backwards, swap OPEN/CLOSE for both.
-#define PU_SERVO_OPEN_L   0        // scooper open (spread apart)
-#define PU_SERVO_OPEN_R   180
-#define PU_SERVO_CLOSE_L  180      // scooper closed (swept inward to scoop)
-#define PU_SERVO_CLOSE_R  0
+#define PU_SERVO_OPEN_L   180      // scooper open (spread apart)
+#define PU_SERVO_OPEN_R   0
+#define PU_SERVO_CLOSE_L  0        // scooper closed (swept inward to scoop)
+#define PU_SERVO_CLOSE_R  180
 #define PU_TIMEOUT_MS     45000    // abort pickup if stuck for 45 seconds (slower sequence)
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
