@@ -203,7 +203,8 @@ def get_stats():
 
 @stream_app.route('/start')
 def nav_start():
-    if _navigator_ref and _navigator_ref.state == State.WAITING:
+    if _navigator_ref and _navigator_ref.state in (State.WAITING, State.STOPPED,
+                                                     State.MISSION_COMPLETE):
         if not _navigator_ref.esp32._connected.is_set():
             return jsonify({"ok": False, "state": "WAITING", "msg": "ESP32 not connected via WiFi yet"})
         _navigator_ref.pickup_success_count = 0
@@ -515,11 +516,11 @@ MAX_PICKUPS_BACKSTOP = 20   # absolute cap regardless of IR sensor
 # If we haven't seen one for this long, assume the link is dead (USB
 # unplug, reader thread crash) and force a stop — otherwise the
 # navigator would keep deciding based on frozen sensor values.
-SENSOR_STALE_S = 2.0
+SENSOR_STALE_S = 5.0
 
 # YOLO inference watchdog: if the model errors N times in a row,
 # stop driving — we have no eyes.
-INFER_FAIL_LIMIT = 3
+INFER_FAIL_LIMIT = 15
 
 
 # ══════════════════════════════════════════════════════════════
@@ -559,15 +560,18 @@ class ESP32WiFiLink:
                 with self._lock:
                     self.sensor_data = parsed
                     self._sensor_data_ts = time.time()
+                self._poll_fails = 0
                 if not self._connected.is_set():
                     self._connected.set()
                     print(f"  WiFi connected to ESP32 at {self.base_url}")
             except Exception:
-                with self._lock:
-                    self._sensor_data_ts = 0.0
-                if self._connected.is_set():
-                    self._connected.clear()
-                    print(f"  WiFi lost connection to ESP32")
+                self._poll_fails = getattr(self, '_poll_fails', 0) + 1
+                if self._poll_fails >= 5:
+                    with self._lock:
+                        self._sensor_data_ts = 0.0
+                    if self._connected.is_set():
+                        self._connected.clear()
+                        print(f"  WiFi lost connection to ESP32")
             time.sleep(0.2)
 
     def _log(self, command, response):
@@ -618,9 +622,13 @@ class ESP32WiFiLink:
             return time.time() - self._sensor_data_ts
 
     def cmd(self, command):
-        if command == self._last_cmd and command not in ("PIX", "PISTOP", "P", "PA"):
+        now = time.time()
+        if command == self._last_cmd:
+            return
+        if now - getattr(self, '_last_cmd_time', 0) < 0.15:
             return
         self._last_cmd = command
+        self._last_cmd_time = now
         self._log(command, "...")
         try:
             url = f"{self.base_url}/cmd?c={urllib.parse.quote(command)}"
