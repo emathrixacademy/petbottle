@@ -1,0 +1,9 @@
+nano ~/setup_hailo.sh
+# Paste the script, then press Ctrl+X, Y, Enter
+
+chmod +x ~/setup_hailo.sh
+
+./setup_hailo.sh
+
+
+100.93.98.117
