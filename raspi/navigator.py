@@ -127,7 +127,8 @@ VERIFY_SPEED    = 30            # verification approach — extra cautious
 BOTTLE_CLOSE_FILL = 0.15        # bottle fills 15% of frame → close enough to pick
 BOTTLE_CENTER_TOL = 0.15        # tolerance from frame center (fraction)
 VERIFY_FRAMES     = 10          # must see bottle in N frames before approaching
-SCAN_DURATION     = 8.0         # seconds to scan (slow 360 rotation)
+SCAN_DURATION     = 60.0        # seconds to scan (30s left + 30s right)
+SWING_FULL_TRAVEL_S = 3.0      # seconds to sweep full 180° at SCAN_SPEED
 
 # COCO obstacle classes (things the robot should avoid)
 COCO_OBSTACLE_CLASSES = {
@@ -146,8 +147,9 @@ stream_frame = None  # latest JPEG-encoded frame
 stream_stats = {"fps": 0, "bottles": 0, "persons": 0, "model": "", "inference_ms": 0, "state": "WAITING",
                 "ultrasonic": {"s1": 999, "s2": 999, "s3": 999, "s4": 999},
                 "binFull": False, "pickups": 0, "avoidances": 0, "espConnected": False,
-                "esp32_ip": None}
+                "esp32_ip": None, "cameraOk": False}
 _navigator_ref = None  # set by Navigator.__init__ so Flask routes can control it
+_manual_mode_until = 0.0  # epoch time until which manual mode suppresses periodic stops
 
 # Data logger — records events during navigation
 data_log = []
@@ -201,6 +203,15 @@ def get_stats():
     with stream_lock:
         return jsonify(stream_stats)
 
+@stream_app.route('/manual_mode')
+def set_manual_mode():
+    global _manual_mode_until
+    _manual_mode_until = time.time() + 30.0  # suppress periodic stops for 30 s
+    # Also reset the stop timer so the next periodic stop is 30 s from now
+    if _navigator_ref:
+        _navigator_ref._stop_sent_time = time.time()
+    return jsonify({"ok": True})
+
 @stream_app.route('/start')
 def nav_start():
     if _navigator_ref and _navigator_ref.state in (State.WAITING, State.STOPPED,
@@ -220,6 +231,12 @@ def nav_start():
 @stream_app.route('/stop')
 def nav_stop():
     if _navigator_ref:
+        # Stop button does not interrupt active autonomous operation.
+        # It only works from terminal/idle states.
+        if _navigator_ref.state not in (State.WAITING, State.STOPPED,
+                                         State.MISSION_COMPLETE):
+            return jsonify({"ok": False, "state": _navigator_ref.state.name,
+                           "msg": "autonomous running — cannot stop mid-mission"})
         _navigator_ref.state = State.WAITING
         _navigator_ref._stop_sent_time = 0
         _navigator_ref.esp32._last_cmd = None
@@ -723,6 +740,9 @@ class Navigator:
         self.turn_timer  = 0.0
         self.avoid_timer = 0.0
         self.scan_start  = 0.0       # when scanning started
+        self._swing_pos  = 0.5      # 0.0=full_left  0.5=center  1.0=full_right
+        self._swing_dir  = 0        # -1=moving_left  +1=moving_right  0=stopped
+        self._swing_last_t = 0.0
         self.verify_count = 0        # frames bottle has been seen during verify
         self.verify_lost  = 0        # frames bottle was NOT seen during verify
         self.approach_lost_count = 0
@@ -749,16 +769,24 @@ class Navigator:
             ))
             picam2.start()
             use_picamera2 = True
+            with stream_lock:
+                stream_stats["cameraOk"] = True
             print("  Using picamera2 (CSI ribbon)")
         except Exception as e:
             print(f"  picamera2 not available ({e}), falling back to V4L2...")
             use_picamera2 = False
             cap = cv2.VideoCapture(0)
             if not cap.isOpened():
-                print("Cannot open camera")
-                return
+                print("Cannot open camera — running sensor-only mode")
+                with stream_lock:
+                    stream_stats["cameraOk"] = False
+                # Keep running so ESP32 connection and manual control still work
+                while True:
+                    time.sleep(1)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            with stream_lock:
+                stream_stats["cameraOk"] = True
 
         if not self.no_show:
             cv2.namedWindow("PET Bottle Navigator", cv2.WINDOW_NORMAL)
@@ -888,10 +916,7 @@ class Navigator:
                         if self.state == State.STOPPED:
                             self.state = State.ROAMING
                             print("\n  >>> RESUMED")
-                        elif self.state != State.WAITING:
-                            self.esp32.stop()
-                            self.state = State.STOPPED
-                            print("\n  >>> MANUAL STOP")
+                        # S key does not interrupt active autonomous operation
                 else:
                     # Headless mode: autonomous start is controlled ONLY
                     # via the /start Flask route (pi_admin dashboard button).
@@ -917,20 +942,24 @@ class Navigator:
         """State machine: slow, careful navigation. Safety is #1 priority.
         us = dict with keys s1(front), s2(right), s3(back), s4(left) in cm."""
 
-        # ── Safety hold: force stop all motors (repeat every 2s as safety net) ──
+        # ── Safety hold: force stop all motors (once on entry, repeat every 30s) ──
         if self.state == State.WAITING:
             now = time.time()
-            if now - getattr(self, '_stop_sent_time', 0) > 2.0:
+            if now < _manual_mode_until:  # manual control active — don't override
+                return
+            if now - getattr(self, '_stop_sent_time', 0) > 30.0:
                 self._stop_sent_time = now
                 self.esp32._last_cmd = None
                 self.esp32.emergency_stop()
                 self.esp32.swing_stop()
             return
 
-        # ── Stopped state: force stop all motors (repeat every 2s as safety net) ──
+        # ── Stopped state: force stop all motors (once on entry, repeat every 30s) ──
         if self.state == State.STOPPED:
             now = time.time()
-            if now - getattr(self, '_stop_sent_time', 0) > 2.0:
+            if now < _manual_mode_until:  # manual control active — don't override
+                return
+            if now - getattr(self, '_stop_sent_time', 0) > 30.0:
                 self._stop_sent_time = now
                 self.esp32._last_cmd = None
                 self.esp32.emergency_stop()
@@ -1030,7 +1059,7 @@ class Navigator:
             if bottles:
                 # Saw something during scan — stop wheels and swing
                 self.esp32.stop()
-                self.esp32.swing_stop()
+                self._swing_stop()
                 self.state = State.VERIFYING
                 self.verify_count = 1
                 self.verify_lost = 0
@@ -1043,16 +1072,21 @@ class Navigator:
                     self.esp32.turn_right(SCAN_SPEED)
                 else:
                     self.esp32.turn_left(SCAN_SPEED)
-                # Swing camera platform: left for first half, right for second half
+                # Swing camera platform within 180° limit
+                self._tick_swing()
                 swing_phase = int(elapsed / (SCAN_DURATION / 2))
                 new_swing = -1 if swing_phase == 0 else 1
-                if new_swing < 0:
+                if new_swing < 0 and self._swing_pos > 0.01:
                     self.esp32.swing_left()
-                else:
+                    self._swing_dir = -1
+                elif new_swing > 0 and self._swing_pos < 0.99:
                     self.esp32.swing_right()
+                    self._swing_dir = 1
+                else:
+                    self._swing_stop()
             else:
                 # Scan complete — stop swing, then decide next move
-                self.esp32.swing_stop()
+                self._swing_stop()
                 # Ask AI for advice if available
                 if AI_AVAILABLE and (time.time() - self._ai_scene_time) > self._ai_scene_interval:
                     self._ai_scene_time = time.time()
@@ -1240,11 +1274,25 @@ class Navigator:
                 self.state = State.SCANNING
                 self.scan_start = time.time()
 
+    def _tick_swing(self):
+        """Update estimated swing position (0.0=left_end … 1.0=right_end)."""
+        now = time.time()
+        if self._swing_last_t > 0 and self._swing_dir != 0:
+            dt = now - self._swing_last_t
+            self._swing_pos = max(0.0, min(1.0,
+                self._swing_pos + self._swing_dir * dt / SWING_FULL_TRAVEL_S))
+        self._swing_last_t = now
+
+    def _swing_stop(self):
+        self._tick_swing()
+        self.esp32.swing_stop()
+        self._swing_dir = 0
+
     def _start_pickup(self):
         """Stop, run pickup sequence in a thread, then resume scanning."""
         self.state = State.PICKING_UP
         self.esp32.stop()
-        self.esp32.swing_stop()
+        self._swing_stop()
         time.sleep(0.3)
 
         def _do_pickup():
@@ -1327,7 +1375,7 @@ class Navigator:
         self.verify_lost = 0
         self.approach_lost_count = 0
         self.esp32.stop()
-        self.esp32.swing_stop()
+        self._swing_stop()
         self.avoid_count += 1
         us = self.esp32.ultrasonic
         log_event("avoidance", {
@@ -1470,7 +1518,12 @@ class Navigator:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 100), 1)
 
         # Bottom hint
-        hint = "G=GO  S=Stop/Resume  Q=Quit" if self.state == State.WAITING else "S=Stop/Resume  Q=Quit"
+        if self.state == State.WAITING:
+            hint = "G=GO  Q=Quit"
+        elif self.state == State.STOPPED:
+            hint = "S=Resume  Q=Quit"
+        else:
+            hint = "Q=Quit  (autonomous — stop disabled)"
         cv2.putText(frame, hint,
                     (w // 2 - 100, h - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1)
