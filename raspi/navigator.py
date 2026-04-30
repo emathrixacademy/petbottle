@@ -216,6 +216,7 @@ def esp32_reconnect():
     print(f"  ESP32 IP updated to {ip} via /esp32_reconnect")
     return jsonify({"ok": True, "ip": ip})
 
+
 @stream_app.route('/manual_mode')
 def set_manual_mode():
     global _manual_mode_until

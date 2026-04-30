@@ -47,7 +47,7 @@ WebServer server(80);
 #define ECHO_1    33
 #define ECHO_2    35
 #define ECHO_3    32
-#define ECHO_4    0
+#define ECHO_4    34
 const int echoPins[] = {ECHO_1, ECHO_2, ECHO_3, ECHO_4};
 const char* echoLabels[] = {"S1(33)", "S2(35)", "S3(32)", "S4(34)"};
 const int NUM_SENSORS = 4;
@@ -1641,6 +1641,7 @@ void loop() {
     swingCurrentDir = 0;
     Serial.println("Swing 180 limit reached — auto-stop");
   }
+
 
   // Background ultrasonic reads — ONE sensor per tick (round-robin).
   // Shared TRIG needs ~60ms between fires to let echoes decay.
