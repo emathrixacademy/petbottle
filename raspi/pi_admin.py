@@ -710,11 +710,18 @@ function setUSm(id,val){
 
 function updateAutoBtn(){
   var btn=document.getElementById('autoBtn');
-  btn.disabled=false;
   btn.style.opacity='1';
   if(autoRunning){
+    btn.disabled=false;
     btn.className='auto-btn stop';btn.textContent='STOP AUTONOMOUS';
+  }else if(!_navOk){
+    btn.disabled=true;
+    btn.className='auto-btn start';btn.textContent='NAVIGATOR OFFLINE';
+  }else if(!_espOk){
+    btn.disabled=true;
+    btn.className='auto-btn start';btn.textContent='WAITING FOR ESP32...';
   }else{
+    btn.disabled=false;
     btn.className='auto-btn start';btn.textContent='START AUTONOMOUS';
   }
 }
