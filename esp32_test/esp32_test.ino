@@ -1629,6 +1629,20 @@ void setup() {
 void loop() {
   server.handleClient();
 
+  // WiFi auto-reconnect — re-attempt every 10 s if connection is lost
+  static unsigned long lastWifiCheck = 0;
+  if (millis() - lastWifiCheck >= 10000) {
+    lastWifiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi lost — reconnecting...");
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("WiFi reconnect");
+      WiFi.disconnect(true);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+  }
+
   // Non-blocking buzzer
   buzzerUpdate();
 
