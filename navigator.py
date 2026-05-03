@@ -124,7 +124,8 @@ ALIGN_SPEED     = 35            # fine alignment turns before pickup — slow to
 VERIFY_SPEED    = 30            # verification approach — extra cautious
 
 # Bottle detection & verification
-PICKUP_DIST_CM    = 20          # front ultrasonic ≤ 20 cm → close enough to pick
+PICKUP_DIST_CM    = 10          # front ultrasonic ≤ 20 cm → close enough to pick
+PICKUP_FILL_FALLBACK = 0.25     # camera fallback: bottle fills 25% of frame → pick (for lying bottles ultrasonic misses)
 BOTTLE_CENTER_TOL = 0.15        # tolerance from frame center (fraction)
 VERIFY_FRAMES     = 10          # must see bottle in N frames before approaching
 SCAN_DURATION     = 60.0        # seconds to scan (30s left + 30s right)
@@ -1195,10 +1196,13 @@ class Navigator:
                 if self.verify_count >= VERIFY_FRAMES:
                     # Bottle confirmed by YOLO — go straight to pickup
                     b_cx_norm = ((bx1 + bx2) / 2.0) / w
-                    if (us_front <= PICKUP_DIST_CM
+                    close_by_us = us_front <= PICKUP_DIST_CM
+                    close_by_cam = b_fill >= PICKUP_FILL_FALLBACK
+                    if ((close_by_us or close_by_cam)
                             and abs(b_cx_norm - 0.5) < BOTTLE_CENTER_TOL):
                         # Already in range and centered — pick up now
-                        print(f"\n  >>> Bottle CONFIRMED & in range (US={us_front}cm) — starting pickup")
+                        trigger = f"US={us_front}cm" if close_by_us else f"CAM={b_fill:.0%}"
+                        print(f"\n  >>> Bottle CONFIRMED & in range ({trigger}) — starting pickup")
                         self._start_pickup()
                     else:
                         # Not close enough yet — approach and pickup triggers automatically
@@ -1235,8 +1239,10 @@ class Navigator:
                 b_cx = (bx1 + bx2) / 2.0
                 b_cx_norm = b_cx / w  # 0.0 = left, 1.0 = right
 
-                if us_front <= PICKUP_DIST_CM:
-                    # Close enough (ultrasonic) — check alignment then pick up
+                close_by_us = us_front <= PICKUP_DIST_CM
+                close_by_cam = b_fill >= PICKUP_FILL_FALLBACK
+                if close_by_us or close_by_cam:
+                    # Close enough (ultrasonic OR camera fallback for lying bottles)
                     if abs(b_cx_norm - 0.5) < BOTTLE_CENTER_TOL:
                         self._start_pickup()
                     else:
