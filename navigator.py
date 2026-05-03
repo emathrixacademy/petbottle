@@ -128,7 +128,9 @@ PICKUP_DIST_CM    = 10          # front ultrasonic ≤ 20 cm → close enough to
 PICKUP_FILL_FALLBACK = 0.25     # camera fallback: bottle fills 25% of frame → pick (for lying bottles ultrasonic misses)
 BOTTLE_CENTER_TOL = 0.15        # tolerance from frame center (fraction)
 VERIFY_FRAMES     = 10          # must see bottle in N frames before approaching
-SCAN_DURATION     = 60.0        # seconds to scan (30s left + 30s right)
+SCAN_STEP_TURN_S  = 0.4         # seconds to spin per step (~25° at SCAN_SPEED 60%)
+SCAN_PAUSE_S      = 2.5         # seconds to pause and look after each step
+SCAN_MAX_STEPS    = 15          # steps per scan cycle (~375° total = full rotation + margin)
 
 # COCO obstacle classes (things the robot should avoid)
 COCO_OBSTACLE_CLASSES = {
@@ -236,8 +238,7 @@ def nav_start():
         _navigator_ref.pickup_success_count = 0
         _navigator_ref.ir_ever_tripped = False
         _navigator_ref.infer_fail_streak = 0
-        _navigator_ref.state = State.SCANNING
-        _navigator_ref.scan_start = time.time()
+        _navigator_ref._reset_scan()
         return jsonify({"ok": True, "state": "SCANNING"})
     elif _navigator_ref:
         return jsonify({"ok": False, "state": _navigator_ref.state.name, "msg": "already running"})
@@ -269,8 +270,7 @@ def esp32_proxy_cmd():
 @stream_app.route('/resume')
 def nav_resume():
     if _navigator_ref and _navigator_ref.state == State.STOPPED:
-        _navigator_ref.state = State.SCANNING
-        _navigator_ref.scan_start = time.time()
+        _navigator_ref._reset_scan()
         return jsonify({"ok": True, "state": "SCANNING"})
     elif _navigator_ref:
         return jsonify({"ok": False, "state": _navigator_ref.state.name})
@@ -776,6 +776,9 @@ class Navigator:
         self.turn_timer  = 0.0
         self.avoid_timer = 0.0
         self.scan_start  = 0.0       # when scanning started
+        self.scan_step   = 0         # current step in step-scan cycle
+        self.scan_phase  = "turn"    # "turn" or "pause"
+        self.scan_phase_start = 0.0  # when current phase started
         self.verify_count = 0        # frames bottle has been seen during verify
         self.verify_lost  = 0        # frames bottle was NOT seen during verify
         self.approach_lost_count = 0
@@ -959,8 +962,7 @@ class Navigator:
                             if not self.esp32._connected.is_set():
                                 print("\n  >>> WAITING for ESP32 WiFi connection...")
                             else:
-                                self.state = State.SCANNING
-                                self.scan_start = time.time()
+                                self._reset_scan()
                                 print("\n  >>> MOTORS ENABLED — SCANNING (slow look-around)")
                     elif key in (ord('s'), ord('S')):
                         if self.state == State.STOPPED:
@@ -1070,8 +1072,7 @@ class Navigator:
                     self.avoid_timer = time.time()
                 else:
                     self.esp32.stop()
-                    self.state = State.SCANNING
-                    self.scan_start = time.time()
+                    self._reset_scan()
             return
 
         # ── PERSON DETECTED → steer away (but don't kill autonomous) ──
@@ -1114,12 +1115,11 @@ class Navigator:
                     self.esp32.turn_left(SCAN_SPEED)
                 return
 
-        # ── SCANNING: slow rotation to look around 360° ──
+        # ── SCANNING: step-scan — turn ~25°, pause 2.5s to look, repeat ──
         if self.state == State.SCANNING:
-            elapsed = time.time() - self.scan_start
+            now = time.time()
 
             if bottles:
-                # Saw something during scan — stop wheels
                 self.esp32.stop()
                 self.state = State.VERIFYING
                 self.verify_count = 1
@@ -1127,20 +1127,12 @@ class Navigator:
                 print("\n  >>> Possible bottle spotted — verifying...")
                 return
 
-            if elapsed < SCAN_DURATION:
-                # Turn wheels to rotate the robot body
-                if self.turn_dir > 0:
-                    self.esp32.turn_right(SCAN_SPEED)
-                else:
-                    self.esp32.turn_left(SCAN_SPEED)
-            else:
-                # Scan complete — decide next move
+            if self.scan_step >= SCAN_MAX_STEPS:
+                # Full rotation done, no bottle found — roam forward
                 self.esp32.stop()
-                # Ask AI for advice if available
-                if AI_AVAILABLE and (time.time() - self._ai_scene_time) > self._ai_scene_interval:
-                    self._ai_scene_time = time.time()
+                if AI_AVAILABLE and (now - self._ai_scene_time) > self._ai_scene_interval:
+                    self._ai_scene_time = now
                     sensor = self.esp32.sensors
-                    import threading
                     def _ai_scan():
                         result = analyze_scene(self._current_frame, sensor)
                         if self.state == State.WAITING:
@@ -1152,33 +1144,48 @@ class Navigator:
                         if self.state == State.WAITING:
                             return
                         if spotted > 0:
-                            self.state = State.SCANNING
-                            self.scan_start = time.time()
+                            self._reset_scan()
                         elif action == "turn_left":
                             self.esp32.turn_left(SCAN_SPEED)
                             time.sleep(1.5)
                             if self.state == State.WAITING:
                                 return
                             self.esp32.stop()
-                            self.state = State.SCANNING
-                            self.scan_start = time.time()
+                            self._reset_scan()
                         elif action == "turn_right":
                             self.esp32.turn_right(SCAN_SPEED)
                             time.sleep(1.5)
                             if self.state == State.WAITING:
                                 return
                             self.esp32.stop()
-                            self.state = State.SCANNING
-                            self.scan_start = time.time()
+                            self._reset_scan()
                         else:
                             self.state = State.ROAMING
                             self.turn_timer = time.time()
                     threading.Thread(target=_ai_scan, daemon=True).start()
                 else:
-                    self.esp32.stop()
                     self.state = State.ROAMING
                     self.turn_timer = time.time()
                 self.turn_dir *= -1
+                return
+
+            phase_elapsed = now - self.scan_phase_start
+
+            if self.scan_phase == "turn":
+                if phase_elapsed < SCAN_STEP_TURN_S:
+                    if self.turn_dir > 0:
+                        self.esp32.turn_right(SCAN_SPEED)
+                    else:
+                        self.esp32.turn_left(SCAN_SPEED)
+                else:
+                    self.esp32.stop()
+                    self.scan_phase = "pause"
+                    self.scan_phase_start = now
+            elif self.scan_phase == "pause":
+                if phase_elapsed >= SCAN_PAUSE_S:
+                    self.scan_step += 1
+                    self.scan_phase = "turn"
+                    self.scan_phase_start = now
             return
 
         # ── VERIFYING: stay still or creep closer to confirm bottle ──
@@ -1222,8 +1229,7 @@ class Navigator:
                 if self.verify_lost > 20:
                     # Lost it — false alarm, go back to scanning
                     print("\n  >>> False alarm — resuming scan")
-                    self.state = State.SCANNING
-                    self.scan_start = time.time()
+                    self._reset_scan()
                     self.verify_count = 0
             return
 
@@ -1266,8 +1272,7 @@ class Navigator:
                 self.esp32.stop()
                 if self.approach_lost_count > 20:
                     print("\n  >>> Lost bottle — scanning again")
-                    self.state = State.SCANNING
-                    self.scan_start = time.time()
+                    self._reset_scan()
             return
 
         # ── ALIGNING: fine-tune position before pickup ────
@@ -1285,8 +1290,7 @@ class Navigator:
                         self.esp32.turn_right(ALIGN_SPEED)
             else:
                 self.esp32.stop()
-                self.state = State.SCANNING
-                self.scan_start = time.time()
+                self._reset_scan()
             return
 
         # ── ROAMING: move forward slowly, then scan again ─
@@ -1312,8 +1316,16 @@ class Navigator:
             else:
                 # Done moving — stop and scan again
                 self.esp32.stop()
-                self.state = State.SCANNING
-                self.scan_start = time.time()
+                self._reset_scan()
+
+    def _start_pickup(self):
+    def _reset_scan(self):
+        """Enter SCANNING with fresh step-scan state."""
+        self.state = State.SCANNING
+        self.scan_start = time.time()
+        self.scan_step = 0
+        self.scan_phase = "turn"
+        self.scan_phase_start = time.time()
 
     def _start_pickup(self):
         """Stop, run pickup sequence in a thread, then resume scanning."""
@@ -1396,8 +1408,7 @@ class Navigator:
             print(f"\n  >>> PICKUP DONE ({self.pickup_success_count}) — "
                   f"scanning for next bottle")
             self.tracker = DetectionTracker()
-            self.state = State.SCANNING
-            self.scan_start = time.time()
+            self._reset_scan()
 
         threading.Thread(target=_do_pickup, daemon=True).start()
 
