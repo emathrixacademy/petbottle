@@ -117,7 +117,7 @@ TURN_DIST       = 60            # start steering away
 # Tracks need more power to skid-steer than to drive straight
 ROAM_SPEED      = 40            # forward/backward — 40% duty
 SLOW_SPEED      = 30            # near obstacles — slow crawl
-APPROACH_SPEED  = 25            # approaching a bottle — slow to compensate for camera latency
+APPROACH_SPEED  = 40            # approaching a bottle — 40%
 TURN_SPEED      = 60            # turning — 60% (tracks need more to skid-steer)
 SCAN_SPEED      = 60            # scanning rotation — 60%
 ALIGN_SPEED     = 35            # fine alignment turns before pickup — slow to avoid overshoot
@@ -1268,22 +1268,11 @@ class Navigator:
                     else:
                         self.esp32.forward(APPROACH_SPEED)
             else:
-                # Camera lost the bottle — use ultrasonic to decide what to do
-                if us_front <= PICKUP_DIST_CM:
-                    # D: ultrasonic says something is right here — pick it up
-                    print(f"\n  >>> Camera lost bottle but US={us_front}cm — starting pickup")
-                    self._start_pickup()
-                elif us_front <= SLOW_DIST:
-                    # B: ultrasonic sees something close — keep creeping forward
-                    self.approach_lost_count = 0
-                    self.esp32.forward(SLOW_SPEED)
-                else:
-                    # Genuinely lost — no ultrasonic backup
-                    self.approach_lost_count += 1
-                    self.esp32.stop()
-                    if self.approach_lost_count > 45:
-                        print("\n  >>> Lost bottle — scanning again")
-                        self._reset_scan()
+                self.approach_lost_count += 1
+                self.esp32.stop()
+                if self.approach_lost_count > 20:
+                    print("\n  >>> Lost bottle — scanning again")
+                    self._reset_scan()
             return
 
         # ── ALIGNING: fine-tune position before pickup ────
