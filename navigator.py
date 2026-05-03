@@ -117,17 +117,17 @@ TURN_DIST       = 60            # start steering away
 # Tracks need more power to skid-steer than to drive straight
 ROAM_SPEED      = 40            # forward/backward — 40% duty
 SLOW_SPEED      = 30            # near obstacles — slow crawl
-APPROACH_SPEED  = 40            # approaching a bottle — 40%
+APPROACH_SPEED  = 25            # approaching a bottle — slow crawl to avoid ramming
 TURN_SPEED      = 60            # turning — 60% (tracks need more to skid-steer)
 SCAN_SPEED      = 60            # scanning rotation — 60%
 ALIGN_SPEED     = 35            # fine alignment turns before pickup — slow to avoid overshoot
 VERIFY_SPEED    = 30            # verification approach — extra cautious
 
 # Bottle detection & verification
-PICKUP_DIST_CM    = 10          # front ultrasonic ≤ 20 cm → close enough to pick
-PICKUP_FILL_FALLBACK = 0.25     # camera fallback: bottle fills 25% of frame → pick (for lying bottles ultrasonic misses)
+PICKUP_DIST_CM    = 15          # front ultrasonic ≤ 15 cm → close enough to pick
+PICKUP_FILL_FALLBACK = 0.18     # camera fallback: bottle fills 18% of frame → pick (for lying bottles ultrasonic misses)
 BOTTLE_CENTER_TOL = 0.15        # tolerance from frame center (fraction)
-VERIFY_FRAMES     = 10          # must see bottle in N frames before approaching
+VERIFY_FRAMES     = 30          # must see bottle in 30 frames (~1s at 30fps) before approaching
 SCAN_STEP_TURN_S  = 0.4         # seconds to spin per step (~25° at SCAN_SPEED 60%)
 SCAN_PAUSE_S      = 2.5         # seconds to pause and look after each step
 SCAN_MAX_STEPS    = 15          # steps per scan cycle (~375° total = full rotation + margin)
@@ -1188,46 +1188,38 @@ class Navigator:
                     self.scan_phase_start = now
             return
 
-        # ── VERIFYING: stay still or creep closer to confirm bottle ──
+        # ── VERIFYING: stay completely still and watch for bottle ──
         if self.state == State.VERIFYING:
+            self.esp32.stop()
             if bottles:
                 self.verify_count += 1
                 self.verify_lost = 0
+
+                if self.verify_count < VERIFY_FRAMES:
+                    return
 
                 best = max(bottles, key=lambda b: (b[2]-b[0]) * (b[3]-b[1]))
                 bx1, by1, bx2, by2, bconf = best
                 bw = bx2 - bx1
                 bh = by2 - by1
                 b_fill = (bw * bh) / frame_area
+                b_cx_norm = ((bx1 + bx2) / 2.0) / w
+                close_by_us = us_front <= PICKUP_DIST_CM
+                close_by_cam = b_fill >= PICKUP_FILL_FALLBACK
 
-                if self.verify_count >= VERIFY_FRAMES:
-                    # Bottle confirmed by YOLO — go straight to pickup
-                    b_cx_norm = ((bx1 + bx2) / 2.0) / w
-                    close_by_us = us_front <= PICKUP_DIST_CM
-                    close_by_cam = b_fill >= PICKUP_FILL_FALLBACK
-                    if ((close_by_us or close_by_cam)
-                            and abs(b_cx_norm - 0.5) < BOTTLE_CENTER_TOL):
-                        # Already in range and centered — pick up now
-                        trigger = f"US={us_front}cm" if close_by_us else f"CAM={b_fill:.0%}"
-                        print(f"\n  >>> Bottle CONFIRMED & in range ({trigger}) — starting pickup")
-                        self._start_pickup()
-                    else:
-                        # Not close enough yet — approach and pickup triggers automatically
-                        print(f"\n  >>> Bottle CONFIRMED ({self.verify_count} frames) — approaching")
-                        self.state = State.APPROACHING
-                        self.approach_lost_count = 0
-                    return
-                elif b_fill < 0.03:
-                    # Too far to be sure — creep forward very slowly
-                    self.esp32.forward(VERIFY_SPEED)
+                if ((close_by_us or close_by_cam)
+                        and abs(b_cx_norm - 0.5) < BOTTLE_CENTER_TOL):
+                    trigger = f"US={us_front}cm" if close_by_us else f"CAM={b_fill:.0%}"
+                    print(f"\n  >>> Bottle CONFIRMED & in range ({trigger}) — starting pickup")
+                    self._start_pickup()
                 else:
-                    # Close enough to verify from here — just wait
-                    self.esp32.stop()
+                    print(f"\n  >>> Bottle CONFIRMED ({self.verify_count} frames, "
+                          f"fill={b_fill:.0%}, US={us_front}cm) — approaching slowly")
+                    self.state = State.APPROACHING
+                    self.approach_lost_count = 0
             else:
                 self.verify_lost += 1
-                self.esp32.stop()
-                if self.verify_lost > 20:
-                    # Lost it — false alarm, go back to scanning
+                if self.verify_lost > 30:
                     print("\n  >>> False alarm — resuming scan")
                     self._reset_scan()
                     self.verify_count = 0
