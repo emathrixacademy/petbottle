@@ -145,10 +145,10 @@ int swingCurrentDir = 0;  // -1=left, 0=stopped, +1=right
 //       Bottom limit must be physically positioned ~5° above 0 to act as
 //       the "lowest allowable" stop.
 // UP:   continuous full force (180 PWM) until TOP limit (SW1) trips.
-#define MANUAL_DOWN_SPEED    35
+#define MANUAL_DOWN_SPEED    45
 #define MANUAL_DOWN_ON_MS    200       // motor on per pulse
 #define MANUAL_DOWN_OFF_MS   300       // motor off between pulses
-#define MANUAL_UP_SPEED      215
+#define MANUAL_UP_SPEED      245
 bool armManualPulseActive = false;     // true while manual arm motion is active
 bool armManualPulseOn     = false;     // current phase of the on/off pulse
 int  armManualPulseDir    = 0;         // +1 = up, -1 = down
@@ -172,14 +172,14 @@ unsigned long puTimer = 0;         // general purpose timer for pickup steps
 unsigned long puStartTime = 0;     // when pickup sequence began (for timeout)
 bool puArmOn = false;              // tracks arm pulse on/off during lowering
 bool puLiftOn = false;             // tracks arm pulse on/off during lifting
-#define PU_LOWER_SPEED    35
+#define PU_LOWER_SPEED    45
 #define PU_LOWER_ON_MS    150      // arm on duration during pulsed lowering
 #define PU_LOWER_OFF_MS   400      // arm off duration during pulsed lowering
 #define PU_SCOOP_CLOSE_MS 1500     // time to wait after closing scoopers
-#define PU_LIFT_SPEED     215
-#define PU_LIFT_ON_MS     200      // arm on duration during pulsed lifting
+#define PU_LIFT_SPEED     245
+#define PU_LIFT_ON_MS     180      // arm on duration during pulsed lifting
 #define PU_LIFT_OFF_MS    400      // arm off duration during pulsed lifting
-#define PU_DROP_OPEN_MS   12000    // time to wait after opening scoopers
+#define PU_DROP_OPEN_MS   3000    // time to wait after opening scoopers
 // Servos are MIRRORED — sweep inward to scoop, outward to release.
 // If scooper direction is backwards, swap OPEN/CLOSE for both.
 #define PU_SERVO_OPEN_L   180      // scooper open (spread apart)
@@ -423,6 +423,7 @@ void pickupUpdate() {
         lcd.setCursor(0, 0); lcd.print("PICKUP: Scoop");
         setServo(SERVO_L_CH, PU_SERVO_CLOSE_L);
         setServo(SERVO_R_CH, PU_SERVO_CLOSE_R);
+        delay(2000);
         puTimer = now;
         puState = PU_SCOOPING;
         beep(50);
