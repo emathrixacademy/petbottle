@@ -1318,7 +1318,6 @@ class Navigator:
                 self.esp32.stop()
                 self._reset_scan()
 
-    def _start_pickup(self):
     def _reset_scan(self):
         """Enter SCANNING with fresh step-scan state."""
         self.state = State.SCANNING
