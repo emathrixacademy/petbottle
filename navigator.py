@@ -124,7 +124,7 @@ ALIGN_SPEED     = 35            # fine alignment turns before pickup — slow to
 VERIFY_SPEED    = 30            # verification approach — extra cautious
 
 # Bottle detection & verification
-BOTTLE_CLOSE_FILL = 0.22        # bottle fills 22% of frame → close enough to pick
+PICKUP_DIST_CM    = 20          # front ultrasonic ≤ 20 cm → close enough to pick
 BOTTLE_CENTER_TOL = 0.15        # tolerance from frame center (fraction)
 VERIFY_FRAMES     = 10          # must see bottle in N frames before approaching
 SCAN_DURATION     = 60.0        # seconds to scan (30s left + 30s right)
@@ -1195,10 +1195,10 @@ class Navigator:
                 if self.verify_count >= VERIFY_FRAMES:
                     # Bottle confirmed by YOLO — go straight to pickup
                     b_cx_norm = ((bx1 + bx2) / 2.0) / w
-                    if (b_fill >= BOTTLE_CLOSE_FILL
+                    if (us_front <= PICKUP_DIST_CM
                             and abs(b_cx_norm - 0.5) < BOTTLE_CENTER_TOL):
                         # Already in range and centered — pick up now
-                        print(f"\n  >>> Bottle CONFIRMED & in range — starting pickup")
+                        print(f"\n  >>> Bottle CONFIRMED & in range (US={us_front}cm) — starting pickup")
                         self._start_pickup()
                     else:
                         # Not close enough yet — approach and pickup triggers automatically
@@ -1235,8 +1235,8 @@ class Navigator:
                 b_cx = (bx1 + bx2) / 2.0
                 b_cx_norm = b_cx / w  # 0.0 = left, 1.0 = right
 
-                if b_fill >= BOTTLE_CLOSE_FILL:
-                    # Close enough — check alignment then pick up
+                if us_front <= PICKUP_DIST_CM:
+                    # Close enough (ultrasonic) — check alignment then pick up
                     if abs(b_cx_norm - 0.5) < BOTTLE_CENTER_TOL:
                         self._start_pickup()
                     else:
