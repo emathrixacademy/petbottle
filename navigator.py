@@ -1268,11 +1268,18 @@ class Navigator:
                     else:
                         self.esp32.forward(APPROACH_SPEED)
             else:
-                self.approach_lost_count += 1
-                self.esp32.stop()
-                if self.approach_lost_count > 20:
-                    print("\n  >>> Lost bottle — scanning again")
-                    self._reset_scan()
+                if us_front <= PICKUP_DIST_CM:
+                    print(f"\n  >>> Camera lost bottle but US={us_front}cm — starting pickup")
+                    self._start_pickup()
+                elif us_front <= SLOW_DIST:
+                    self.approach_lost_count = 0
+                    self.esp32.forward(SLOW_SPEED)
+                else:
+                    self.approach_lost_count += 1
+                    self.esp32.stop()
+                    if self.approach_lost_count > 45:
+                        print("\n  >>> Lost bottle — scanning again")
+                        self._reset_scan()
             return
 
         # ── ALIGNING: fine-tune position before pickup ────
