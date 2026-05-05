@@ -1654,16 +1654,18 @@
 # KINOMMENT KO MUNA LAHAT NG CODE DITO KAHAPON PARA SA BAGONG CODE NGAUN DITO SA BABA
 
 
+
+
 #!/usr/bin/env python3
 """
-PET Bottle Robot — Autonomous Navigator (LiDAR + RealSense Edition)
+PET Bottle Robot — Autonomous Navigator (Ultrasonic + RealSense Edition)
 Runs on Raspberry Pi 5. Fuses:
-  - LD06 360° LiDAR (UART serial) for obstacle avoidance
+  - 4x Ultrasonic sensors on ESP32 (front/right/back/left) for obstacle avoidance
   - Intel RealSense D4xx (USB) for YOLO detection + depth-based bottle distance
 
 The robot continuously:
   1. Roams open space looking for PET bottles
-  2. Avoids obstacles (LiDAR 360° + camera person/object detection)
+  2. Avoids obstacles (ultrasonics + camera person/object detection)
   3. Approaches detected bottles (depth camera for accurate distance)
   4. Triggers the pickup sequence on the ESP32
   5. Resumes roaming
@@ -1672,7 +1674,7 @@ Transport: Pi <-> ESP32 is WiFi HTTP. Both devices connect to the same
 mobile hotspot. ESP32 is auto-discovered at startup.
 
 Hardware:
-  - LD06 LiDAR on UART (/dev/ttyAMA0 or /dev/ttyUSB0) at 230400 baud
+  - ESP32 with 4 ultrasonic sensors (TRIG=12, ECHO=33/35/32/34)
   - Intel RealSense D435/D455 on USB 3.0
   - Hailo-8 NPU for YOLO inference (USB)
 
@@ -1680,15 +1682,12 @@ Usage:
   python3 navigator.py                          # default (YOLOv8)
   python3 navigator.py --model yolov8
   python3 navigator.py --esp32-ip 192.168.43.100
-  python3 navigator.py --lidar-port /dev/ttyAMA0
   python3 navigator.py --no-show                # headless
 """
 
 import cv2
 import numpy as np
 import argparse
-import serial
-import struct
 
 import time
 import threading
@@ -1726,230 +1725,6 @@ from hailo_platform import (
     InputVStreamParams, OutputVStreamParams, FormatType
 )
 
-# CRC table for LD06 LiDAR packet validation (from config.py)
-CRC_TABLE_LD06 = [
-    0x00,0x4D,0x9A,0xD7,0x79,0x34,0xE3,0xAE,0xF2,0xBF,0x68,0x25,0x8B,0xC6,0x11,0x5C,
-    0xA9,0xE4,0x33,0x7E,0xD0,0x9D,0x4A,0x07,0x5B,0x16,0xC1,0x8C,0x22,0x6F,0xB8,0xF5,
-    0x1F,0x52,0x85,0xC8,0x66,0x2B,0xFC,0xB1,0xED,0xA0,0x77,0x3A,0x94,0xD9,0x0E,0x43,
-    0xB6,0xFB,0x2C,0x61,0xCF,0x82,0x55,0x18,0x44,0x09,0xDE,0x93,0x3D,0x70,0xA7,0xEA,
-    0x3E,0x73,0xA4,0xE9,0x47,0x0A,0xDD,0x90,0xCC,0x81,0x56,0x1B,0xB5,0xF8,0x2F,0x62,
-    0x97,0xDA,0x0D,0x40,0xEE,0xA3,0x74,0x39,0x65,0x28,0xFF,0xB2,0x1C,0x51,0x86,0xCB,
-    0x21,0x6C,0xBB,0xF6,0x58,0x15,0xC2,0x8F,0xD3,0x9E,0x49,0x04,0xAA,0xE7,0x30,0x7D,
-    0x88,0xC5,0x12,0x5F,0xF1,0xBC,0x6B,0x26,0x7A,0x37,0xE0,0xAD,0x03,0x4E,0x99,0xD4,
-    0x7C,0x31,0xE6,0xAB,0x05,0x48,0x9F,0xD2,0x8E,0xC3,0x14,0x59,0xF7,0xBA,0x6D,0x20,
-    0xD5,0x98,0x4F,0x02,0xAC,0xE1,0x36,0x7B,0x27,0x6A,0xBD,0xF0,0x5E,0x13,0xC4,0x89,
-    0x63,0x2E,0xF9,0xB4,0x1A,0x57,0x80,0xCD,0x91,0xDC,0x0B,0x46,0xE8,0xA5,0x72,0x3F,
-    0xCA,0x87,0x50,0x1D,0xB3,0xFE,0x29,0x64,0x38,0x75,0xA2,0xEF,0x41,0x0C,0xDB,0x96,
-    0x42,0x0F,0xD8,0x95,0x3B,0x76,0xA1,0xEC,0xB0,0xFD,0x2A,0x67,0xC9,0x84,0x53,0x1E,
-    0xEB,0xA6,0x71,0x3C,0x92,0xDF,0x08,0x45,0x19,0x54,0x83,0xCE,0x60,0x2D,0xFA,0xB7,
-    0x5D,0x10,0xC7,0x8A,0x24,0x69,0xBE,0xF3,0xAF,0xE2,0x35,0x78,0xD6,0x9B,0x4C,0x01,
-    0xF4,0xB9,0x6E,0x23,0x8D,0xC0,0x17,0x5A,0x06,0x4B,0x9C,0xD1,0x7F,0x32,0xE5,0xA8,
-]
-
-
-# ══════════════════════════════════════════════════════════════
-# LD06 LiDAR Driver
-# ══════════════════════════════════════════════════════════════
-
-LIDAR_OFFSET_DEG = 270  # mounting offset — LD06 0° to robot forward
-
-# Zone definitions: front/right/back/left mapped to angular ranges (robot frame)
-# After applying LIDAR_OFFSET, 0° = robot forward, 90° = robot right, etc.
-LIDAR_ZONES = {
-    "front":  (-45, 45),     # -45° to +45° centered on forward
-    "right":  (45, 135),
-    "back":   (135, 225),
-    "left":   (225, 315),
-}
-
-# Minimum valid range (mm) — below this is noise
-LIDAR_MIN_RANGE_MM = 20
-# Maximum valid range (mm) — LD06 spec is 12000
-LIDAR_MAX_RANGE_MM = 12000
-
-
-def crc8_ld06(data: bytes) -> int:
-    crc = 0
-    for b in data:
-        crc = CRC_TABLE_LD06[(crc ^ b) & 0xFF]
-    return crc
-
-
-class LD06LiDAR:
-    """LD06 360° LiDAR driver. Reads UART serial in a background thread,
-    parses 47-byte packets, and provides zone distances (cm) compatible
-    with the original ultrasonic interface (front/right/back/left)."""
-
-    HEADER = 0x54
-    PKT_LEN = 47  # 1 header + 1 ver_len + 2 speed + 2 start_angle + 36 data + 2 end_angle + 2 timestamp + 1 crc
-
-    def __init__(self, port="/dev/ttyAMA0", baudrate=230400):
-        self.port = port
-        self.baudrate = baudrate
-        self._lock = threading.Lock()
-        self._running = False
-        self._connected = threading.Event()
-        self._scan_points = []  # list of (angle_deg, distance_mm, confidence)
-        self._zone_distances = {"front": 999, "right": 999, "back": 999, "left": 999}
-        self._last_update = 0.0
-        self._thread = None
-
-    def start(self):
-        self._running = True
-        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=3)
-
-    @property
-    def zones(self):
-        """Return zone distances in cm (matches old ultrasonic dict format)."""
-        with self._lock:
-            return dict(self._zone_distances)
-
-    @property
-    def zone_min(self):
-        z = self.zones
-        return min(z["front"], z["right"], z["back"], z["left"])
-
-    @property
-    def raw_points(self):
-        with self._lock:
-            return list(self._scan_points)
-
-    @property
-    def is_connected(self):
-        return self._connected.is_set()
-
-    @property
-    def data_age(self):
-        with self._lock:
-            if self._last_update == 0.0:
-                return float('inf')
-            return time.time() - self._last_update
-
-    def _reader_loop(self):
-        while self._running:
-            try:
-                ser = serial.Serial(self.port, self.baudrate, timeout=1)
-                print(f"  LiDAR: opened {self.port} @ {self.baudrate}")
-                self._connected.set()
-                buf = bytearray()
-
-                while self._running:
-                    chunk = ser.read(ser.in_waiting or 1)
-                    if not chunk:
-                        continue
-                    buf.extend(chunk)
-
-                    while len(buf) >= self.PKT_LEN:
-                        # Find header byte
-                        idx = buf.find(self.HEADER)
-                        if idx < 0:
-                            buf.clear()
-                            break
-                        if idx > 0:
-                            del buf[:idx]
-                        if len(buf) < self.PKT_LEN:
-                            break
-
-                        pkt = bytes(buf[:self.PKT_LEN])
-                        del buf[:self.PKT_LEN]
-
-                        # Validate CRC (last byte)
-                        if crc8_ld06(pkt[:-1]) != pkt[-1]:
-                            continue
-
-                        self._parse_packet(pkt)
-
-            except serial.SerialException as e:
-                if self._connected.is_set():
-                    self._connected.clear()
-                    print(f"  LiDAR: serial error ({e}) — reconnecting...")
-                time.sleep(2)
-            except Exception as e:
-                print(f"  LiDAR: unexpected error ({e})")
-                time.sleep(2)
-
-    def _parse_packet(self, pkt):
-        """Parse a 47-byte LD06 packet: 12 measurement points."""
-        # ver_len = pkt[1]  # 0x2C = version 1, 12 points
-        speed = struct.unpack_from('<H', pkt, 2)[0]  # degrees/sec * 100
-        start_angle = struct.unpack_from('<H', pkt, 4)[0] / 100.0  # degrees
-        end_angle = struct.unpack_from('<H', pkt, 42)[0] / 100.0
-        timestamp = struct.unpack_from('<H', pkt, 44)[0]
-
-        # Handle angle wrap-around
-        if end_angle < start_angle:
-            angle_span = (end_angle + 360.0) - start_angle
-        else:
-            angle_span = end_angle - start_angle
-
-        points = []
-        for i in range(12):
-            offset = 6 + i * 3
-            dist_mm = struct.unpack_from('<H', pkt, offset)[0]
-            confidence = pkt[offset + 2]
-
-            # Interpolate angle for this point
-            if angle_span > 0:
-                angle = start_angle + (angle_span * i / 11.0)
-            else:
-                angle = start_angle
-
-            # Apply mounting offset and normalize to 0-360
-            angle = (angle + LIDAR_OFFSET_DEG) % 360.0
-
-            # Filter invalid ranges
-            if dist_mm < LIDAR_MIN_RANGE_MM or dist_mm > LIDAR_MAX_RANGE_MM:
-                continue
-            if confidence < 100:
-                continue
-
-            points.append((angle, dist_mm, confidence))
-
-        if not points:
-            return
-
-        with self._lock:
-            self._scan_points.extend(points)
-            # Keep last ~2 full rotations (~4000 points at 4500 pts/sec)
-            if len(self._scan_points) > 5000:
-                self._scan_points = self._scan_points[-4000:]
-            self._last_update = time.time()
-            self._update_zones()
-
-    def _update_zones(self):
-        """Compute minimum distance per zone from recent scan points.
-        Uses points from the last 200ms (~1 full rotation at 10Hz spin)."""
-        cutoff = time.time() - 0.2
-        # We don't have per-point timestamps, so use all buffered points
-        # and rely on the rolling buffer being ~200ms worth
-
-        zone_mins = {"front": 99900, "right": 99900, "back": 99900, "left": 99900}
-
-        for angle, dist_mm, conf in self._scan_points[-1200:]:
-            for zone_name, (a_start, a_end) in LIDAR_ZONES.items():
-                # Normalize angle check for ranges that wrap around 0°
-                a_start_n = a_start % 360
-                a_end_n = a_end % 360
-
-                if a_start_n < a_end_n:
-                    in_zone = a_start_n <= angle < a_end_n
-                else:
-                    in_zone = angle >= a_start_n or angle < a_end_n
-
-                if in_zone and dist_mm < zone_mins[zone_name]:
-                    zone_mins[zone_name] = dist_mm
-
-        # Convert mm to cm, cap at 999
-        for zone_name in zone_mins:
-            dist_cm = zone_mins[zone_name] / 10.0
-            self._zone_distances[zone_name] = min(int(dist_cm), 999)
-
 
 # ══════════════════════════════════════════════════════════════
 # RealSense Camera
@@ -1968,7 +1743,7 @@ class RealSenseCamera:
         self._depth_scale = 0.001  # default, updated on connect
         self._connected = False
 
-        # Depth post-processing filters (from SLAM robot pipeline)
+        # Depth post-processing filters
         self._decimation = rs.decimation_filter()
         self._decimation.set_option(rs.option.filter_magnitude, 2)
         self._spatial = rs.spatial_filter()
@@ -1987,11 +1762,9 @@ class RealSenseCamera:
 
         profile = self._pipeline.start(config)
 
-        # Get depth scale (meters per depth unit)
         depth_sensor = profile.get_device().first_depth_sensor()
         self._depth_scale = depth_sensor.get_depth_scale()
 
-        # Align depth to color frame
         self._align = rs.align(rs.stream.color)
 
         self._connected = True
@@ -2000,22 +1773,40 @@ class RealSenseCamera:
 
     def stop(self):
         if self._pipeline:
-            self._pipeline.stop()
+            try:
+                self._pipeline.stop()
+            except Exception:
+                pass
+            self._pipeline = None
             self._connected = False
 
     @property
     def is_connected(self):
         return self._connected
 
+    def reconnect(self):
+        """Stop and restart the RealSense pipeline. Called automatically
+        on frame failures — mirrors the original Pi Camera retry logic."""
+        self.stop()
+        try:
+            self.start()
+            return True
+        except Exception as e:
+            print(f"  RealSense: reconnect failed ({e})")
+            self._connected = False
+            return False
+
     def get_frames(self):
         """Return (color_bgr, depth_meters) or (None, None) on failure.
-        depth_meters is a float32 array in meters."""
+        depth_meters is a float32 array in meters.
+        On repeated failures, attempts automatic reconnection."""
         if not self._pipeline:
             return None, None
 
         try:
             frames = self._pipeline.wait_for_frames(timeout_ms=5000)
         except RuntimeError:
+            self._connected = False
             return None, None
 
         aligned = self._align.process(frames)
@@ -2053,7 +1844,6 @@ class RealSenseCamera:
         x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
         h, w = depth_meters.shape[:2]
 
-        # Clamp to frame bounds
         x1 = max(0, x1)
         y1 = max(0, y1)
         x2 = min(w, x2)
@@ -2092,8 +1882,7 @@ ESP32_BASE_URL = None
 
 
 def discover_esp32(timeout=30):
-    """Scan the local network for the ESP32 by probing /sensor on each host.
-    ESP32 /sensor no longer has ultrasonic data but still returns limits/speeds/irProx."""
+    """Scan the local network for the ESP32 by probing /sensor on each host."""
     import socket
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -2112,8 +1901,7 @@ def discover_esp32(timeout=30):
         try:
             req = urllib.request.urlopen(f"http://{ip}/sensor", timeout=0.5)
             data = req.read().decode("utf-8", errors="replace")
-            # Accept any valid JSON with known ESP32 fields
-            if "limits" in data or "wheels" in data or "pickup" in data:
+            if "ultrasonic" in data:
                 return ip
         except Exception:
             pass
@@ -2135,7 +1923,7 @@ def discover_esp32(timeout=30):
     return None
 
 
-# Obstacle avoidance thresholds (cm) — same as original
+# Obstacle avoidance thresholds (cm)
 STOP_DIST       = 25
 SLOW_DIST       = 40
 TURN_DIST       = 60
@@ -2150,7 +1938,7 @@ ALIGN_SPEED     = 35
 VERIFY_SPEED    = 30
 
 # Bottle detection & verification
-PICKUP_DIST_CM    = 20          # depth camera ≤ 20 cm → close enough to pick
+PICKUP_DIST_CM    = 20          # depth camera OR front ultrasonic ≤ 20 cm → close enough to pick
 PICKUP_FILL_FALLBACK = 0.25     # camera fallback: bottle fills 25% of frame
 BOTTLE_CENTER_TOL = 0.15
 VERIFY_FRAMES     = 75
@@ -2172,9 +1960,9 @@ stream_app = Flask(__name__)
 stream_lock = threading.Lock()
 stream_frame = None
 stream_stats = {"fps": 0, "bottles": 0, "persons": 0, "model": "", "inference_ms": 0, "state": "WAITING",
-                "lidar": {"front": 999, "right": 999, "back": 999, "left": 999},
+                "ultrasonic": {"s1": 999, "s2": 999, "s3": 999, "s4": 999},
                 "binFull": False, "pickups": 0, "avoidances": 0, "espConnected": False,
-                "esp32_ip": None, "cameraOk": False, "lidarOk": False, "depthOk": False}
+                "esp32_ip": None, "cameraOk": False, "depthOk": False}
 _navigator_ref = None
 _manual_mode_until = 0.0
 
@@ -2188,7 +1976,7 @@ def log_event(event_type, details):
         data_log.append(entry)
 
 def update_stream(frame_bgr, bottles, persons, model_name, inference_ms, state_name,
-                  lidar_zones=None, bin_full=None):
+                  ultrasonic=None, bin_full=None):
     global stream_frame, stream_stats
     _, jpeg = cv2.imencode('.jpg', frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
     with stream_lock:
@@ -2198,15 +1986,14 @@ def update_stream(frame_bgr, bottles, persons, model_name, inference_ms, state_n
         stream_stats["model"] = model_name
         stream_stats["inference_ms"] = round(inference_ms, 1)
         stream_stats["state"] = state_name
-        if lidar_zones:
-            stream_stats["lidar"] = lidar_zones
+        if ultrasonic:
+            stream_stats["ultrasonic"] = ultrasonic
         if bin_full is not None:
             stream_stats["binFull"] = bool(bin_full)
         if _navigator_ref:
             stream_stats["pickups"] = _navigator_ref.pickup_success_count
             stream_stats["avoidances"] = getattr(_navigator_ref, 'avoid_count', 0)
             stream_stats["espConnected"] = _navigator_ref.esp32._connected.is_set()
-            stream_stats["lidarOk"] = _navigator_ref.lidar.is_connected
             stream_stats["depthOk"] = _navigator_ref.realsense.is_connected
 
 def generate_mjpeg():
@@ -2273,9 +2060,7 @@ def nav_stop():
         _navigator_ref.state = State.WAITING
         _navigator_ref._stop_sent_time = 0
         _navigator_ref.esp32._last_cmd = None
-        _navigator_ref.esp32._last_swing_cmd = None
         _navigator_ref.esp32.emergency_stop()
-        _navigator_ref.esp32.cmd("PISWS")
         _navigator_ref.esp32.emergency_stop()
         return jsonify({"ok": True, "state": "WAITING"})
     return jsonify({"ok": False, "msg": "navigator not ready"})
@@ -2325,7 +2110,7 @@ def stream_index():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
-<title>PET Bottle Navigator (LiDAR + RealSense)</title>
+<title>PET Bottle Navigator (Ultrasonic + RealSense)</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a1a;color:#eee;padding:12px;
@@ -2357,10 +2142,10 @@ button:active{transform:scale(.94)}
 .stat{text-align:center}
 .stat .val{font-size:1.3rem;font-weight:700;color:#4fc3f7}
 .stat .lbl{font-size:.65rem;color:#888;margin-top:2px}
-.lidar-bar{background:#1a1a2e;border-radius:12px;padding:12px;margin-top:8px;
+.us-bar{background:#1a1a2e;border-radius:12px;padding:12px;margin-top:8px;
   display:grid;grid-template-columns:repeat(4,1fr);gap:8px;text-align:center}
-.lidar-bar .val{font-size:1.1rem;font-weight:700}
-.lidar-bar .lbl{font-size:.65rem;color:#888}
+.us-bar .val{font-size:1.1rem;font-weight:700}
+.us-bar .lbl{font-size:.65rem;color:#888}
 #log{background:#000;border-radius:8px;padding:8px;margin-top:8px;
   font-family:monospace;font-size:.7rem;color:#4fc3f7;
   height:80px;overflow-y:auto;white-space:pre-wrap}
@@ -2370,14 +2155,13 @@ button:active{transform:scale(.94)}
 </style>
 </head>
 <body>
-<h1>PET Bottle Navigator (LiDAR + RealSense)</h1>
+<h1>PET Bottle Navigator (Ultrasonic + RealSense)</h1>
 
 <div class="video-wrap">
   <img src="/video_feed" alt="Live Feed">
   <div class="badge" id="badge" style="background:#ff9800">WAITING</div>
   <div class="wifi-dot" id="wifi" style="background:#ef5350;color:#fff">WiFi: --</div>
   <div class="sensor-dots">
-    <div class="sdot" id="lidar-dot" style="background:#ef5350;color:#fff">LiDAR</div>
     <div class="sdot" id="depth-dot" style="background:#ef5350;color:#fff">Depth</div>
   </div>
 </div>
@@ -2405,11 +2189,11 @@ button:active{transform:scale(.94)}
     <div class="stat"><div class="val" id="avoids">0</div><div class="lbl">Avoidances</div></div>
   </div>
 
-  <div class="lidar-bar">
-    <div><div class="val" id="lid-f" style="color:#4fc3f7">--</div><div class="lbl">Front (LiDAR)</div></div>
-    <div><div class="val" id="lid-r" style="color:#4fc3f7">--</div><div class="lbl">Right</div></div>
-    <div><div class="val" id="lid-b" style="color:#4fc3f7">--</div><div class="lbl">Back</div></div>
-    <div><div class="val" id="lid-l" style="color:#4fc3f7">--</div><div class="lbl">Left</div></div>
+  <div class="us-bar">
+    <div><div class="val" id="us-f" style="color:#4fc3f7">--</div><div class="lbl">Front</div></div>
+    <div><div class="val" id="us-r" style="color:#4fc3f7">--</div><div class="lbl">Right</div></div>
+    <div><div class="val" id="us-b" style="color:#4fc3f7">--</div><div class="lbl">Back</div></div>
+    <div><div class="val" id="us-l" style="color:#4fc3f7">--</div><div class="lbl">Left</div></div>
   </div>
 
   <div id="log">Ready.
@@ -2423,7 +2207,7 @@ button:active{transform:scale(.94)}
   </div>
 </div>
 
-<div class="footer">PET Bottle Collector Robot (LiDAR + RealSense) &mdash; Emathrix Academy</div>
+<div class="footer">PET Bottle Collector Robot (Ultrasonic + RealSense) &mdash; Emathrix Academy</div>
 
 <script>
 const stateColors={WAITING:'#ff9800',SCANNING:'#ffeb3b',ROAMING:'#66bb6a',
@@ -2450,10 +2234,10 @@ function switchModel(m){
   });
 }
 
-function zoneColor(v){
+function usColor(v){
   if(v>=999) return '#555';
-  if(v<25) return '#ef5350';
-  if(v<60) return '#ff9800';
+  if(v<60) return '#ef5350';
+  if(v<100) return '#ff9800';
   return '#66bb6a';
 }
 
@@ -2476,19 +2260,16 @@ function poll(){
     const wifi=document.getElementById('wifi');
     wifi.textContent=d.espConnected?'WiFi: Connected':'WiFi: Disconnected';
     wifi.style.background=d.espConnected?'#66bb6a':'#ef5350';
-    // LiDAR zones
-    if(d.lidar){
-      var z=d.lidar;
-      [['f','front'],['r','right'],['b','back'],['l','left']].forEach(function(pair){
-        var el=document.getElementById('lid-'+pair[0]);
-        var v=z[pair[1]]||999;
+    if(d.ultrasonic){
+      var u=d.ultrasonic;
+      ['f','r','b','l'].forEach((k,i)=>{
+        var key='s'+(i+1);var v=u[key]||999;
+        var el=document.getElementById('us-'+k);
         el.textContent=v>=999?'--':v+'cm';
-        el.style.color=zoneColor(v);
+        el.style.color=usColor(v);
       });
     }
-    // Sensor status dots
-    var lidarDot=document.getElementById('lidar-dot');
-    lidarDot.style.background=d.lidarOk?'#66bb6a':'#ef5350';
+    // Depth status dot
     var depthDot=document.getElementById('depth-dot');
     depthDot.style.background=d.depthOk?'#66bb6a':'#ef5350';
   }).catch(()=>{});
@@ -2526,8 +2307,8 @@ def download_data_log():
     si = io.StringIO()
     writer = csv.writer(si)
     writer.writerow(["time", "event", "model", "bottles_detected", "persons_detected",
-                     "inference_ms", "bottle_depth_cm", "lidar_front", "lidar_right",
-                     "lidar_back", "lidar_left", "state", "detail"])
+                     "inference_ms", "bottle_depth_cm", "us_front", "us_right",
+                     "us_back", "us_left", "state", "detail"])
     with data_log_lock:
         for entry in data_log:
             writer.writerow([
@@ -2538,10 +2319,10 @@ def download_data_log():
                 entry.get("persons", ""),
                 entry.get("inference_ms", ""),
                 entry.get("bottle_depth_cm", ""),
-                entry.get("lidar_front", ""),
-                entry.get("lidar_right", ""),
-                entry.get("lidar_back", ""),
-                entry.get("lidar_left", ""),
+                entry.get("us_front", ""),
+                entry.get("us_right", ""),
+                entry.get("us_back", ""),
+                entry.get("us_left", ""),
                 entry.get("state", ""),
                 entry.get("detail", ""),
             ])
@@ -2592,8 +2373,7 @@ class ESP32WiFiLink:
     """Talks to the ESP32 over WiFi HTTP.
     Sends commands via GET /cmd?c=<CMD> and polls sensor data
     via GET /sensor every 200ms in a background thread.
-    NOTE: ESP32 no longer provides ultrasonic data — LiDAR handles obstacle detection.
-    ESP32 still provides: limits, wheels, pickup state, irProx."""
+    ESP32 provides: ultrasonic (s1-s4), limits, wheels, pickup state, irProx."""
 
     MAX_LOG = 20
 
@@ -2603,6 +2383,8 @@ class ESP32WiFiLink:
         self._sensor_data_ts = 0.0
         self.cmd_log = []
         self._last_cmd = None
+        self._last_cmd_time = 0.0
+        self._poll_fails = 0
         self._lock = threading.Lock()
         self._running = True
         self._connected = threading.Event()
@@ -2679,6 +2461,22 @@ class ESP32WiFiLink:
             return list(self.cmd_log)
 
     @property
+    def ultrasonic(self):
+        with self._lock:
+            us = self.sensor_data.get("ultrasonic", {})
+            return {
+                "s1": us.get("s1", 999),
+                "s2": us.get("s2", 999),
+                "s3": us.get("s3", 999),
+                "s4": us.get("s4", 999),
+            }
+
+    @property
+    def ultrasonic_min(self):
+        us = self.ultrasonic
+        return min(us["s1"], us["s2"], us["s3"], us["s4"])
+
+    @property
     def sensors(self):
         with self._lock:
             return dict(self.sensor_data)
@@ -2686,7 +2484,7 @@ class ESP32WiFiLink:
     @property
     def is_connected(self):
         with self._lock:
-            return bool(self.sensor_data)
+            return "ultrasonic" in self.sensor_data
 
     def sensor_age(self):
         with self._lock:
@@ -2696,14 +2494,8 @@ class ESP32WiFiLink:
 
     def cmd(self, command):
         now = time.time()
-        no_dedup = command in ("PIX", "PISTOP", "PA", "PISWS")
-        is_swing = command in ("PISWL", "PISWR")
-        if is_swing:
-            if command == getattr(self, '_last_swing_cmd', None) and now - getattr(self, '_last_swing_time', 0) < 2.0:
-                return
-            self._last_swing_cmd = command
-            self._last_swing_time = now
-        elif not no_dedup and command == self._last_cmd and now - getattr(self, '_last_cmd_time', 0) < 0.5:
+        no_dedup = command in ("PIX", "PISTOP", "PA")
+        if not no_dedup and command == self._last_cmd and now - getattr(self, '_last_cmd_time', 0) < 0.5:
             return
         self._last_cmd = command
         self._last_cmd_time = now
@@ -2736,15 +2528,6 @@ class ESP32WiFiLink:
     def emergency_stop(self):
         self.cmd("PISTOP")
 
-    def swing_left(self):
-        self.cmd("PISWL")
-
-    def swing_right(self):
-        self.cmd("PISWR")
-
-    def swing_stop(self):
-        self.cmd("PISWS")
-
     def pickup(self):
         self.cmd("P")
 
@@ -2762,16 +2545,20 @@ class ESP32WiFiLink:
 
 class Navigator:
     """
-    Main brain: fuses RealSense camera (YOLO + depth) + LD06 LiDAR for
-    real-time navigation. Same state machine as original — roam, detect,
+    Main brain: fuses RealSense camera (YOLO + depth) + ESP32 ultrasonics
+    for real-time navigation. Same state machine as original — roam, detect,
     approach, pick up, resume.
+
+    Upgrade from original: RealSense depth camera replaces Pi Camera,
+    providing accurate per-bottle distance via depth frame. Ultrasonics
+    still handle obstacle avoidance. Bottle proximity uses BOTH depth
+    camera (primary) and front ultrasonic (fallback).
     """
 
-    def __init__(self, manager, esp32, lidar, realsense, conf_thresh, no_show, out_dir):
+    def __init__(self, manager, esp32, realsense, conf_thresh, no_show, out_dir):
         global _navigator_ref
         self.manager     = manager
         self.esp32       = esp32
-        self.lidar       = lidar
         self.realsense   = realsense
         self.conf_thresh = conf_thresh
         self.no_show     = no_show
@@ -2794,20 +2581,21 @@ class Navigator:
         self.avoid_count          = 0
         self.ir_ever_tripped      = False
         self.infer_fail_streak    = 0
+        self._stop_sent_time      = 0.0
         self._current_frame       = None
-        self._current_depth       = None  # depth frame (meters) for bottle distance
+        self._current_depth       = None
         self._ai_verified         = False
         self._ai_scene_time       = 0.0
         self._ai_scene_interval   = 8.0
 
     def run(self):
-        """Main loop — RealSense camera + LiDAR + navigation."""
+        """Main loop — RealSense camera + ultrasonics + navigation."""
         if not self.no_show:
             cv2.namedWindow("PET Bottle Navigator", cv2.WINDOW_NORMAL)
 
         print(f"\n{'='*60}")
         print(f"  PET Bottle Robot — AUTONOMOUS NAVIGATOR")
-        print(f"  RealSense Depth Camera + LD06 LiDAR Fusion")
+        print(f"  RealSense Depth Camera + Ultrasonic Fusion")
         print(f"  ESP32: WiFi ({ESP32_BASE_URL})")
         print(f"  SAFETY MODE: Motors DISABLED")
         print(f"  Press G to GO (enable motors) | Q to quit")
@@ -2817,16 +2605,28 @@ class Navigator:
 
         frame_idx = 0
 
+        _rs_fail_count = 0
+
         try:
             while True:
                 # ── Grab RealSense frames ────────────────────
                 frame, depth_m = self.realsense.get_frames()
                 if frame is None:
-                    print("\n  RealSense: frame lost — retrying...")
+                    _rs_fail_count += 1
                     with stream_lock:
                         stream_stats["cameraOk"] = False
-                    time.sleep(0.1)
+                    if _rs_fail_count % 50 == 1:
+                        print(f"\n  RealSense: frame lost ({_rs_fail_count}) — reconnecting...")
+                    if _rs_fail_count >= 10:
+                        if self.realsense.reconnect():
+                            print("  RealSense: reconnected successfully")
+                            _rs_fail_count = 0
+                        else:
+                            time.sleep(5)
+                    else:
+                        time.sleep(0.1)
                     continue
+                _rs_fail_count = 0
 
                 with stream_lock:
                     stream_stats["cameraOk"] = True
@@ -2849,8 +2649,8 @@ class Navigator:
 
                 smoothed = self.tracker.update(bottles)
 
-                # ── Get LiDAR zone distances ─────────────────
-                lz = self.lidar.zones  # {front, right, back, left} in cm
+                # ── Get ultrasonic data from ESP32 ───────────
+                us = self.esp32.ultrasonic  # {s1:front, s2:right, s3:back, s4:left}
 
                 # ── Get bottle depth from RealSense ──────────
                 bottle_depth_cm = 999
@@ -2859,13 +2659,9 @@ class Navigator:
                     bottle_depth_cm = self.realsense.get_bottle_depth_cm(depth_m, best)
 
                 # ── Sensor freshness (log only) ──────────────
-                lidar_age = self.lidar.data_age
-                if lidar_age > SENSOR_STALE_S and frame_idx % 100 == 0:
-                    print(f"\n  >>> LIDAR DATA AGE: {lidar_age:.1f}s (LiDAR may be disconnected)")
-
-                esp_age = self.esp32.sensor_age()
-                if esp_age > SENSOR_STALE_S and frame_idx % 100 == 0:
-                    print(f"\n  >>> ESP32 DATA AGE: {esp_age:.1f}s (ESP32 may be slow)")
+                age = self.esp32.sensor_age()
+                if age > SENSOR_STALE_S and frame_idx % 100 == 0:
+                    print(f"\n  >>> SENSOR DATA AGE: {age:.1f}s (ESP32 may be slow)")
 
                 # ── Store frames for AI vision ───────────────
                 self._current_frame = frame.copy()
@@ -2873,7 +2669,7 @@ class Navigator:
 
                 # ── Navigation decision ──────────────────────
                 self._navigate(smoothed, persons, orig_w, orig_h,
-                               frame_area, lz, bottle_depth_cm)
+                               frame_area, us, bottle_depth_cm)
 
                 # ── Data logging (1 Hz) ──────────────────────
                 if frame_idx % 30 == 0 and self.state not in (State.WAITING, State.STOPPED):
@@ -2883,20 +2679,20 @@ class Navigator:
                         "persons": len(persons),
                         "inference_ms": round(ms, 1),
                         "bottle_depth_cm": bottle_depth_cm if bottle_depth_cm < 999 else "",
-                        "lidar_front": lz["front"], "lidar_right": lz["right"],
-                        "lidar_back": lz["back"], "lidar_left": lz["left"],
+                        "us_front": us["s1"], "us_right": us["s2"],
+                        "us_back": us["s3"], "us_left": us["s4"],
                         "state": self.state.name,
                     })
 
                 # ── Draw results ─────────────────────────────
                 result = draw_detections(frame.copy(), smoothed, persons)
-                self._draw_nav_overlay(result, smoothed, lz, bottle_depth_cm, ms, frame_idx)
+                self._draw_nav_overlay(result, smoothed, us, bottle_depth_cm, ms, frame_idx)
 
                 # ── Update web stream ────────────────────────
                 model_name = self.manager.active_name
                 bin_full = self.esp32.sensors.get("irProx", False)
                 update_stream(result, smoothed, persons, model_name, ms,
-                              self.state.name, lz, bin_full=bin_full)
+                              self.state.name, us, bin_full=bin_full)
 
                 # ── FPS counter ──────────────────────────────
                 self._fps_count = getattr(self, '_fps_count', 0) + 1
@@ -2912,8 +2708,8 @@ class Navigator:
                 icon = "OK" if smoothed else "--"
                 depth_str = f"D:{bottle_depth_cm}cm" if bottle_depth_cm < 999 else "D:---"
                 print(f"\r  [{icon}] {self.state.name:12s} "
-                      f"LiDAR F:{lz['front']:3d} R:{lz['right']:3d} "
-                      f"B:{lz['back']:3d} L:{lz['left']:3d} | "
+                      f"US F:{us['s1']:3d} R:{us['s2']:3d} "
+                      f"B:{us['s3']:3d} L:{us['s4']:3d} | "
                       f"{depth_str} | {len(smoothed)} det | {ms:.0f}ms   ",
                       end="", flush=True)
 
@@ -2942,17 +2738,16 @@ class Navigator:
         finally:
             self.esp32.stop()
             self.realsense.stop()
-            self.lidar.stop()
             if not self.no_show:
                 cv2.destroyAllWindows()
             print()
 
     # ── Navigation logic ──────────────────────────────────────
 
-    def _navigate(self, bottles, persons, w, h, frame_area, lz, bottle_depth_cm):
-        """State machine: same logic as original but using LiDAR zones
-        instead of ultrasonic sensors, and depth camera for bottle distance.
-        lz = dict with keys front/right/back/left in cm.
+    def _navigate(self, bottles, persons, w, h, frame_area, us, bottle_depth_cm):
+        """State machine: ultrasonics for obstacle avoidance, depth camera
+        for bottle distance measurement.
+        us = dict with keys s1(front), s2(right), s3(back), s4(left) in cm.
         bottle_depth_cm = RealSense depth to closest detected bottle in cm."""
 
         if self.state == State.WAITING:
@@ -2963,7 +2758,6 @@ class Navigator:
                 self._stop_sent_time = now
                 self.esp32._last_cmd = None
                 self.esp32.emergency_stop()
-                self.esp32.swing_stop()
             return
 
         if self.state == State.STOPPED:
@@ -2974,7 +2768,6 @@ class Navigator:
                 self._stop_sent_time = now
                 self.esp32._last_cmd = None
                 self.esp32.emergency_stop()
-                self.esp32.swing_stop()
             return
 
         if self.state == State.MISSION_COMPLETE:
@@ -2983,34 +2776,34 @@ class Navigator:
         if self.state == State.PICKING_UP:
             return
 
-        lid_front = lz["front"]
-        lid_right = lz["right"]
-        lid_back  = lz["back"]
-        lid_left  = lz["left"]
-        lid_min_forward = min(lid_front, lid_left, lid_right)
+        us_front = us["s1"]
+        us_right = us["s2"]
+        us_back  = us["s3"]
+        us_left  = us["s4"]
+        us_min_forward = min(us_front, us_left, us_right)
 
         # ── Avoiding state: back up and turn away ─────────
         if self.state == State.AVOIDING:
             elapsed = time.time() - self.avoid_timer
             if elapsed < 1.5:
-                if lid_back > STOP_DIST:
+                if us_back > STOP_DIST:
                     self.esp32.backward(SLOW_SPEED)
                 else:
-                    if lid_left < lid_right:
+                    if us_left < us_right:
                         self.esp32.turn_right(SCAN_SPEED)
                     else:
                         self.esp32.turn_left(SCAN_SPEED)
             elif elapsed < 3.0:
-                if lid_left < lid_right:
+                if us_left < us_right:
                     self.esp32.turn_right(SCAN_SPEED)
                 else:
                     self.esp32.turn_left(SCAN_SPEED)
             elif elapsed < 3.4:
                 self.esp32.stop()
             else:
-                if lid_front < STOP_DIST:
+                if us_front < STOP_DIST:
                     print(f"\n  >>> AVOIDING re-check failed "
-                          f"(F={lid_front} min_fwd={lid_min_forward}) "
+                          f"(F={us_front} min_fwd={us_min_forward}) "
                           f"— restarting avoid")
                     self.avoid_timer = time.time()
                 else:
@@ -3028,26 +2821,26 @@ class Navigator:
                 self._enter_avoiding("PERSON DETECTED")
                 return
 
-        # ── Emergency stop: LiDAR front too close ────────
+        # ── Emergency stop: front ultrasonic too close ───
         _pursuing = self.state in (State.VERIFYING, State.APPROACHING,
                                    State.ALIGNING)
         _bottle_in_sight = len(bottles) > 0
-        if lid_front < STOP_DIST and not _pursuing:
+        if us_front < STOP_DIST and not _pursuing:
             if _bottle_in_sight and self.state in (State.SCANNING, State.ROAMING):
                 self.esp32.stop()
                 self.state = State.VERIFYING
                 self.verify_count = 1
                 self.verify_lost = 0
-                print("\n  >>> Bottle within reach (LiDAR triggered) — starting verification")
+                print("\n  >>> Bottle within reach (US triggered) — starting verification")
                 return
             self.esp32.stop()
-            self._enter_avoiding(f"FRONT < {STOP_DIST}cm (LiDAR)")
+            self._enter_avoiding(f"FRONT < {STOP_DIST}cm")
             return
 
-        # ── LiDAR: slow zone → steer away gently (only while ROAMING) ──
-        if lid_min_forward < TURN_DIST and not _pursuing and self.state == State.ROAMING:
+        # ── Ultrasonic: slow zone → steer away gently (only while ROAMING) ──
+        if us_min_forward < TURN_DIST and not _pursuing and self.state == State.ROAMING:
             if not _bottle_in_sight:
-                if lid_left < lid_right:
+                if us_left < us_right:
                     self.esp32.turn_right(SCAN_SPEED)
                 else:
                     self.esp32.turn_left(SCAN_SPEED)
@@ -3139,17 +2932,23 @@ class Navigator:
 
                 if self.verify_count >= VERIFY_FRAMES:
                     b_cx_norm = ((bx1 + bx2) / 2.0) / w
-                    # Use depth camera for distance instead of ultrasonic
+                    # Use depth camera (primary) or ultrasonic (fallback) for distance
                     close_by_depth = bottle_depth_cm <= PICKUP_DIST_CM
+                    close_by_us = us_front <= PICKUP_DIST_CM
                     close_by_cam = b_fill >= PICKUP_FILL_FALLBACK
-                    if ((close_by_depth or close_by_cam)
+                    if ((close_by_depth or close_by_us or close_by_cam)
                             and abs(b_cx_norm - 0.5) < BOTTLE_CENTER_TOL):
-                        trigger = f"DEPTH={bottle_depth_cm}cm" if close_by_depth else f"CAM={b_fill:.0%}"
+                        if close_by_depth:
+                            trigger = f"DEPTH={bottle_depth_cm}cm"
+                        elif close_by_us:
+                            trigger = f"US={us_front}cm"
+                        else:
+                            trigger = f"CAM={b_fill:.0%}"
                         print(f"\n  >>> Bottle CONFIRMED & in range ({trigger}) — starting pickup")
                         self._start_pickup()
                     else:
                         print(f"\n  >>> Bottle CONFIRMED ({self.verify_count} frames, "
-                              f"depth={bottle_depth_cm}cm) — approaching")
+                              f"depth={bottle_depth_cm}cm, US={us_front}cm) — approaching")
                         self.state = State.APPROACHING
                         self.approach_lost_count = 0
                     return
@@ -3179,8 +2978,9 @@ class Navigator:
                 b_cx_norm = b_cx / w
 
                 close_by_depth = bottle_depth_cm <= PICKUP_DIST_CM
+                close_by_us = us_front <= PICKUP_DIST_CM
                 close_by_cam = b_fill >= PICKUP_FILL_FALLBACK
-                if close_by_depth or close_by_cam:
+                if close_by_depth or close_by_us or close_by_cam:
                     if abs(b_cx_norm - 0.5) < BOTTLE_CENTER_TOL:
                         self._start_pickup()
                     else:
@@ -3198,11 +2998,14 @@ class Navigator:
                     else:
                         self.esp32.forward(APPROACH_SPEED)
             else:
-                # Camera lost bottle — use depth + LiDAR as fallback
+                # Camera lost bottle — use depth or ultrasonic as fallback
                 if bottle_depth_cm <= PICKUP_DIST_CM:
                     print(f"\n  >>> Camera lost bottle but DEPTH={bottle_depth_cm}cm — starting pickup")
                     self._start_pickup()
-                elif lid_front <= SLOW_DIST:
+                elif us_front <= PICKUP_DIST_CM:
+                    print(f"\n  >>> Camera lost bottle but US={us_front}cm — starting pickup")
+                    self._start_pickup()
+                elif us_front <= SLOW_DIST:
                     self.approach_lost_count = 0
                     self.esp32.forward(SLOW_SPEED)
                 else:
@@ -3246,7 +3049,7 @@ class Navigator:
 
             if elapsed < 5.0:
                 speed = ROAM_SPEED
-                if lid_min_forward < SLOW_DIST:
+                if us_min_forward < SLOW_DIST:
                     speed = SLOW_SPEED
                 self.esp32.forward(speed)
             else:
@@ -3350,12 +3153,12 @@ class Navigator:
         self.approach_lost_count = 0
         self.esp32.stop()
         self.avoid_count += 1
-        lz = self.lidar.zones
+        us = self.esp32.ultrasonic
         log_event("avoidance", {
             "detail": reason, "state": "AVOIDING",
             "model": self.manager.active_name,
-            "lidar_front": lz["front"], "lidar_right": lz["right"],
-            "lidar_back": lz["back"], "lidar_left": lz["left"],
+            "us_front": us["s1"], "us_right": us["s2"],
+            "us_back": us["s3"], "us_left": us["s4"],
         })
         print(f"\n  >>> AVOIDING ({reason})")
         if AI_AVAILABLE and self._current_frame is not None:
@@ -3382,9 +3185,9 @@ class Navigator:
 
     # ── HUD overlay ───────────────────────────────────────
 
-    def _draw_nav_overlay(self, frame, bottles, lz, bottle_depth_cm, ms, frame_idx):
+    def _draw_nav_overlay(self, frame, bottles, us, bottle_depth_cm, ms, frame_idx):
         """Draw navigation HUD on frame.
-        lz = dict with keys front/right/back/left in cm.
+        us = dict with keys s1(front), s2(right), s3(back), s4(left).
         bottle_depth_cm = depth camera distance to nearest bottle."""
         h, w = frame.shape[:2]
 
@@ -3408,15 +3211,15 @@ class Navigator:
         cv2.putText(frame, badge, (w - tw - 10, th + 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
 
-        # LiDAR distance bars (replacing ultrasonic bars)
+        # Ultrasonic distance bars
         bar_max_h = 100
         bar_w = 30
         margin = 10
         bar_positions = [
-            ("F", lz["front"], margin),
-            ("L", lz["left"], margin + bar_w + 6),
-            ("R", lz["right"], w - bar_w - margin),
-            ("B", lz["back"], w - 2 * bar_w - margin - 6),
+            ("F", us["s1"], margin),
+            ("L", us["s4"], margin + bar_w + 6),
+            ("R", us["s2"], w - bar_w - margin),
+            ("B", us["s3"], w - 2 * bar_w - margin - 6),
         ]
 
         for side, dist, x_pos in bar_positions:
@@ -3457,12 +3260,11 @@ class Navigator:
                     f"  Lift:{sensor.get('lift',0)}  Base:{sensor.get('base',0)}",
                     (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
 
-        # LiDAR + Depth status indicators
-        lidar_ok = self.lidar.is_connected
+        # Depth status indicator
         depth_ok = self.realsense.is_connected
-        cv2.putText(frame, f"LiDAR:{'OK' if lidar_ok else 'OFF'}  Depth:{'OK' if depth_ok else 'OFF'}",
+        cv2.putText(frame, f"Depth:{'OK' if depth_ok else 'OFF'}",
                     (10, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                    (0, 255, 0) if (lidar_ok and depth_ok) else (0, 0, 255), 1)
+                    (0, 255, 0) if depth_ok else (0, 0, 255), 1)
 
         # Command log panel (right side)
         log = self.esp32.recent_log
@@ -3513,17 +3315,13 @@ class Navigator:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PET Bottle Robot — Autonomous Navigator (LiDAR + RealSense)"
+        description="PET Bottle Robot — Autonomous Navigator (Ultrasonic + RealSense)"
     )
     parser.add_argument("--model", default="yolov8",
                         choices=["yolov5", "yolov7", "yolov8"],
                         help="YOLO model (default: yolov8)")
     parser.add_argument("--esp32-ip", default=None,
                         help="ESP32 WiFi IP address (default: auto-discover)")
-    parser.add_argument("--lidar-port", default="/dev/ttyAMA0",
-                        help="LD06 LiDAR serial port (default: /dev/ttyAMA0)")
-    parser.add_argument("--lidar-baud", type=int, default=230400,
-                        help="LiDAR baud rate (default: 230400)")
     parser.add_argument("--conf", type=float, default=CONF_THRESHOLD,
                         help=f"Confidence threshold (default: {CONF_THRESHOLD})")
     parser.add_argument("--no-show", action="store_true",
@@ -3537,7 +3335,7 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"  PET Bottle Robot — Autonomous Navigator")
-    print(f"  LD06 LiDAR + Intel RealSense + YOLO (WiFi transport)")
+    print(f"  Ultrasonic + Intel RealSense + YOLO (WiFi transport)")
     print(f"{'='*60}")
 
     # Start web stream server
@@ -3546,21 +3344,11 @@ def main():
     stream_thread.start()
     print(f"  Stream: http://0.0.0.0:5000/video_feed")
 
-    # Start LD06 LiDAR
-    print(f"  Starting LD06 LiDAR on {args.lidar_port}...")
-    lidar = LD06LiDAR(port=args.lidar_port, baudrate=args.lidar_baud)
-    lidar.start()
-    # Wait briefly for first data
-    for _ in range(20):
-        if lidar.is_connected:
-            break
-        time.sleep(0.5)
-    if lidar.is_connected:
-        print(f"  LiDAR: connected and streaming")
-    else:
-        print(f"  WARNING: LiDAR not responding on {args.lidar_port} — continuing without LiDAR")
-
     # Start Intel RealSense camera
+    if not REALSENSE_AVAILABLE:
+        print(f"  FATAL: pyrealsense2 not installed — cannot start RealSense camera")
+        print(f"  Install with: pip install pyrealsense2")
+        return
     print(f"  Starting Intel RealSense camera...")
     realsense = RealSenseCamera(width=640, height=480, fps=30)
     try:
@@ -3568,7 +3356,6 @@ def main():
     except Exception as e:
         print(f"  FATAL: RealSense camera failed to start: {e}")
         print(f"  Check USB 3.0 connection and pyrealsense2 installation")
-        lidar.stop()
         return
 
     # Discover ESP32
@@ -3596,13 +3383,12 @@ def main():
         print(f"  Active: {manager.active_name}")
 
         try:
-            nav = Navigator(manager, esp32, lidar, realsense,
+            nav = Navigator(manager, esp32, realsense,
                             args.conf, args.no_show, out_dir)
             nav.run()
         finally:
             esp32.shutdown()
             manager.cleanup()
-            lidar.stop()
             realsense.stop()
 
 
