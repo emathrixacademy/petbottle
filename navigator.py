@@ -1931,20 +1931,20 @@ TURN_DIST       = 60
 # Driving speeds
 ROAM_SPEED      = 40
 SLOW_SPEED      = 30
-APPROACH_SPEED  = 40
-TURN_SPEED      = 60
-SCAN_SPEED      = 60
-ALIGN_SPEED     = 35
-VERIFY_SPEED    = 30
+APPROACH_SPEED  = 25 #25
+TURN_SPEED      = 75
+SCAN_SPEED      = 75
+ALIGN_SPEED     = 45
+VERIFY_SPEED    = 25
 
 # Bottle detection & verification
-PICKUP_DIST_CM    = 20          # depth camera OR front ultrasonic ≤ 20 cm → close enough to pick
+PICKUP_DIST_CM    =    14   #16    # depth camera OR front ultrasonic ≤ 20 cm → close enough to pick
 PICKUP_FILL_FALLBACK = 0.25     # camera fallback: bottle fills 25% of frame
 BOTTLE_CENTER_TOL = 0.15
-VERIFY_FRAMES     = 75
+VERIFY_FRAMES     = 35 #25
 SCAN_STEP_TURN_S  = 0.4
 SCAN_PAUSE_S      = 2.5
-SCAN_MAX_STEPS    = 15
+SCAN_MAX_STEPS    = 30
 
 COCO_OBSTACLE_CLASSES = {
     0: "person", 56: "chair", 57: "couch", 58: "potted plant",
@@ -3190,6 +3190,8 @@ class Navigator:
         us = dict with keys s1(front), s2(right), s3(back), s4(left).
         bottle_depth_cm = depth camera distance to nearest bottle."""
         h, w = frame.shape[:2]
+
+		
 
         # State badge (top-right)
         state_colors = {
