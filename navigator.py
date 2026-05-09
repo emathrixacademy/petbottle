@@ -3191,7 +3191,10 @@ class Navigator:
         bottle_depth_cm = depth camera distance to nearest bottle."""
         h, w = frame.shape[:2]
 
-		
+        box_w, box_h = w // 4, h // 3
+        cx, cy = w // 2, h // 2
+        cv2.rectangle(frame, (cx - box_w // 2, cy - box_h // 2),
+                      (cx + box_w // 2, cy + box_h // 2), (0, 255, 0), 3)
 
         # State badge (top-right)
         state_colors = {
